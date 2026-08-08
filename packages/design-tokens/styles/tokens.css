@@ -15,17 +15,17 @@
 
 :root {
   /* Earthy-textile palette (Clay & Linen — design default) */
-  --paper: #f6f1e7;
-  --linen: #e8dcc4;
-  --linen-2: #d9cbae;
-  --clay: #c4856b;
-  --clay-deep: #a86a52;
-  --sage: #7a8471;
-  --sage-deep: #5e6a57;
-  --espresso: #3d2e1f;
-  --ink: #2a2118;
-  --ink-soft: #4f4032;
-  --rule: #c9b999;
+  --paper: #F6F1E7;
+  --linen: #E8DCC4;
+  --linen-2: #D9CBAE;
+  --clay: #C4856B;
+  --clay-deep: #A86A52;
+  --sage: #7A8471;
+  --sage-deep: #5E6A57;
+  --espresso: #3D2E1F;
+  --ink: #2A2118;
+  --ink-soft: #4F4032;
+  --rule: #C9B999;
 
   /* Type families */
   --serif: 'Cormorant Garamond', 'Cormorant', Georgia, serif;
@@ -60,12 +60,12 @@
 
   /* Shadows */
   --shadow-sm: 0 1px 2px 0 rgba(61, 46, 31, 0.05);
-  --shadow-base: 0 1px 3px 0 rgba(61, 46, 31, 0.1), 0 1px 2px -1px rgba(61, 46, 31, 0.06);
-  --shadow-md: 0 4px 6px -1px rgba(61, 46, 31, 0.1), 0 2px 4px -2px rgba(61, 46, 31, 0.06);
-  --shadow-lg: 0 10px 15px -3px rgba(61, 46, 31, 0.1), 0 4px 6px -4px rgba(61, 46, 31, 0.06);
+  --shadow-base: 0 1px 3px 0 rgba(61, 46, 31, 0.10), 0 1px 2px -1px rgba(61, 46, 31, 0.06);
+  --shadow-md: 0 4px 6px -1px rgba(61, 46, 31, 0.10), 0 2px 4px -2px rgba(61, 46, 31, 0.06);
+  --shadow-lg: 0 10px 15px -3px rgba(61, 46, 31, 0.10), 0 4px 6px -4px rgba(61, 46, 31, 0.06);
   --shadow-xl: 0 20px 25px -5px rgba(61, 46, 31, 0.12), 0 8px 10px -6px rgba(61, 46, 31, 0.06);
   --shadow-card: 0 30px 60px -30px rgba(61, 46, 31, 0.25);
-  --shadow-card-lift: 0 20px 40px -24px rgba(61, 46, 31, 0.3);
+  --shadow-card-lift: 0 20px 40px -24px rgba(61, 46, 31, 0.30);
 
   /* Motion — `--ts-motion-multiplier` is the senior-mode hinge */
   --ts-motion-multiplier: 1;
@@ -96,17 +96,17 @@
 
 [data-senior-mode='on'] {
   /* Senior-mode AAA contrast pair (CLAUDE §8.3) */
-  --paper: #fffefa;
-  --linen: #efe6ce;
-  --linen-2: #d9cbae;
-  --clay: #a86a52;
-  --clay-deep: #8e4922;
-  --sage: #5e6a57;
-  --sage-deep: #3f522b;
-  --espresso: #1a140b;
-  --ink: #0a0700;
-  --ink-soft: #2a2118;
-  --rule: #8c7e66;
+  --paper: #FFFEFA;
+  --linen: #EFE6CE;
+  --linen-2: #D9CBAE;
+  --clay: #A86A52;
+  --clay-deep: #8E4922;
+  --sage: #5E6A57;
+  --sage-deep: #3F522B;
+  --espresso: #1A140B;
+  --ink: #0A0700;
+  --ink-soft: #2A2118;
+  --rule: #8C7E66;
 
   /* Senior-mode hinges */
   --ts-text-scale: 1.5;

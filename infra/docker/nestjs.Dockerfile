@@ -127,6 +127,35 @@ RUN pnpm --filter "${SERVICE_PACKAGE}..." build
 # only production dependencies and inlines workspace packages.
 RUN pnpm --filter "${SERVICE_PACKAGE}" deploy --prod /deploy
 
+# Prune the build-time toolchain that `pnpm deploy --prod` leaves behind.
+#
+# `pnpm why esbuild` reports it as devDependencies-only (vitest -> vite ->
+# esbuild), yet pnpm 9's `deploy` copies the virtual store wholesale and the
+# binary lands at `/app/node_modules/.pnpm/@esbuild+linux-x64@…/bin/esbuild` in
+# the shipped image. The first Trivy run found it there and attributed EIGHTEEN
+# HIGH-severity Go stdlib CVEs to it — esbuild is a Go program, and 0.21.5 was
+# built with Go 1.20.12.
+#
+# Deleting it is the correct fix rather than a version bump: a bundler has no
+# business in a runtime whose entrypoint is `node dist/main.js`, and the CVEs
+# are only reachable because a build tool was shipped. This also removes the
+# tempting alternative of overriding esbuild to a newer release, which vite 5
+# pins and which would be fighting the lockfile to solve the wrong problem.
+#
+# The assertion is the load-bearing half: if a future pnpm changes `deploy`
+# semantics — in either direction — this fails the build loudly instead of
+# silently shipping the binary again or silently deleting something now needed.
+RUN rm -rf /deploy/node_modules/.pnpm/@esbuild+* \
+           /deploy/node_modules/.pnpm/esbuild@* \
+           /deploy/node_modules/.pnpm/vite@* \
+           /deploy/node_modules/.pnpm/vitest@* \
+           /deploy/node_modules/.pnpm/rollup@* \
+           /deploy/node_modules/.pnpm/@rollup+* \
+ && if find /deploy/node_modules -name 'esbuild' -type f -print -quit | grep -q .; then \
+      echo "FATAL: esbuild survived the prune and would ship in the runtime image"; \
+      exit 1; \
+    fi
+
 # Stage the generated client separately (TS-502). `pnpm deploy` copies
 # production dependencies and workspace packages — `prisma/generated` lives
 # outside `node_modules`, so it is not carried and the runner would start

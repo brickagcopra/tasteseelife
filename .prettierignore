@@ -14,3 +14,8 @@ pnpm-lock.yaml
 
 # Husky generated wrapper scripts (auto-generated on `husky install`)
 .husky/_/
+
+# Generated mirror of `buildTokenCss()` — `src/__tests__/css.test.ts` asserts it
+# matches that output. Prettier lowercases hex colours, which silently broke that
+# assertion during the initial commit, so the formatter must not own this file.
+packages/design-tokens/styles/tokens.css
