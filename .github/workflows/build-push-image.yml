@@ -233,6 +233,12 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: "1"
           ignore-unfixed: true
+          # REQUIRED with format: sarif. Without it trivy-action builds the
+          # report "with all severities" and evaluates exit-code against ALL
+          # of them, so the job fails on MEDIUM/LOW despite severity above
+          # saying HIGH,CRITICAL. 0.28.0 did not behave this way; the 0.36.0
+          # bump changed it, and the gate silently became stricter than it reads.
+          limit-severities-for-sarif: true
 
       - name: Upload Trivy SARIF to GitHub Security
         # Same shape as the migrator upload below: a bare `always()` would fire
@@ -302,6 +308,12 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: "1"
           ignore-unfixed: true
+          # REQUIRED with format: sarif. Without it trivy-action builds the
+          # report "with all severities" and evaluates exit-code against ALL
+          # of them, so the job fails on MEDIUM/LOW despite severity above
+          # saying HIGH,CRITICAL. 0.28.0 did not behave this way; the 0.36.0
+          # bump changed it, and the gate silently became stricter than it reads.
+          limit-severities-for-sarif: true
 
       - name: Upload migrator Trivy SARIF to GitHub Security
         # Gated on the migrator BUILD, not just on the image name. `always()`

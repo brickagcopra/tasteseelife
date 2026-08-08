@@ -478,6 +478,12 @@ jobs:
           # severities are reported but don't block.
           exit-code: "1"
           ignore-unfixed: true
+          # REQUIRED with format: sarif. Without it trivy-action builds the
+          # report "with all severities" and evaluates exit-code against ALL
+          # of them, so the job fails on MEDIUM/LOW despite severity above
+          # saying HIGH,CRITICAL. 0.28.0 did not behave this way; the 0.36.0
+          # bump changed it, and the gate silently became stricter than it reads.
+          limit-severities-for-sarif: true
           # Skip noisy directories — node_modules is reproducible from the
           # lockfile and gets covered by `pnpm audit` follow-ups.
           skip-dirs: "node_modules,.next,.turbo,dist,build,coverage"
