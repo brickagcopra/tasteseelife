@@ -40,6 +40,19 @@
 # tags initially and were converted to SHA pins by TS-009g-followup-1
 # (2026-05-18).
 #
+# trivy-action was bumped 0.28.0 -> 0.36.0 on 2026-08-07 because the first CI
+# run failed on ALL 34 builds in ~10s with:
+#
+#   Unable to resolve action `aquasecurity/setup-trivy@v0.2.1`,
+#   unable to find version `v0.2.1`
+#
+# SHA-pinning protects the action we name; it does not protect that action's
+# OWN references. trivy-action 0.28.0 called `setup-trivy@v0.2.1` by MUTABLE
+# TAG, and upstream deleted it — so a SHA pin we had not touched in months
+# broke on its own. 0.36.0 pins setup-trivy by SHA (v0.2.6), which closes the
+# hole rather than moving it. Worth remembering: a transitive tag reference is
+# a supply-chain dependency the pin does not cover.
+#
 # References:
 #   PDD.md §20.1 (container strategy), §20.4 (CI/CD)
 #   CLAUDE.md §3 (security), §11 (CI/CD & branching), §3.5 (secrets)
@@ -212,7 +225,7 @@ jobs:
         # what landed in the registry — defends against a tag-flip race.
         # Fails the job on HIGH/CRITICAL; lower severities are reported via
         # the SARIF upload but don't block.
-        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2 # v0.28.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
           format: sarif
@@ -279,7 +292,7 @@ jobs:
         # on softer ones: this image holds a database superuser-grade
         # `DATABASE_URL` for the length of a migration.
         if: inputs.migrator-image-name != ''
-        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2 # v0.28.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ inputs.migrator-image-name }}@${{ steps.build-migrator.outputs.digest }}
           format: sarif
