@@ -1,0 +1,16 @@
+node_modules/
+dist/
+build/
+.next/
+out/
+coverage/
+.turbo/
+pnpm-lock.yaml
+*.min.js
+*.min.css
+
+# Per-service generated Prisma clients (TS-500/TS-501) — machine-generated.
+**/prisma/generated/
+
+# Husky generated wrapper scripts (auto-generated on `husky install`)
+.husky/_/

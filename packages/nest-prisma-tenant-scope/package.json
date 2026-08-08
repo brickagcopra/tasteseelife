@@ -1,0 +1,56 @@
+{
+  "name": "@taste-and-see/nest-prisma-tenant-scope",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Shared NestJS + Prisma tenant-scoping SDK for the Taste & See platform. Implements CLAUDE.md §3.2 + §17.10: a request-scoped context store (AsyncLocalStorage), an interceptor that seeds the store from `request.requestContext`, a Prisma client extension that rejects queries when no RequestContext is in scope (mode = `enforce`) or logs a warning and proceeds (mode = `audit`, the Phase-1 default), and an explicit `runWithoutTenantContext` escape hatch for background workers and bootstrap. TS-141.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@taste-and-see/auth-sdk": "workspace:*",
+    "zod": "3.23.8"
+  },
+  "peerDependencies": {
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/core": "^11.0.0",
+    "@prisma/client": "^5.22.0",
+    "reflect-metadata": "^0.2.0",
+    "rxjs": "^7.8.0"
+  },
+  "devDependencies": {
+    "@nestjs/common": "11.0.0",
+    "@nestjs/core": "11.0.0",
+    "@nestjs/testing": "11.0.0",
+    "@prisma/client": "5.22.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/express": "5.0.0",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "reflect-metadata": "0.2.2",
+    "rimraf": "6.0.1",
+    "rxjs": "7.8.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

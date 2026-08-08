@@ -1,0 +1,868 @@
+// Concierge bounded context — see PDD §7.2 (service inventory entry #7)
+// and §10.6 (Concierge Operations: ticket queue, SLA tracking, assignment
+// to concierge staff, escalation paths, internal notes & follow-ups).
+//
+// Scope so far:
+//   - TS-221 ships the skeleton: the `concierge` Postgres schema and the
+//     `concierge_tickets` base table (id, household_id, kind, status,
+//     sla_due_at, assigned_to_user_id, escalation_path) plus its enums
+//     and indexes. No HTTP surface beyond `/healthz` + `/readyz` yet.
+//
+// Forthcoming (captured so the layout is predictable):
+//   - TS-222 — dedicated culinary-concierge assignment for Tier 3
+//     households (`POST /api/v1/concierge/assignments`); brings a
+//     `concierge_assignments` table + the JWT-verification + idempotency
+//     env clusters.
+//   - TS-223 — custom-request submission; extends `concierge_tickets`
+//     with request-detail columns (subject / structured fields).
+//   - TS-224 — ops console queue (reads `concierge_tickets` ordered by
+//     SLA proximity) + internal notes table.
+//   - TS-225 — emergency concierge (high-severity ticket + PagerDuty).
+//
+// Each addition is a forward-compatible expand → migrate → contract
+// migration per CLAUDE.md §4.1; enum value sets evolve additively
+// (`ALTER TYPE … ADD VALUE`) per the TS-205 / TS-220 convention.
+//
+// Cross-service references are by id only — never a foreign key into
+// another service schema (CLAUDE.md §2.3, §4.1). Specifically:
+//
+//   - `concierge_tickets.household_id`         soft FK → `household.households.id`.
+//   - `concierge_tickets.assigned_to_user_id`  soft FK → `identity.users.id`.
+//
+// Joins across these boundaries happen via the gateway BFF (TS-140) or via
+// events (TS-142), never via SQL JOIN.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. The feature has been
+  // production-stable since Prisma 5.0 even though it remains under the
+  // `previewFeatures` umbrella in 5.x — see Prisma migration notes.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `concierge` Postgres schema. Every other service
+  // gets its own schema in the same database (Phase 1) or its own database
+  // entirely (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["concierge"]
+}
+
+/// Concierge ticket category. Drives queue routing, the SLA budget a
+/// ticket inherits, and the family-portal rendering. Grounded in the
+/// PRD §6.6 "Concierge Service Requests" catalog plus the Tier-3
+/// transportation (TS-226) and emergency (TS-225) channels.
+///
+/// Additive only — new request types arrive via `ALTER TYPE … ADD VALUE`
+/// (the same convention as `booking.service_kind`), never by repurposing
+/// an existing value.
+///
+///   `custom_request`        = free-form request routed to the dedicated
+///                             concierge (PRD §6.6 "Custom requests").
+///   `holiday_dinner`        = PRD §6.6 "Holiday dinners".
+///   `birthday_experience`   = PRD §6.6 "Birthday experiences".
+///   `grocery_stocking`      = PRD §6.6 "Grocery stocking".
+///   `tea_social`            = PRD §6.6 "Tea socials".
+///   `museum_outing`         = PRD §6.6 "Museum outings".
+///   `memory_meal`           = PRD §6.6 "Memory meal experiences".
+///   `transportation`        = Tier-3 transportation coordination (TS-226).
+///   `emergency_assistance`  = Tier-3 emergency concierge channel (TS-225);
+///                             always opened at a high severity with a
+///                             tightened SLA + on-call escalation path.
+enum ConciergeTicketKind {
+  custom_request
+  holiday_dinner
+  birthday_experience
+  grocery_stocking
+  tea_social
+  museum_outing
+  memory_meal
+  transportation
+  emergency_assistance
+
+  @@map("concierge_ticket_kind")
+  @@schema("concierge")
+}
+
+/// Concierge ticket lifecycle. The ops console (TS-224) reads the queue
+/// filtered by status and ordered by `sla_due_at`. Terminal states are
+/// `resolved` and `canceled` — neither accepts further transitions
+/// (enforced at the service layer when the transition surface lands in
+/// TS-224, not by a DB constraint).
+///
+///   `open`        = freshly created, unassigned; SLA timer running.
+///   `assigned`    = a concierge owns it (`assigned_to_user_id` set) but
+///                   work has not yet started.
+///   `in_progress` = the concierge is actively working the request.
+///   `escalated`   = handed up the `escalation_path`; SLA timer still
+///                   running until resolution.
+///   `resolved`    = completed successfully (terminal).
+///   `canceled`    = withdrawn by the family or closed without action
+///                   (terminal).
+enum ConciergeTicketStatus {
+  open
+  assigned
+  in_progress
+  escalated
+  resolved
+  canceled
+
+  @@map("concierge_ticket_status")
+  @@schema("concierge")
+}
+
+/// Escalation routing for a ticket (PDD §10.6 "Escalation paths", §16.1).
+/// Every ticket carries one — `standard` is the default "handle in the
+/// normal concierge queue" routing; the other values name the chain a
+/// ticket follows once escalated. Additive only.
+///
+///   `standard`         = normal concierge queue, no escalation.
+///   `concierge_lead`   = escalated to the concierge lead (PDD §10.12 role
+///                        `concierge_lead`).
+///   `ops_manager`      = escalated to the operations manager.
+///   `trust_safety`     = routed to Trust & Safety — welfare / abuse /
+///                        scam concerns (PDD §16.1, CLAUDE.md §12); never
+///                        auto-closed.
+///   `emergency_on_call`= Tier-3 emergency channel — pages the on-call
+///                        supervisor via PagerDuty (TS-225, PDD §20.5).
+enum ConciergeEscalationPath {
+  standard
+  concierge_lead
+  ops_manager
+  trust_safety
+  emergency_on_call
+
+  @@map("concierge_escalation_path")
+  @@schema("concierge")
+}
+
+/// Concierge ticket — the unit of concierge operations (PDD §10.6). One
+/// household can hold many tickets over its lifetime. A ticket tracks a
+/// single concierge service request or operational follow-up from intake
+/// through resolution, carrying its SLA deadline, current assignee, and
+/// escalation routing.
+///
+/// `household_id` is a soft FK into `household.households.id` — never
+/// declare a Prisma relation here (cross-service relations would couple
+/// the two services' Prisma clients and violate CLAUDE.md §2.3 / §4.1).
+/// This column is also the tenant-scope key the TS-141 Prisma extension
+/// filters on (the access token carries a
+/// `tenantScope: {type: 'household', householdId}` claim).
+///
+/// `assigned_to_user_id` is a soft FK into `identity.users.id` — the
+/// concierge staff member who owns the ticket. Null while the ticket
+/// sits in the unassigned queue.
+///
+/// `sla_due_at` is the deadline the ops console (TS-224) sorts the queue
+/// by. Null for kinds that carry no SLA budget; populated at create time
+/// from the per-kind SLA policy at submission (TS-223 — `now + the per-kind
+/// policy hours` from the contract's `CONCIERGE_TICKET_SLA_HOURS_BY_KIND`).
+///
+/// Request-detail columns (TS-223): `subject` (short title) + `body`
+/// (free-text details) are required on every ticket; `requested_date`
+/// (calendar date, no time), `party_size`, and `theme` are optional
+/// structured fields the family supplies on submission.
+///
+/// Soft-delete (`deleted_at`) preserves the audit history of concierge
+/// activity (PDD §17 — "who was working what the night the welfare flag
+/// fired?"). Read-paths filter `deleted_at = null` unless explicitly
+/// auditing.
+model ConciergeTicket {
+  id               String                  @id @default(cuid())
+  /// Soft FK into `household.households.id`. Tenant-scope key. Never a
+  /// Prisma relation — see the schema-level header.
+  householdId      String                  @map("household_id")
+  kind             ConciergeTicketKind
+  status           ConciergeTicketStatus   @default(open)
+  /// Short request title shown on the family card + the ops queue (TS-223).
+  subject          String
+  /// Free-text request details (TS-223).
+  body             String
+  /// Optional requested calendar date (no time component) for the request
+  /// (TS-223) — e.g. the date of a holiday dinner or outing.
+  requestedDate    DateTime?               @map("requested_date") @db.Date
+  /// Optional party size for the request (TS-223).
+  partySize        Int?                    @map("party_size")
+  /// Optional theme / occasion descriptor (TS-223).
+  theme            String?
+  /// SLA deadline the ops queue (TS-224) orders by. Null = no SLA budget
+  /// for this ticket (every TS-223 submission sets it from the per-kind
+  /// policy).
+  slaDueAt         DateTime?               @map("sla_due_at") @db.Timestamptz(6)
+  /// Soft FK into `identity.users.id` — the assigned concierge. Null
+  /// while the ticket is in the unassigned queue.
+  assignedToUserId String?                 @map("assigned_to_user_id")
+  escalationPath   ConciergeEscalationPath @default(standard) @map("escalation_path")
+  createdAt        DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone; populated by ops only. Read-paths must filter
+  /// `deleted_at = null` unless explicitly auditing.
+  deletedAt        DateTime?               @map("deleted_at") @db.Timestamptz(6)
+
+  /// Append-only internal-notes timeline written by ops on the console
+  /// (TS-224). In-service relation (both tables in the `concierge` schema)
+  /// — allowed since it does not cross a service boundary (CLAUDE.md §4.1).
+  notes            ConciergeTicketNote[]
+
+  /// Scheduled events (TS-227) that fulfil this request — a ticket may
+  /// produce zero, one, or several booked experiences (e.g. a "social
+  /// outings" request → multiple outings). In-service relation; the FK on
+  /// `ConciergeScheduledEvent.ticketId` is ON DELETE SET NULL.
+  scheduledEvents  ConciergeScheduledEvent[]
+
+  /// Transportation requests (TS-226) that fulfil this request — a ticket may
+  /// produce zero, one, or several booked rides. In-service relation; the FK
+  /// on `ConciergeTransportationRequest.ticketId` is ON DELETE SET NULL.
+  transportationRequests ConciergeTransportationRequest[]
+
+  /// Tenant-scope filter + "all tickets for this household" reads.
+  @@index([householdId], map: "concierge_tickets_household_id_idx")
+  /// "Tickets assigned to me" — the concierge staff member's worklist.
+  @@index([assignedToUserId], map: "concierge_tickets_assigned_to_user_id_idx")
+  /// Soft-delete filter on list reads.
+  @@index([deletedAt], map: "concierge_tickets_deleted_at_idx")
+  /// Powers the ops-console queue (TS-224): "open / escalated tickets in
+  /// SLA-proximity order". Composite so a single index scan filters by
+  /// status AND returns rows sorted by the SLA deadline.
+  @@index([status, slaDueAt], map: "concierge_tickets_status_sla_idx")
+  /// Powers the family "my requests" read (TS-223): "this household's
+  /// tickets newest-first". Composite so a single index scan filters by
+  /// household AND returns rows in created_at-descending order.
+  @@index([householdId, createdAt(sort: Desc)], map: "concierge_tickets_household_created_idx")
+  @@map("concierge_tickets")
+  @@schema("concierge")
+}
+
+/// Dedicated culinary-concierge assignment lifecycle (TS-222; PRD §5.1
+/// Tier 3 "Dedicated culinary concierge", §6.6; PDD §10.6).
+///
+///   `active` = the household's current dedicated concierge. At most one
+///              active row per household — enforced by a DB partial-unique
+///              index (`deleted_at IS NULL AND status = 'active'`).
+///   `ended`  = superseded by a reassignment, or explicitly ended by ops.
+///              Retained for the audit history (PDD §17), never deleted.
+enum ConciergeAssignmentStatus {
+  active
+  ended
+
+  @@map("concierge_assignment_status")
+  @@schema("concierge")
+}
+
+/// Dedicated culinary-concierge assignment (TS-222). Links a Tier-3
+/// household to a primary concierge + optional backup. Assigning a
+/// dedicated concierge is an ops action (PDD §10.6 "Assignment to concierge
+/// staff"); the family portal reads the active row to render the "Your
+/// concierge" card.
+///
+/// **Reassignment model.** One active assignment per household; reassigning
+/// ends the prior active row (`status=ended`, `ended_at` set) and inserts a
+/// fresh active row in the same transaction, so the full history is
+/// preserved for the audit trail (PDD §17 — "who was the concierge the
+/// night the welfare flag fired").
+///
+/// `household_id` is a soft FK into `household.households.id` — never a
+/// Prisma relation (cross-service relations violate CLAUDE.md §2.3 / §4.1).
+/// It is also the tenant-scope key the TS-141 Prisma extension filters on
+/// (the family access token carries a
+/// `tenantScope: {type:'household', householdId}` claim).
+///
+/// `primary_concierge_user_id` / `backup_concierge_user_id` are soft FKs
+/// into `identity.users.id`. The `*_display_name` columns capture the
+/// concierge's name at assignment time so the family card renders without a
+/// cross-service `identity.users` read on every request (CLAUDE.md §2.3).
+/// Name-sync on the rare rename is a deferred follow-up.
+///
+/// `assigned_by_user_id` is a soft FK into `identity.users.id` — the admin
+/// (super_admin) who created the assignment.
+///
+/// **Single-active invariant.** The partial unique index
+/// `concierge_assignments_one_active_per_household` enforces "at most one
+/// active row per household" at the database level
+/// (`WHERE deleted_at IS NULL AND status = 'active'`). Prisma's `@@unique`
+/// cannot express the partial predicate, so the index lives in the
+/// hand-written migration only (the established convention — see
+/// `ProviderCertification` in service-provider).
+model ConciergeAssignment {
+  id                          String                    @id @default(cuid())
+  /// Soft FK into `household.households.id`. Tenant-scope key.
+  householdId                 String                    @map("household_id")
+  /// Soft FK into `identity.users.id` — the primary dedicated concierge.
+  primaryConciergeUserId      String                    @map("primary_concierge_user_id")
+  /// Display name captured at assignment time (see model header).
+  primaryConciergeDisplayName String                    @map("primary_concierge_display_name")
+  /// Soft FK into `identity.users.id` — the backup concierge. Null when no
+  /// backup is named; set together with `backup_concierge_display_name`.
+  backupConciergeUserId       String?                   @map("backup_concierge_user_id")
+  backupConciergeDisplayName  String?                   @map("backup_concierge_display_name")
+  status                      ConciergeAssignmentStatus @default(active)
+  /// Soft FK into `identity.users.id` — the admin who made the assignment.
+  assignedByUserId            String?                   @map("assigned_by_user_id")
+  startedAt                   DateTime                  @default(now()) @map("started_at") @db.Timestamptz(6)
+  /// Set when the row transitions to `ended`. Null while active.
+  endedAt                     DateTime?                 @map("ended_at") @db.Timestamptz(6)
+  createdAt                   DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                   DateTime                  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone; populated by ops only. Read-paths must filter
+  /// `deleted_at = null` unless explicitly auditing.
+  deletedAt                   DateTime?                 @map("deleted_at") @db.Timestamptz(6)
+
+  /// Tenant-scope filter + "assignment history for this household" reads
+  /// (ordered active-first then by `started_at`).
+  @@index([householdId, startedAt(sort: Desc)], map: "concierge_assignments_household_started_idx")
+  /// "Households this concierge is assigned to" — staff worklist reads.
+  @@index([primaryConciergeUserId], map: "concierge_assignments_primary_user_idx")
+  /// Soft-delete filter on list reads.
+  @@index([deletedAt], map: "concierge_assignments_deleted_at_idx")
+  // The single-active partial unique index
+  // (`concierge_assignments_one_active_per_household`) is added in the
+  // hand-written migration — Prisma cannot express its WHERE predicate.
+  @@map("concierge_assignments")
+  @@schema("concierge")
+}
+
+/// Append-only internal note on a concierge ticket (TS-224; PDD §10.6
+/// "Internal notes and follow-ups"). Ops staff add notes from the console
+/// while working a ticket — triage observations, escalation rationale, the
+/// "why" behind a status transition. Notes are never edited or deleted (an
+/// internal audit trail of ops activity, in the spirit of CLAUDE.md §3.6);
+/// no update / delete surface exists.
+///
+/// `ticket_id` is an in-service relation to `ConciergeTicket` (both tables
+/// live in the `concierge` schema, so a real FK is allowed — CLAUDE.md §4.1
+/// forbids FKs only ACROSS service schemas). `ON DELETE CASCADE` keeps the
+/// timeline consistent if a ticket is ever hard-deleted (today tickets are
+/// only soft-deleted, so this is defence-in-depth).
+///
+/// `household_id` is denormalised from the parent ticket — it is the
+/// tenant-scope key the TS-141 Prisma extension filters on (so every model
+/// in this service carries the household axis; `unscopedModels: []`), and it
+/// gives a useful "all notes for this household" read axis.
+///
+/// `author_user_id` is a soft FK into `identity.users.id` — the ops staff
+/// member who wrote the note (authoritative from the verified token, never
+/// client-supplied). Display-name resolution is a cross-service concern
+/// (CLAUDE.md §2.3) handled by the gateway / a future follow-up.
+model ConciergeTicketNote {
+  id            String          @id @default(cuid())
+  /// In-service relation to the parent ticket (see model header).
+  ticketId      String          @map("ticket_id")
+  ticket        ConciergeTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  /// Denormalised tenant-scope key — copied from the parent ticket.
+  householdId   String          @map("household_id")
+  /// Soft FK into `identity.users.id` — the authoring ops staff member.
+  authorUserId  String          @map("author_user_id")
+  body          String
+  createdAt     DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// Powers the ticket-detail notes timeline (TS-224): "this ticket's notes
+  /// oldest-first". Composite so a single index scan filters by ticket AND
+  /// returns rows in created_at order.
+  @@index([ticketId, createdAt], map: "concierge_ticket_notes_ticket_created_idx")
+  /// Tenant-scope filter + "all notes for this household" reads.
+  @@index([householdId], map: "concierge_ticket_notes_household_id_idx")
+  @@map("concierge_ticket_notes")
+  @@schema("concierge")
+}
+
+/// Scheduled-event category (TS-227; PRD §5.1 Tier 3 "social outings · event
+/// dining"). The three Tier-3 experience types a concierge can book.
+/// Additive only — new kinds arrive via `ALTER TYPE … ADD VALUE`.
+enum ConciergeEventKind {
+  restaurant_reservation
+  cultural_event
+  group_outing
+
+  @@map("concierge_event_kind")
+  @@schema("concierge")
+}
+
+/// Scheduled-event lifecycle (TS-227). `proposed` → `confirmed` →
+/// `completed`; `canceled` from either non-terminal state. `completed` and
+/// `canceled` are terminal (enforced at the service layer against the
+/// `CONCIERGE_EVENT_STATUS_TRANSITIONS` matrix, not by a DB constraint).
+enum ConciergeEventStatus {
+  proposed
+  confirmed
+  completed
+  canceled
+
+  @@map("concierge_event_status")
+  @@schema("concierge")
+}
+
+/// Booking source for a scheduled event (TS-227) — the Phase-3 adapter seam.
+/// `manual` is the Phase-1 default (the concierge booked by phone / in
+/// person); `opentable` / `museum` name live partner integrations wired in
+/// Phase 3 (TS-227-followup-5). Additive only.
+enum ConciergeEventExternalProvider {
+  manual
+  opentable
+  museum
+
+  @@map("concierge_event_external_provider")
+  @@schema("concierge")
+}
+
+/// Concierge scheduled event (TS-227; PRD §5.1 Tier 3, §6.6; PDD §10.6) — the
+/// concrete booked experience that fulfils a Tier-3 household's request: a
+/// restaurant reservation, cultural event, or group outing. Where
+/// `ConciergeTicket` is the REQUEST, a scheduled event is the FULFILMENT.
+///
+/// `household_id` is a soft FK into `household.households.id` — never a Prisma
+/// relation (cross-service relations violate CLAUDE.md §2.3 / §4.1). It is the
+/// tenant-scope key the TS-141 Prisma extension filters on.
+///
+/// `ticket_id` is an OPTIONAL in-service relation to the originating
+/// `ConciergeTicket` (both tables live in the `concierge` schema, so a real FK
+/// is allowed). Null for a concierge-initiated event with no family request.
+/// `ON DELETE SET NULL` keeps the event when its ticket is hard-deleted (the
+/// event is an independent record).
+///
+/// `created_by_user_id` is a soft FK into `identity.users.id` — the concierge
+/// who scheduled the event (authoritative from the verified token, never
+/// client-supplied).
+///
+/// `external_provider` is the Phase-3 adapter seam (manual / opentable /
+/// museum); `external_reference` holds the confirmation number from whichever
+/// source booked it.
+///
+/// Soft-delete (`deleted_at`) preserves the audit history. Read-paths filter
+/// `deleted_at = null` unless explicitly auditing.
+model ConciergeScheduledEvent {
+  id                String                         @id @default(cuid())
+  /// Soft FK into `household.households.id`. Tenant-scope key.
+  householdId       String                         @map("household_id")
+  /// Optional in-service relation to the originating ticket (see header).
+  ticketId          String?                        @map("ticket_id")
+  ticket            ConciergeTicket?               @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+  kind              ConciergeEventKind
+  status            ConciergeEventStatus           @default(proposed)
+  /// Short event title shown on the ops list.
+  title             String
+  /// Venue name (restaurant / museum / venue). Null when not yet known.
+  venueName         String?                        @map("venue_name")
+  /// Venue address / location free-text. Null when not yet known.
+  venueAddress      String?                        @map("venue_address")
+  /// When the event starts (full timestamp, unlike a ticket's date-only
+  /// `requested_date`).
+  scheduledStart    DateTime                       @map("scheduled_start") @db.Timestamptz(6)
+  /// When the event ends. Null when only a start time is known.
+  scheduledEnd      DateTime?                      @map("scheduled_end") @db.Timestamptz(6)
+  /// Optional party size for the booking.
+  partySize         Int?                           @map("party_size")
+  externalProvider  ConciergeEventExternalProvider @default(manual) @map("external_provider")
+  /// Confirmation / reservation reference from the booking source. Null until
+  /// the booking is confirmed.
+  externalReference String?                        @map("external_reference")
+  /// Concierge scheduling notes (logistics, accessibility, preferences).
+  notes             String?
+  /// Soft FK into `identity.users.id` — the concierge who scheduled it.
+  createdByUserId   String                         @map("created_by_user_id")
+  createdAt         DateTime                       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime                       @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone; populated by ops only. Read-paths must filter
+  /// `deleted_at = null` unless explicitly auditing.
+  deletedAt         DateTime?                      @map("deleted_at") @db.Timestamptz(6)
+
+  /// Dominant ops read: "this household's events, soonest first" + the
+  /// cross-household upcoming view. Composite so one index scan filters by
+  /// household AND returns rows ordered by start time.
+  @@index([householdId, scheduledStart], map: "concierge_scheduled_events_household_start_idx")
+  /// "Events fulfilling this request" — the ticket → fulfilment lookup.
+  @@index([ticketId], map: "concierge_scheduled_events_ticket_id_idx")
+  /// Status-filtered ops views.
+  @@index([status], map: "concierge_scheduled_events_status_idx")
+  /// Soft-delete filter on list reads.
+  @@index([deletedAt], map: "concierge_scheduled_events_deleted_at_idx")
+  @@map("concierge_scheduled_events")
+  @@schema("concierge")
+}
+
+/// Tier-3 onboarding rollup status (TS-228; PRD §5.1 Tier 3; PDD §10.6).
+/// Derived from the checklist steps on every mutation, EXCEPT `canceled`
+/// which is set explicitly and is sticky.
+///
+///   `not_started` = created; no step completed or skipped yet.
+///   `in_progress` = at least one step completed/skipped, not all.
+///   `completed`   = every step completed or skipped (derived — reverts to
+///                   `in_progress` if a step is re-opened).
+///   `canceled`    = abandoned (household downgraded out of Tier 3, etc.).
+///                   Sticky terminal; rejects further edits.
+enum ConciergeOnboardingStatus {
+  not_started
+  in_progress
+  completed
+  canceled
+
+  @@map("concierge_onboarding_status")
+  @@schema("concierge")
+}
+
+/// The white-glove kickoff checklist steps (TS-228). Mirrors the contract's
+/// `CONCIERGE_ONBOARDING_STEP_TEMPLATE`. Additive only — new steps arrive via
+/// `ALTER TYPE … ADD VALUE` + a template extension.
+enum ConciergeOnboardingStepKey {
+  welcome_kickoff_call
+  senior_preference_deep_dive
+  family_expectation_setting
+  assign_dedicated_concierge
+  schedule_first_chef_visit
+  confirm_household_access
+
+  @@map("concierge_onboarding_step_key")
+  @@schema("concierge")
+}
+
+/// Per-step completion state (TS-228). A checklist toggle, not a state
+/// machine — ops may move a step between any of the three.
+///
+///   `pending`   = not yet done.
+///   `completed` = the concierge completed the step (stamps `completed_at` +
+///                 `completed_by_user_id`).
+///   `skipped`   = deliberately not applicable for this household.
+enum ConciergeOnboardingStepStatus {
+  pending
+  completed
+  skipped
+
+  @@map("concierge_onboarding_step_status")
+  @@schema("concierge")
+}
+
+/// Tier-3 onboarding ("white-glove kickoff") (TS-228; PRD §5.1 Tier 3; PDD
+/// §10.6). A checklist-driven workflow that guides a new Tier-3 (Concierge
+/// Lifestyle) household through the kickoff.
+///
+/// **Where the state lives.** The acceptance frames the status as "persisted
+/// on the subscription record", but the workflow is concierge-domain and a
+/// cross-service write into `subscription` is forbidden (CLAUDE.md §2.3). The
+/// onboarding lives here, keyed by `household_id` (the Tier-3 household) — the
+/// same soft-FK pattern every concierge table uses — and is surfaced in admin
+/// ops + a read-only family progress card.
+///
+/// `household_id` is a soft FK into `household.households.id` — never a Prisma
+/// relation (CLAUDE.md §2.3 / §4.1). It is the tenant-scope key the TS-141
+/// Prisma extension filters on.
+///
+/// `started_by_user_id` is a soft FK into `identity.users.id` — the ops staff
+/// member who opened the onboarding (authoritative from the verified token,
+/// never client-supplied).
+///
+/// **Single-active invariant.** At most one active (non-deleted) onboarding
+/// per household — enforced by a DB partial unique index
+/// (`concierge_onboardings_one_active_per_household` WHERE `deleted_at IS
+/// NULL`). Prisma's `@@unique` cannot express the partial predicate, so the
+/// index lives in the hand-written migration only (the established convention
+/// — see `ConciergeAssignment`).
+///
+/// Soft-delete (`deleted_at`) preserves the audit history. Read-paths filter
+/// `deleted_at = null` unless explicitly auditing.
+model ConciergeOnboarding {
+  id                String                    @id @default(cuid())
+  /// Soft FK into `household.households.id`. Tenant-scope key.
+  householdId       String                    @map("household_id")
+  status            ConciergeOnboardingStatus @default(not_started)
+  /// Scheduled time of the 30-minute kickoff call. Null until scheduled.
+  kickoffScheduledAt DateTime?                @map("kickoff_scheduled_at") @db.Timestamptz(6)
+  /// Onboarding-level free-text notes.
+  notes             String?
+  /// Soft FK into `identity.users.id` — the ops staffer who opened it.
+  startedByUserId   String?                   @map("started_by_user_id")
+  /// Set when every step is completed/skipped (the rollup rolls to
+  /// `completed`); cleared if a step is later re-opened.
+  completedAt       DateTime?                 @map("completed_at") @db.Timestamptz(6)
+  /// Set when the onboarding is explicitly canceled (sticky terminal).
+  canceledAt        DateTime?                 @map("canceled_at") @db.Timestamptz(6)
+  createdAt         DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime                  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone; populated by ops only. Read-paths filter
+  /// `deleted_at = null` unless explicitly auditing.
+  deletedAt         DateTime?                 @map("deleted_at") @db.Timestamptz(6)
+
+  /// The ordered checklist steps. In-service relation (both tables in the
+  /// `concierge` schema) — allowed since it does not cross a service boundary
+  /// (CLAUDE.md §4.1). `ON DELETE CASCADE` keeps the steps consistent if an
+  /// onboarding is ever hard-deleted (today onboardings are soft-deleted only).
+  steps             ConciergeOnboardingStep[]
+
+  /// Tenant-scope filter + "this household's onboarding" read.
+  @@index([householdId], map: "concierge_onboardings_household_id_idx")
+  /// Status-filtered ops queue ("which onboardings are still in progress").
+  @@index([status], map: "concierge_onboardings_status_idx")
+  /// Soft-delete filter on list reads.
+  @@index([deletedAt], map: "concierge_onboardings_deleted_at_idx")
+  // The single-active partial unique index
+  // (`concierge_onboardings_one_active_per_household`) is added in the
+  // hand-written migration — Prisma cannot express its WHERE predicate.
+  @@map("concierge_onboardings")
+  @@schema("concierge")
+}
+
+/// One checklist step on a Tier-3 onboarding (TS-228). Seeded from the frozen
+/// `CONCIERGE_ONBOARDING_STEP_TEMPLATE` at create time — six rows per
+/// onboarding. The step's human-facing `title` / `description` are NOT stored
+/// (they live in the template constant + are projected onto the wire record),
+/// so a template copy edit needs no data migration.
+///
+/// `onboarding_id` is an in-service relation to `ConciergeOnboarding` (both in
+/// the `concierge` schema — a real FK is allowed; CLAUDE.md §4.1 forbids FKs
+/// only ACROSS service schemas). `ON DELETE CASCADE` keeps the checklist
+/// consistent on a hard delete.
+///
+/// `household_id` is denormalised from the parent onboarding — it is the
+/// tenant-scope key the TS-141 Prisma extension filters on (so every model in
+/// this service carries the household axis; `unscopedModels: []`).
+///
+/// `completed_by_user_id` is a soft FK into `identity.users.id` — the
+/// concierge who completed the step (set only when `status = 'completed'`).
+model ConciergeOnboardingStep {
+  id                String                        @id @default(cuid())
+  /// In-service relation to the parent onboarding (see model header).
+  onboardingId      String                        @map("onboarding_id")
+  onboarding        ConciergeOnboarding           @relation(fields: [onboardingId], references: [id], onDelete: Cascade)
+  /// Denormalised tenant-scope key — copied from the parent onboarding.
+  householdId       String                        @map("household_id")
+  stepKey           ConciergeOnboardingStepKey    @map("step_key")
+  status            ConciergeOnboardingStepStatus @default(pending)
+  /// Ordering within the checklist (from the template).
+  sortPosition      Int                           @map("sort_position")
+  /// Per-step free-text notes (what was covered, follow-ups).
+  notes             String?
+  /// Set when `status = 'completed'`; cleared otherwise.
+  completedAt       DateTime?                     @map("completed_at") @db.Timestamptz(6)
+  /// Soft FK into `identity.users.id` — the concierge who completed the step.
+  completedByUserId String?                       @map("completed_by_user_id")
+  createdAt         DateTime                      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime                      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// One row per (onboarding, step) — the seed + every update upsert on this.
+  @@unique([onboardingId, stepKey], map: "concierge_onboarding_steps_onboarding_step_key")
+  /// Tenant-scope filter + "all steps for this household" reads.
+  @@index([householdId], map: "concierge_onboarding_steps_household_id_idx")
+  @@map("concierge_onboarding_steps")
+  @@schema("concierge")
+}
+
+/// Tier-3 weekly enrichment-summary lifecycle (TS-229; PRD §5.1 Tier 3, §6.9).
+///
+///   `draft`     = the concierge's private compose buffer; NOT family-visible.
+///   `published` = visible on the family dashboard + at its permalink (stamps
+///                 `published_at` + `published_by_user_id`).
+///   `archived`  = retired from the family view; re-publishable (stamps
+///                 `archived_at`). No terminal state — all three are mutually
+///                 reachable (enforced at the service layer against the
+///                 `CONCIERGE_ENRICHMENT_SUMMARY_STATUS_TRANSITIONS` matrix,
+///                 not by a DB constraint).
+enum ConciergeEnrichmentSummaryStatus {
+  draft
+  published
+  archived
+
+  @@map("concierge_enrichment_summary_status")
+  @@schema("concierge")
+}
+
+/// Tier-3 weekly enrichment summary (TS-229; PRD §5.1 Tier 3, §6.9; PDD §12.1).
+/// The dedicated concierge writes a short weekly narrative — visit highlights,
+/// wellness signals, social engagement — for a Concierge Lifestyle household;
+/// the family-portal dashboard surfaces the PUBLISHED summaries with a stable
+/// per-week permalink. This is the white-glove differentiator above the
+/// Tier-1/2 automated wellness check-in (PRD §6.9).
+///
+/// `household_id` is a soft FK into `household.households.id` — never a Prisma
+/// relation (cross-service relations violate CLAUDE.md §2.3 / §4.1). It is the
+/// tenant-scope key the TS-141 Prisma extension filters on.
+///
+/// `authored_by_user_id` / `published_by_user_id` are soft FKs into
+/// `identity.users.id` — the concierge who wrote / published the summary
+/// (authoritative from the verified token, never client-supplied).
+///
+/// **Week-keyed.** `week_start_date` is the Monday anchoring the week (a
+/// `DATE`, no time). A household has at most one non-deleted summary per week —
+/// enforced by the partial unique index
+/// `concierge_enrichment_summaries_one_per_household_week`
+/// (WHERE `deleted_at IS NULL`). Prisma's `@@unique` cannot express the partial
+/// predicate, so the index is hand-written in the migration (the established
+/// convention — see `ConciergeAssignment` / `ConciergeOnboarding`).
+///
+/// **Email-on-publish deferred.** service-concierge has no outbox yet; the
+/// `concierge.enrichment_summary_published` → `service-notification` hop is a
+/// TS-229 follow-up. The permalink + dashboard read ship now.
+///
+/// Soft-delete (`deleted_at`) preserves the audit history. Read-paths filter
+/// `deleted_at = null` unless explicitly auditing.
+model ConciergeEnrichmentSummary {
+  id                String                           @id @default(cuid())
+  /// Soft FK into `household.households.id`. Tenant-scope key.
+  householdId       String                           @map("household_id")
+  /// The Monday anchoring the summarised week (date only, no time).
+  weekStartDate     DateTime                         @map("week_start_date") @db.Date
+  status            ConciergeEnrichmentSummaryStatus @default(draft)
+  /// Short headline shown on the family dashboard card + the ops list.
+  headline          String
+  /// Narrative: highlights of the week's visits.
+  visitHighlights   String                           @map("visit_highlights")
+  /// Narrative: wellness signals (mood, appetite, hydration, mobility).
+  wellnessSignals   String                           @map("wellness_signals")
+  /// Narrative: social engagement (outings, companionship, connection).
+  socialEngagement  String                           @map("social_engagement")
+  /// Optional closing notes.
+  additionalNotes   String?                          @map("additional_notes")
+  /// Soft FK into `identity.users.id` — the concierge who authored it.
+  authoredByUserId  String?                          @map("authored_by_user_id")
+  /// Set when the summary is published (the rollup goes family-visible);
+  /// cleared when unpublished back to draft.
+  publishedAt       DateTime?                        @map("published_at") @db.Timestamptz(6)
+  /// Soft FK into `identity.users.id` — the concierge who published it.
+  publishedByUserId String?                          @map("published_by_user_id")
+  /// Set when the summary is archived; cleared when it leaves the archived state.
+  archivedAt        DateTime?                        @map("archived_at") @db.Timestamptz(6)
+  createdAt         DateTime                         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime                         @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone; populated by ops only. Read-paths filter
+  /// `deleted_at = null` unless explicitly auditing.
+  deletedAt         DateTime?                        @map("deleted_at") @db.Timestamptz(6)
+
+  /// Dominant read: "this household's summaries, newest-week-first" — powers
+  /// both the family dashboard list and the ops per-household view. Composite
+  /// so one index scan filters by household AND returns rows ordered by week.
+  @@index([householdId, weekStartDate(sort: Desc)], map: "concierge_enrichment_summaries_household_week_idx")
+  /// Status-filtered ops queue ("which summaries are still drafts").
+  @@index([status], map: "concierge_enrichment_summaries_status_idx")
+  /// Soft-delete filter on list reads.
+  @@index([deletedAt], map: "concierge_enrichment_summaries_deleted_at_idx")
+  // The one-per-household-week partial unique index
+  // (`concierge_enrichment_summaries_one_per_household_week`) is added in the
+  // hand-written migration — Prisma cannot express its WHERE predicate.
+  @@map("concierge_enrichment_summaries")
+  @@schema("concierge")
+}
+
+/// Transportation-request lifecycle (TS-226; PRD §5.1 Tier 3 "transportation
+/// coordination"). A vendor-agnostic domain lifecycle the inbound ride-status
+/// webhook maps the raw vendor status onto. `requested` → `scheduled` →
+/// `in_progress` → `completed`; `canceled` is reachable from any non-terminal
+/// state, and `requested` may jump straight to `in_progress` for an on-demand
+/// ride. `completed` + `canceled` are terminal (enforced at the service layer
+/// against the `CONCIERGE_RIDE_STATUS_TRANSITIONS` matrix, not by a DB
+/// constraint).
+enum ConciergeRideStatus {
+  requested
+  scheduled
+  in_progress
+  completed
+  canceled
+
+  @@map("concierge_ride_status")
+  @@schema("concierge")
+}
+
+/// Booking source for a transportation request (TS-226) — the Phase-3 adapter
+/// seam. `manual` is the Phase-1 default (the concierge booked the ride by
+/// phone / a partner app and drives the lifecycle by hand); `uber_health` /
+/// `lyft_health` name the live ride-hailing integrations wired in Phase 3
+/// (TS-226-followup; requires an SDK ADR per CLAUDE.md §13). Additive only.
+enum ConciergeTransportationProvider {
+  manual
+  uber_health
+  lyft_health
+
+  @@map("concierge_transportation_provider")
+  @@schema("concierge")
+}
+
+/// Concierge transportation request (TS-226; PRD §5.1 Tier 3, §6.6; PDD §10.6)
+/// — the concrete booked ride that fulfils a Tier-3 household's transportation
+/// need: a medical appointment, a museum outing, a social visit. The sibling
+/// of `ConciergeScheduledEvent` (event dining + social outings); a separate
+/// table because a ride carries a distinct lifecycle (a vendor mirrors driver
+/// state back via webhook) and distinct fields (pickup / dropoff vs venue).
+///
+/// `household_id` is a soft FK into `household.households.id` — never a Prisma
+/// relation (cross-service relations violate CLAUDE.md §2.3 / §4.1). It is the
+/// tenant-scope key the TS-141 Prisma extension filters on.
+///
+/// `ticket_id` is an OPTIONAL in-service relation to the originating
+/// `ConciergeTicket` (both tables live in the `concierge` schema, so a real FK
+/// is allowed). Null for a concierge-initiated ride with no family request.
+/// `ON DELETE SET NULL` keeps the ride when its ticket is hard-deleted (the
+/// ride is an independent record).
+///
+/// `created_by_user_id` is a soft FK into `identity.users.id` — the concierge
+/// who arranged the ride (authoritative from the verified token, never
+/// client-supplied).
+///
+/// `external_provider` is the Phase-3 adapter seam (manual / uber_health /
+/// lyft_health); `external_reference` holds the vendor ride id;
+/// `external_status` holds the raw vendor status string the inbound webhook
+/// last mirrored back (null for a `manual` ride — no vendor reports on it). No
+/// PII (no phone number) is stored — the concierge coordinates contact via the
+/// household record; `rider_name` is a low-sensitivity display name only.
+///
+/// Soft-delete (`deleted_at`) preserves the audit history. Read-paths filter
+/// `deleted_at = null` unless explicitly auditing.
+model ConciergeTransportationRequest {
+  id                String                          @id @default(cuid())
+  /// Soft FK into `household.households.id`. Tenant-scope key.
+  householdId       String                          @map("household_id")
+  /// Optional in-service relation to the originating ticket (see header).
+  ticketId          String?                         @map("ticket_id")
+  ticket            ConciergeTicket?                @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+  status            ConciergeRideStatus             @default(requested)
+  externalProvider  ConciergeTransportationProvider @default(manual) @map("external_provider")
+  /// Pickup address free-text (street, building, suite, instructions).
+  pickupAddress     String                          @map("pickup_address")
+  /// Dropoff address free-text.
+  dropoffAddress    String                          @map("dropoff_address")
+  /// When the rider needs to be collected (full timestamp).
+  scheduledPickupAt DateTime                        @map("scheduled_pickup_at") @db.Timestamptz(6)
+  /// Optional trip purpose ("Cardiology follow-up", "Met museum outing").
+  purpose           String?
+  /// Optional rider display name (the senior travelling). Never a phone.
+  riderName         String?                         @map("rider_name")
+  /// Vendor ride id / confirmation reference from the booking source. Null
+  /// until the ride is booked with a vendor (always null for `manual`).
+  externalReference String?                         @map("external_reference")
+  /// Raw vendor status string the inbound webhook last mirrored back. Null for
+  /// a `manual` ride.
+  externalStatus    String?                         @map("external_status")
+  /// Concierge coordination notes (accessibility, mobility aid, escort).
+  notes             String?
+  /// Soft FK into `identity.users.id` — the concierge who arranged it.
+  createdByUserId   String                          @map("created_by_user_id")
+  createdAt         DateTime                        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime                        @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone; populated by ops only. Read-paths filter
+  /// `deleted_at = null` unless explicitly auditing.
+  deletedAt         DateTime?                       @map("deleted_at") @db.Timestamptz(6)
+
+  /// Dominant ops read: "this household's rides, soonest first" + the
+  /// cross-household upcoming view. Composite so one index scan filters by
+  /// household AND returns rows ordered by pickup time.
+  @@index([householdId, scheduledPickupAt], map: "concierge_transportation_requests_household_pickup_idx")
+  /// "Rides fulfilling this request" — the ticket → fulfilment lookup.
+  @@index([ticketId], map: "concierge_transportation_requests_ticket_id_idx")
+  /// Status-filtered ops views.
+  @@index([status], map: "concierge_transportation_requests_status_idx")
+  /// Webhook lookup: match an inbound vendor event by (provider, ride id).
+  @@index([externalProvider, externalReference], map: "concierge_transportation_requests_provider_ref_idx")
+  /// Soft-delete filter on list reads.
+  @@index([deletedAt], map: "concierge_transportation_requests_deleted_at_idx")
+  @@map("concierge_transportation_requests")
+  @@schema("concierge")
+}

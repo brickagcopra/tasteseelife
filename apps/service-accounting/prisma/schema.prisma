@@ -1,0 +1,1164 @@
+// Accounting bounded context — see PDD §7.2 (service inventory entry #10),
+// PDD §11.2 (double-entry accounting engine), and PDD Appendix A (sample
+// journal entries).
+//
+// Scope so far:
+//   - TS-080 adds the `chart_of_accounts` catalog + the `journals`,
+//     `journal_lines`, and `periods` tables — the double-entry shape +
+//     period close envelope. Seeded by `pnpm seed:chart-of-accounts`
+//     with the SaaS-standard chart (assets, liabilities, equity,
+//     revenue + per-tier subscription revenue sub-accounts, contra-
+//     revenue for coupon discounts + refunds, payment processing fees,
+//     and provider payable + deferred revenue sub-accounts per tier).
+//   - TS-081 adds JournalsModule with JournalPostingService +
+//     AccountingPeriodService (no schema change — the write paths land
+//     atop TS-080's catalog + envelope tables). Service-layer enforces
+//     the double-entry balance invariant (sum DR = sum CR per
+//     currency); DB-level CHECK constraints (already in the TS-080
+//     migration) defend ad-hoc inserts.
+//   - TS-082 adds RevenueRecognitionModule with the
+//     `deferred_revenue_balances` table tracking per-subscription
+//     deferred amounts amortised into Subscription Revenue over the
+//     service period (CLAUDE.md §17.17 — never recognise on payment).
+//     The SubscriptionRevenueRecognizerService.recognizeActivation
+//     creates the balance row + posts the activation journal in one
+//     transaction; recognizeDaily sweeps active balances cumulatively;
+//     cancelDeferredRevenue halts recognition. Refund + cancellation-
+//     with-refund reversals land in TS-084.
+//   - TS-085 adds PeriodsModule with PeriodLifecycleService (close /
+//     reopen) + PeriodCalendarService (ahead-of-time monthly period
+//     generation). The `period_lifecycle_events` table preserves every
+//     `open → closed` and `closed → open` transition with actor,
+//     reason code, and source-event-id idempotency (the
+//     `AccountingPeriod.closedAt` column is the MOST RECENT close
+//     only — the events table is the audit-log primitive that
+//     CLAUDE.md §6 requires). The lazy-create path on
+//     AccountingPeriodService remains as the safety net (retirement
+//     captured as TS-081-followup-8).
+//
+//   - TS-083 adds BookingCommissionModule with
+//     `provider_payable_balances` (per-provider running balance, one
+//     row per `(provider_id, currency)`) and the
+//     BookingCommissionRecognizerService that posts the four-line
+//     booking-completion journal (DR Cash / CR Marketplace Revenue
+//     gross + DR Marketplace Revenue Contra / CR Provider Payable)
+//     per PDD Appendix A AND upserts the matching balance row in one
+//     transaction. The running balance is the materialised view the
+//     payouts service (TS-090/091) drives off — without it, ops would
+//     have to scan every `journal_lines` row to answer "what do we owe
+//     this provider right now".
+//
+// Deliberately deferred to follow-on tasks (all per PDD §11.2 +
+// Appendix A):
+//   - TS-084 — coupon contra-revenue + refund reversal entries.
+//
+// Splitting these by task keeps each migration focused and reviewable.
+// The skeleton ships only the catalog tables + the read-only listing
+// endpoint, with NO write paths beyond the idempotent seed.
+//
+// Cross-service references are by id only — never a foreign key into
+// another service schema (CLAUDE.md §2.3, §4.1). `journals.source_event_id`
+// points at an event id from the outbox (subscription.activated,
+// booking.completed, payout.disbursed, etc.); `journals.posted_by_user_id`
+// is a soft FK into `identity.users.id`. Cross-schema joins are forbidden
+// — the gateway aggregates when a view needs the journal + the actor
+// metadata together.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. Production-stable since
+  // Prisma 5.0 even though it remains under the `previewFeatures` umbrella
+  // in 5.x.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `accounting` Postgres schema. Every other service
+  // gets its own schema in the same database (Phase 1) or its own database
+  // entirely (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["accounting"]
+}
+
+/// Top-level account type. Drives report categorisation (trial balance,
+/// balance sheet, income statement). Mirrors GAAP categories.
+///
+/// - `asset`          — Cash, Accounts Receivable.
+/// - `liability`      — Deferred Revenue, Provider Payable, Taxes Payable.
+/// - `equity`         — Retained Earnings, Owners' Equity.
+/// - `revenue`        — Subscription Revenue, Marketplace Revenue,
+///                      Academy Revenue, Partnership Revenue.
+/// - `contra_revenue` — Coupon Discount, Refunds. Reduces gross revenue;
+///                      its normal balance is DEBIT (opposite of
+///                      `revenue`'s natural credit).
+/// - `expense`        — Payment Processing Fees, Stripe Fees.
+///
+/// Adding a new type is a breaking-but-explicit contract change — every
+/// downstream report that categorises by `type` either picks up the new
+/// variant or rejects it. The deliberate omission of `contra_asset` /
+/// `contra_expense` etc. matches PRD §10.8 reporting needs at launch.
+enum AccountType {
+  asset
+  liability
+  equity
+  revenue
+  contra_revenue
+  expense
+
+  @@map("account_type")
+  @@schema("accounting")
+}
+
+/// The "natural" side of each account — the side that **increases** the
+/// account's balance. Standard accounting:
+///
+///   asset           → debit  (increases on the left)
+///   liability       → credit (increases on the right)
+///   equity          → credit
+///   revenue         → credit
+///   contra_revenue  → debit  (reduces revenue, opposite of revenue's natural)
+///   expense         → debit
+///
+/// The catalog seeds the correct value for each line. The journal-posting
+/// service (TS-081) reads `normalBalance` to compute increase/decrease
+/// from a posted debit or credit, and to drive the balance-sheet sign
+/// conventions in the trial-balance report.
+enum AccountNormalBalance {
+  debit
+  credit
+
+  @@map("account_normal_balance")
+  @@schema("accounting")
+}
+
+/// Lifecycle status of an accounting period. Periods are typically months
+/// (e.g. `2026-05`) but the model is calendar-agnostic — quarterly /
+/// custom-fiscal periods can land later by changing the period generator,
+/// not the data model.
+///
+/// - `open`   — posts to this period are accepted.
+/// - `closed` — posts to this period require role `finance:adjust` AND an
+///              explicit reopen (CLAUDE.md §6). Reopen is audit-logged.
+enum PeriodStatus {
+  open
+  closed
+
+  @@map("period_status")
+  @@schema("accounting")
+}
+
+/// Categorical kind of a journal entry. Drives the per-category report
+/// roll-ups (e.g. "total marketplace commission revenue last quarter")
+/// and the per-event-source filter on the admin journal browser
+/// (TS-129). Each kind has its own canonical entry shape — see PDD
+/// Appendix A.
+///
+/// - `subscription_activation`    — DR Cash / CR Deferred Revenue at
+///                                  charge time.
+/// - `subscription_recognition`   — DR Deferred Revenue / CR Subscription
+///                                  Revenue as the period elapses
+///                                  (CLAUDE.md §17.17).
+/// - `subscription_cancellation`  — Reversal of unrecognised deferred
+///                                  revenue on cancellation.
+/// - `booking_completion`         — DR Cash / CR Marketplace Revenue +
+///                                  DR Marketplace Revenue contra /
+///                                  CR Provider Payable.
+/// - `provider_payout`            — DR Provider Payable / CR Cash on
+///                                  Stripe transfer success.
+/// - `refund`                     — Reversal of revenue + cash on
+///                                  customer refund.
+/// - `coupon_redemption`          — Contra-revenue entry against the
+///                                  discounted subscription invoice.
+/// - `payment_processing_fee`     — DR Payment Processing Fees / CR Cash
+///                                  for Stripe-side fees.
+/// - `manual_adjustment`          — `finance:adjust`-gated correction.
+/// - `period_close`               — Period-rollover envelope (TS-085).
+/// - `reversal`                   — Explicit reversal of a prior journal
+///                                  (links via `reversed_journal_id`).
+enum JournalKind {
+  subscription_activation
+  subscription_recognition
+  subscription_cancellation
+  booking_completion
+  provider_payout
+  refund
+  coupon_redemption
+  payment_processing_fee
+  manual_adjustment
+  period_close
+  reversal
+
+  @@map("journal_kind")
+  @@schema("accounting")
+}
+
+/// Chart of accounts entry (PDD §8.2 `chart_of_accounts` table).
+///
+/// **`code`** is the stable accounting identifier (`1000`, `1100`,
+/// `4000.family.tier1`, etc.). Codes follow the SaaS-standard four-digit
+/// numbering — assets `1xxx`, liabilities `2xxx`, equity `3xxx`,
+/// revenue `4xxx`, contra-revenue `45xx`/`46xx`, expense `5xxx`.
+/// Sub-accounts use dot-notation: `4000.family.tier2` is a child of
+/// `4000`. Stable forever — they're quoted in reports + audit trails
+/// + accounting exports; renames are not supported.
+///
+/// **`parent_id`** lets the chart be hierarchical without a separate
+/// closure table. The tree is shallow (2–3 levels: top → category →
+/// per-tier sub-account); a self-FK is sufficient. The seed populates
+/// parents before children inside the same transaction so a failed seed
+/// can't leave dangling parents.
+///
+/// **`normal_balance`** is the catalog's canonical "which side increases
+/// this account". TS-081's journal-posting service reads this to compute
+/// increase/decrease semantics and to drive trial-balance sign
+/// conventions. Phase-1 has one valid value per `type`; the column is
+/// nonetheless explicit so the catalog (not application code) is the
+/// authority.
+///
+/// **`currency`** defaults to USD (Phase 1 single-currency). The schema
+/// is multi-currency-ready per PDD §11.2; cross-currency consolidation
+/// is a Phase 3 concern.
+///
+/// **Soft-delete is intentionally NOT supported** — accounts never
+/// disappear. Admin tooling toggles `active = false` to retire an
+/// account; historical journal lines that reference it remain readable.
+model ChartOfAccount {
+  id              String                @id @default(cuid())
+  /// Stable accounting code. UNIQUE. Lower-case dot-notation for
+  /// sub-accounts (`4000.family.tier1`); top-level accounts are bare
+  /// four-digit strings (`1000`, `2100`).
+  code            String                @unique
+  /// Human-readable name rendered on reports and admin tools.
+  /// (`"Cash"`, `"Subscription Revenue — Tier 2 Companion Dining"`).
+  name            String
+  /// Optional admin-facing description (purpose, examples of postings
+  /// that hit this account). Capped at the contract layer to 2000 chars.
+  description     String?
+  type            AccountType
+  /// Self-FK so the chart can be a tree. Sub-accounts roll up to their
+  /// parent in reports; the top-level entries have `parent_id = null`.
+  parentId        String?               @map("parent_id")
+  parent          ChartOfAccount?       @relation("ChartOfAccountHierarchy", fields: [parentId], references: [id])
+  children        ChartOfAccount[]      @relation("ChartOfAccountHierarchy")
+  normalBalance   AccountNormalBalance  @map("normal_balance")
+  /// ISO 4217 currency code. Phase-1 is USD only; the schema is
+  /// multi-currency-ready so a Phase-3 international rollout is
+  /// forward-compatible.
+  currency        String                @default("USD") @db.Char(3)
+  /// `true` = account is selectable for new journal lines. `false` =
+  /// retired; backs historical journal lines but no new ones. Mirrors
+  /// the `Plan.active` retire pattern in service-subscription.
+  active          Boolean               @default(true)
+  createdAt       DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime              @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  lines           JournalLine[]
+
+  /// Top-of-tree listing: "show every active account, ordered by code".
+  /// Covering composite so the admin ledger view + the seed idempotency
+  /// check both satisfy from this index.
+  @@index([active, code], map: "chart_of_accounts_active_code_idx")
+  /// Per-parent listing (sub-account drilldown): "show me every child of
+  /// account X".
+  @@index([parentId, code], map: "chart_of_accounts_parent_idx")
+  /// Type-filtered roll-ups: "show every revenue account".
+  @@index([type, active, code], map: "chart_of_accounts_type_active_idx")
+  @@map("chart_of_accounts")
+  @@schema("accounting")
+}
+
+/// Accounting period (PDD §8.2 `periods` table).
+///
+/// Typically a month — `name = '2026-05'`, `startDate = 2026-05-01`,
+/// `endDate = 2026-05-31`. The model is calendar-agnostic so quarterly
+/// or custom-fiscal periods land later without DDL.
+///
+/// **`status`** drives the post-acceptance gate:
+///   - `open`   — TS-081 accepts posts whose `occurred_at` falls inside
+///                `[startDate, endDate]`.
+///   - `closed` — Post requires role `finance:adjust` AND an explicit
+///                reopen (TS-085). Reopen flips status back to `open`
+///                and audit-logs the operation.
+///
+/// **`closed_at` / `closed_by_user_id`** are stamped on the
+/// `open → closed` transition. Reopens DO NOT clear them — the close
+/// happened, and the audit record is preserved. A subsequent re-close
+/// overwrites with the new timestamp.
+///
+/// Periods are created ahead of time by a calendar generator (TS-085);
+/// the seed does NOT create any periods. Phase-1 ops manually create
+/// the next period via admin tooling; Phase-2 automates the creation.
+model AccountingPeriod {
+  id                  String        @id @default(cuid())
+  /// Display name. Conventionally `YYYY-MM` for monthly periods, but
+  /// the column is free-form to accommodate `2026-Q2` etc. UNIQUE.
+  name                String        @unique
+  /// Inclusive start date.
+  startDate           DateTime      @map("start_date") @db.Date
+  /// Inclusive end date. The period covers
+  /// `[start_date 00:00:00 UTC, end_date 23:59:59.999999 UTC]`.
+  endDate             DateTime      @map("end_date") @db.Date
+  status              PeriodStatus  @default(open)
+  /// Timestamp of the most recent `open → closed` transition. Null for
+  /// periods that have never been closed; preserved across reopens.
+  closedAt            DateTime?     @map("closed_at") @db.Timestamptz(6)
+  /// User who closed the period. Soft FK into `identity.users.id`.
+  /// Null for never-closed periods; preserved across reopens.
+  closedByUserId      String?       @map("closed_by_user_id")
+  createdAt           DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  journals            Journal[]
+  lifecycleEvents     PeriodLifecycleEvent[]
+
+  /// "List periods in calendar order" — admin period-management view.
+  @@index([startDate(sort: Desc)], map: "accounting_periods_start_desc_idx")
+  /// "Find the period covering this date" — TS-081 post-acceptance
+  /// guard. The composite is bounded enough that a planner doesn't
+  /// need a more specialised range index.
+  @@index([status, startDate, endDate], map: "accounting_periods_status_range_idx")
+  @@map("accounting_periods")
+  @@schema("accounting")
+}
+
+/// Journal envelope (PDD §8.2 `journals` table).
+///
+/// **A journal is an immutable, balanced double-entry transaction.** Each
+/// row groups two-or-more `JournalLine` children whose debits and credits
+/// sum to zero (in the same `currency`). The journal-posting service
+/// (TS-081) enforces the invariant at the service layer with a
+/// transactional abort.
+///
+/// **Immutability** (CLAUDE.md §6, §17.7). No row in this table is ever
+/// updated or deleted. Corrections are explicit reversal journals + a
+/// replacement journal:
+///   - The reversal carries `kind = 'reversal'` and `reversed_journal_id`
+///     pointing at the journal being undone; its lines are the original's
+///     with debit↔credit swapped.
+///   - The replacement is a fresh journal of the appropriate kind.
+/// The `reversed_by_journal_id` back-pointer lets reports skip "reversed
+/// pairs" without scanning.
+///
+/// **`source_event_id`** is the upstream identifier that produced this
+/// journal — the outbox event id for system-driven journals
+/// (subscription.activated, booking.completed, payout.disbursed,
+/// invoice.payment_succeeded, etc.), an admin request id for manual
+/// adjustments. Stored as text because the upstream id format varies
+/// across services. UNIQUE — enforces exactly-once posting; a relayed
+/// duplicate of the same source event is rejected by the unique index.
+///
+/// **`period_id`** is the accounting period this journal belongs to,
+/// computed from `occurred_at` at post time. Once a period closes,
+/// new posts to it require role `finance:adjust` + explicit reopen.
+///
+/// **`posted_at`** is when the journal was persisted. May trail
+/// `occurred_at` (e.g. a webhook arrives next day → the journal is
+/// posted now but its occurrence date is yesterday).
+///
+/// **`posted_by_user_id`** is the actor for ops-driven journals (manual
+/// adjustments). Null for system-driven journals — those carry
+/// `actorKind = 'system'` implicitly via the non-null `source_event_id`.
+model Journal {
+  id                   String              @id @default(cuid())
+  kind                 JournalKind
+  /// Business date the entry is dated as-of (drives `period_id` choice +
+  /// revenue-recognition windows). May trail `posted_at` for journals
+  /// posted from a late-arriving webhook.
+  occurredAt           DateTime            @map("occurred_at") @db.Timestamptz(6)
+  /// Soft pointer at the upstream event id that produced this journal.
+  /// UNIQUE — the relay's at-least-once delivery is squashed to
+  /// exactly-once posting at the DB layer.
+  sourceEventId        String              @unique @map("source_event_id")
+  /// Human-readable label for ledger reports. Capped at the contract
+  /// layer.
+  description          String
+  /// Persistence timestamp. Set on insert; never updated.
+  postedAt             DateTime            @default(now()) @map("posted_at") @db.Timestamptz(6)
+  /// If this journal has been reversed, the reversal journal's id. Null
+  /// for un-reversed journals. Set exactly once (CLAUDE.md §6
+  /// immutability — the column itself is mutated once but the reversal
+  /// journal it points at IS the audit record).
+  reversedByJournalId  String?             @map("reversed_by_journal_id")
+  /// If this journal IS a reversal, the original journal's id. Null
+  /// for normal journals.
+  reversedJournalId    String?             @map("reversed_journal_id")
+  /// User who posted the journal. Null for system-driven journals
+  /// (which carry a non-null `source_event_id` from the outbox).
+  postedByUserId       String?             @map("posted_by_user_id")
+  /// The accounting period this journal belongs to. Computed from
+  /// `occurred_at` at post time. FK — periods are owned by this same
+  /// schema so a real FK is allowed.
+  periodId             String              @map("period_id")
+  period               AccountingPeriod    @relation(fields: [periodId], references: [id])
+  /// Free-form context (the Stripe event payload digest, the booking
+  /// id triggering a commission post, etc). Stored as `jsonb` so
+  /// reports can drill in without joining another service.
+  context              Json                @default("{}")
+
+  lines                JournalLine[]
+
+  /// Per-period chronological scroll — the dominant report read pattern.
+  @@index([periodId, occurredAt(sort: Desc)], map: "journals_period_occurred_idx")
+  /// Per-kind roll-up — "every booking-completion journal in May".
+  @@index([kind, occurredAt(sort: Desc)], map: "journals_kind_occurred_idx")
+  /// Reversal lookup — "did this journal get reversed?".
+  @@index([reversedJournalId], map: "journals_reversed_idx")
+  @@map("journals")
+  @@schema("accounting")
+}
+
+/// Journal line — one side of a double-entry posting (PDD §8.2
+/// `journal_lines` table).
+///
+/// **Exactly one of `debit` or `credit` is non-zero on each row.** The
+/// other is `0`. The journal-posting service (TS-081) enforces the
+/// constraint at write time; the DB-level guard (a CHECK constraint
+/// added in the initial migration) defends against ad-hoc inserts.
+///
+/// **Sums-to-zero invariant.** For a given `journal_id` + `currency`,
+/// `SUM(debit) = SUM(credit)`. Enforced by `JournalPostingService`
+/// (TS-081) inside the same Prisma transaction that inserts the
+/// journal; a partial / unbalanced write rolls back atomically.
+///
+/// **`memo`** is per-line context (the specific invoice line item being
+/// recognised, the per-provider portion of a booking commission, etc).
+/// Free-form text, capped at the contract layer.
+///
+/// **No FK to the upstream business object** (subscription, booking,
+/// invoice) — `journals.source_event_id` carries the soft pointer at
+/// the journal level. The line is purely accounting.
+model JournalLine {
+  id          String          @id @default(cuid())
+  journalId   String          @map("journal_id")
+  journal     Journal         @relation(fields: [journalId], references: [id])
+  accountId   String          @map("account_id")
+  account     ChartOfAccount  @relation(fields: [accountId], references: [id])
+  /// Debit amount in `currency` minor units' decimal representation
+  /// (`Decimal(12,2)` — CLAUDE.md §4.1, §17.6). Non-zero on debit
+  /// lines, `0` on credit lines.
+  debit       Decimal         @default(0) @db.Decimal(12, 2)
+  /// Credit amount in `currency` minor units' decimal representation.
+  /// Non-zero on credit lines, `0` on debit lines.
+  credit      Decimal         @default(0) @db.Decimal(12, 2)
+  /// ISO 4217. Phase-1 is USD only; the schema is multi-currency-ready.
+  currency    String          @default("USD") @db.Char(3)
+  /// Per-line context (which invoice line / which provider / etc).
+  /// Capped at the contract layer.
+  memo        String?
+  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// Per-journal scroll (display the two-or-more lines of one journal).
+  @@index([journalId], map: "journal_lines_journal_idx")
+  /// Per-account scroll — "the trial balance for Cash" or "every line
+  /// against Subscription Revenue Tier 2". Composite covers the typical
+  /// "this account in this period" filter.
+  @@index([accountId, journalId], map: "journal_lines_account_journal_idx")
+  @@map("journal_lines")
+  @@schema("accounting")
+}
+
+/// Customer group the deferred-revenue balance belongs to. Mirrors
+/// `subscription.plan_customer_group` 1:1 — duplicated here because
+/// cross-service Prisma references are forbidden (CLAUDE.md §2.3).
+/// The plan code (e.g. `family.tier1`) carries the same vocabulary;
+/// keeping the group as its own column lets the per-group analytics
+/// query (`SUM(original_amount) GROUP BY customer_group`) hit an
+/// index without a parse-the-code text pass.
+enum DeferredRevenueCustomerGroup {
+  family
+  provider
+  academy
+
+  @@map("deferred_revenue_customer_group")
+  @@schema("accounting")
+}
+
+/// Lifecycle status of a deferred-revenue balance.
+///
+/// - `active`            — recognition is in flight; the daily sweep
+///                         continues to amortise.
+/// - `fully_recognized`  — `recognized_amount` has reached
+///                         `original_amount`; no further recognition
+///                         is due (the row is kept as the durable
+///                         record of the completed amortisation).
+/// - `canceled`          — recognition has been halted prior to full
+///                         amortisation (subscription canceled). The
+///                         remaining deferred amount stays on the
+///                         books until TS-084 ships refund / write-off
+///                         handling.
+/// - `paused`            — recognition is SUSPENDED and will resume
+///                         (TS-042-followup-3b2). The daily sweep's
+///                         `where: { status: 'active' }` excludes the
+///                         row for free.
+///
+/// **`paused` is deliberately NOT `canceled`.** `canceled` documents a
+/// halt prior to full amortisation with the remaining balance staying
+/// on the books pending TS-084; un-cancelling on resume would
+/// contradict both that doc and the cancel path's semantics. A pause
+/// is a temporary suspension of an amortisation that WILL complete.
+enum DeferredRevenueStatus {
+  active
+  fully_recognized
+  canceled
+  paused
+
+  @@map("deferred_revenue_status")
+  @@schema("accounting")
+}
+
+/// Per-subscription deferred-revenue balance (PDD §11.2
+/// `deferred_revenue_balances` table).
+///
+/// **Why this table exists.** Subscription revenue is recognised over
+/// the service period, not on payment (CLAUDE.md §17.17). The activation
+/// journal credits Deferred Revenue (a liability); the daily-recognition
+/// driver reads THIS table to compute how much of each balance to
+/// amortise into Subscription Revenue today. The table is therefore
+/// the working state of the amortisation, separate from the immutable
+/// journal-line ledger.
+///
+/// **One row per (subscription, service period).** A subscription
+/// renewing on 2026-06-01 creates a NEW row — each period gets its
+/// own balance row. The composite UNIQUE on
+/// `(subscription_id, service_period_start)` enforces this; a
+/// duplicate activation event for the same period replays cleanly
+/// via the `source_event_id` UNIQUE.
+///
+/// **Money discipline.** `original_amount` and `recognized_amount`
+/// are `Decimal(12,2)` — never floats (CLAUDE.md §17.6). Cumulative
+/// rounding: the recognizer computes the expected total recognised
+/// for the current sweep date and posts the delta vs. what's already
+/// recognised, so rounding pennies don't accumulate across days.
+///
+/// **Cross-service references** by id only — never a foreign key
+/// into `subscription.subscriptions` (CLAUDE.md §2.3). `subscription_id`
+/// is a soft pointer; the gateway aggregates when a view needs both
+/// the balance and the originating subscription.
+///
+/// **`activation_journal_id`** is the soft FK pointing at the
+/// `journals.id` of the activation journal that created this balance.
+/// Kept for the admin "show me the journal that activated this
+/// subscription" lookup; the `journal_lines.account_id` index serves
+/// the inverse query (every deferred-revenue line for Tier 2).
+///
+/// **`source_event_id`** is the upstream event id that triggered
+/// activation — the same value lands on the activation journal's
+/// `journals.source_event_id`. UNIQUE — at-least-once redelivery of
+/// the same activation event squashes to a single balance row + a
+/// single journal.
+model DeferredRevenueBalance {
+  id                    String                          @id @default(cuid())
+  /// Soft pointer into `subscription.subscriptions.id`. Indexed for the
+  /// admin "all balances for this subscription" lookup.
+  subscriptionId        String                          @map("subscription_id")
+  /// Soft pointer into `subscription.customers.id` (or equivalent
+  /// customer-of-record id from service-subscription). Carried for
+  /// per-customer analytics + ops queries; not joined cross-schema.
+  customerId            String                          @map("customer_id")
+  customerGroup         DeferredRevenueCustomerGroup    @map("customer_group")
+  /// Stable plan code matching `subscription.plans.code` (e.g.
+  /// `family.tier2`). Resolves to the deferred + revenue sub-accounts
+  /// `2000.{planCode}` / `4000.{planCode}` via PlanAccountResolverService.
+  planCode              String                          @map("plan_code")
+  /// Deferred amount on activation — the original face value of the
+  /// invoice that landed in Deferred Revenue. Never mutated after
+  /// creation.
+  originalAmount        Decimal                         @map("original_amount") @db.Decimal(12, 2)
+  /// Cumulative amount already recognised as Subscription Revenue.
+  /// Increments on each daily sweep; tops out at `original_amount`
+  /// when status flips to `fully_recognized`.
+  recognizedAmount      Decimal                         @default(0) @map("recognized_amount") @db.Decimal(12, 2)
+  /// ISO 4217. Phase-1 is USD only; the schema is multi-currency-ready.
+  currency              String                          @default("USD") @db.Char(3)
+  /// Service period start (inclusive). The activation journal's
+  /// `occurred_at` is conventionally this date for monthly plans.
+  servicePeriodStart    DateTime                        @map("service_period_start") @db.Timestamptz(6)
+  /// Service period end (inclusive). The final-day recognition sweep
+  /// (when asOf >= servicePeriodEnd) recognises the entire remaining
+  /// deferred amount, handling any rounding leftover.
+  servicePeriodEnd      DateTime                        @map("service_period_end") @db.Timestamptz(6)
+  /// Timestamp of the most recent recognition sweep that mutated this
+  /// row. Null for rows that have not yet been swept (activation just
+  /// landed, daily worker has not run). Drives the idempotency check
+  /// on `recognizeDaily`: a re-run on the same UTC day returns 0
+  /// delta because the cumulative-expected value matches what was
+  /// recognised on the prior run.
+  lastRecognizedAt      DateTime?                       @map("last_recognized_at") @db.Timestamptz(6)
+  status                DeferredRevenueStatus           @default(active)
+  /// Instant the CURRENT pause window opened; null whenever the row is
+  /// not `paused` (TS-042-followup-3b2). The `subscription.resumed`
+  /// event does NOT carry the pause instant, so the extension the
+  /// resume applies cannot be computed without persisting it here.
+  /// Cleared on resume — it describes the in-flight window, not a
+  /// history (the pause/resume audit trail lives on
+  /// `subscription.subscription_status_history`, in the owning
+  /// service).
+  pausedAt              DateTime?                       @map("paused_at") @db.Timestamptz(6)
+  /// Total suspended time across EVERY completed pause window for this
+  /// balance, in whole seconds. Accumulates — a subscription paused
+  /// twice carries the sum.
+  ///
+  /// **Why this column is load-bearing, and why seconds.**
+  /// `computeRecognitionDelta` is purely calendar-driven
+  /// (`originalAmount * elapsed / total`). On resume the service
+  /// extends `service_period_end` by exactly this duration so the
+  /// family receives the service period they paid for; without ALSO
+  /// subtracting it from the elapsed numerator, the first post-resume
+  /// sweep would recognise revenue for days on which no service was
+  /// delivered. The recogniser therefore amortises over
+  /// `(end - start) - paused` — which, because the extension and the
+  /// subtraction use this same integer, is *exactly* the original
+  /// service duration. That invariant is what makes every journal
+  /// already posted against the pre-pause denominator still correct,
+  /// so no reversal / replacement pair is owed (CLAUDE.md §6).
+  /// Seconds, not milliseconds: an `Int` of ms overflows at 24 days
+  /// and pauses routinely exceed that; `BigInt` buys precision the
+  /// day-scale amortisation cannot use.
+  pausedDurationSeconds Int                             @default(0) @map("paused_duration_seconds")
+  /// Soft FK to the activation journal's id. Set on creation; never
+  /// mutated.
+  activationJournalId   String                          @map("activation_journal_id")
+  /// Soft pointer at the upstream activation event id (e.g. the outbox
+  /// `subscription.activated` event id). UNIQUE — at-least-once
+  /// redelivery is squashed to a single balance row.
+  sourceEventId         String                          @unique @map("source_event_id")
+  /// Free-form context (the Stripe invoice id, the plan's marketing
+  /// name at activation time, the customer's locale, etc.). Stored as
+  /// `jsonb` for report drill-down.
+  context               Json                            @default("{}")
+  createdAt             DateTime                        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime                        @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// One balance per (subscription, service period). A renewal creates
+  /// a new row with a later `service_period_start`. The `name` field
+  /// gives the Prisma compound-key alias used in `where` clauses
+  /// (`subscription_period_unique`).
+  @@unique([subscriptionId, servicePeriodStart], name: "subscription_period_unique", map: "deferred_revenue_balances_subscription_period_unique")
+  /// Per-subscription scroll — "show me every balance for this
+  /// subscription, newest first".
+  @@index([subscriptionId, servicePeriodStart(sort: Desc)], map: "deferred_revenue_balances_subscription_idx")
+  /// Daily-sweep filter: WHERE status = 'active' AND service_period_start <= now().
+  /// Partial-status-friendly composite — at steady state most rows are
+  /// `fully_recognized` so the planner narrows hard via the status
+  /// prefix.
+  @@index([status, servicePeriodStart], map: "deferred_revenue_balances_status_period_idx")
+  /// Per-plan roll-up for analytics — "remaining Deferred Revenue by
+  /// plan tier".
+  @@index([planCode, status], map: "deferred_revenue_balances_plan_status_idx")
+  @@map("deferred_revenue_balances")
+  @@schema("accounting")
+}
+
+/// Per-provider running balance — what the platform owes this provider
+/// right now (PDD §8.2 `provider_payable_balances` table).
+///
+/// **Why this table exists.** The booking-completion journal credits
+/// `2100 Provider Payable` with the provider's portion of the gross
+/// commission. To answer "what do we owe provider X today?" without
+/// scanning every `journal_lines` row, we maintain a materialised
+/// running balance row per `(provider_id, currency)`.
+///
+/// **Update path.** TS-083's BookingCommissionRecognizerService upserts
+/// this row on every booking completion (`amount += providerPortion`)
+/// in the SAME `prisma.$transaction` that posts the journal — the
+/// ledger and the materialised view stay in lockstep. TS-090/091
+/// (provider payouts) will decrement on Stripe transfer success.
+/// TS-084 (refund post-payout) may legitimately drive the balance
+/// negative when the customer refund arrives AFTER the provider has
+/// been paid out (clawback) — no DB CHECK constraint defends against
+/// this, the application-layer ops queue handles the negative case.
+///
+/// **One row per (provider, currency).** The composite UNIQUE supports
+/// the upsert contract. Cross-currency rows live on separate rows
+/// (Phase 1 is USD only).
+///
+/// **Cross-service references.** `provider_id` is a soft pointer into
+/// `provider.providers.id` — cross-schema joins forbidden (CLAUDE.md
+/// §2.3). The gateway aggregates when a view needs the provider's
+/// display name alongside the running balance.
+model ProviderPayableBalance {
+  id              String   @id @default(cuid())
+  /// Soft pointer into `provider.providers.id`. Indexed for the
+  /// per-provider lookup.
+  providerId      String   @map("provider_id")
+  /// ISO 4217. Phase-1 USD only; multi-currency-ready schema.
+  currency        String   @default("USD") @db.Char(3)
+  /// Running balance — what the platform owes this provider, summed
+  /// across every booking-completion journal credit minus payout
+  /// disbursement debits (TS-090/091). `Decimal(12,2)` per CLAUDE.md
+  /// §17.6. Defaults to 0 on first insert; may legitimately go
+  /// negative under the TS-084 refund-after-payout flow (clawback).
+  amount          Decimal  @default(0) @db.Decimal(12, 2)
+  /// Timestamp of the most recent mutation. Drives the ops dashboard's
+  /// "how stale is this balance" indicator and the payouts worker's
+  /// "balances updated since last sweep" filter.
+  lastUpdatedAt   DateTime @default(now()) @map("last_updated_at") @db.Timestamptz(6)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// One row per (provider, currency). The composite UNIQUE supports
+  /// the upsert-on-completion contract; the Prisma compound-key alias
+  /// `provider_currency_unique` reads naturally in `where` clauses.
+  @@unique([providerId, currency], name: "provider_currency_unique", map: "provider_payable_balances_provider_currency_unique")
+  /// Per-provider scroll — the dominant admin "show this provider's
+  /// outstanding payable" + payouts worker filter.
+  @@index([providerId], map: "provider_payable_balances_provider_idx")
+  @@map("provider_payable_balances")
+  @@schema("accounting")
+}
+
+/// Kind of lifecycle transition on an accounting period. Captured on
+/// `period_lifecycle_events.kind` for every `open → closed` and
+/// `closed → open` transition.
+enum PeriodLifecycleEventKind {
+  close
+  reopen
+
+  @@map("period_lifecycle_event_kind")
+  @@schema("accounting")
+}
+
+/// Audit row for every period lifecycle transition (TS-085, PDD §11.2,
+/// CLAUDE.md §6 — "Reopen is audit-logged").
+///
+/// **Why this table exists.** `AccountingPeriod.closedAt` /
+/// `closedByUserId` capture only the MOST RECENT close — a re-close
+/// overwrites them. This table preserves EVERY transition so the
+/// finance audit trail is the canonical record. Until TS-100 audit-svc
+/// (Cassandra cold) lands, this IS the audit log for period lifecycle.
+///
+/// **Idempotency on `source_event_id`.** An admin double-clicking the
+/// "close period" submit button (or a transient network retry) must
+/// not produce a second audit row. The UNIQUE constraint at the DB
+/// layer + the service-layer P2002 refetch surface the cached event
+/// on a redelivery (matching the journal-posting + revenue-recognition
+/// patterns from TS-081 / TS-082).
+///
+/// **Cross-schema references** are forbidden (CLAUDE.md §2.3, §4.1) —
+/// `actor_user_id` is a soft pointer into `identity.users.id`; the
+/// gateway aggregates when a view needs the actor's display name
+/// alongside the audit row. `period_id` IS allowed as a real FK
+/// because the target table lives in the same `accounting` schema.
+model PeriodLifecycleEvent {
+  id             String                    @id @default(cuid())
+  /// FK to the accounting period this event belongs to. Both tables
+  /// live in the same schema so a real FK is allowed.
+  periodId       String                    @map("period_id")
+  period         AccountingPeriod          @relation(fields: [periodId], references: [id])
+  kind           PeriodLifecycleEventKind
+  /// User who triggered the transition. Soft FK into
+  /// `identity.users.id` — cross-schema joins are forbidden.
+  actorUserId    String                    @map("actor_user_id")
+  /// Admin-supplied stable id for the lifecycle action (a UUID minted
+  /// by the admin client on submit). UNIQUE — a redelivery / double-
+  /// click squashes to the same audit row.
+  sourceEventId  String                    @unique @map("source_event_id")
+  /// Short reason code (e.g. `monthly_close`, `late_invoice_adjustment`).
+  /// Capped at the contract layer.
+  reasonCode     String                    @map("reason_code")
+  /// Optional longer-form description. Capped at the contract layer.
+  description    String?
+  /// Effective moment of the transition. Defaults to the service's
+  /// `now()` when the request omits it.
+  occurredAt     DateTime                  @map("occurred_at") @db.Timestamptz(6)
+  /// Persistence timestamp. Set on insert; never updated.
+  createdAt      DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// Per-period chronological scroll — "show me every close + reopen
+  /// of period 2026-05, newest first". The dominant audit-trail query.
+  @@index([periodId, occurredAt(sort: Desc)], map: "period_lifecycle_events_period_idx")
+  /// Per-actor roll-up — "every period this user closed or reopened".
+  /// Finance staff review.
+  @@index([actorUserId, occurredAt(sort: Desc)], map: "period_lifecycle_events_actor_idx")
+  @@map("period_lifecycle_events")
+  @@schema("accounting")
+}
+
+/// Outbox consumer dedup table (TS-142-followup-2-followup-2, PDD §7.3,
+/// CLAUDE.md §5.3, §6).
+///
+/// One row per `(consumer_group, event_id)`. The
+/// `@taste-and-see/nest-outbox-consumer` SDK reads + writes this table
+/// via raw SQL through a Prisma-shaped executor; this Prisma model is
+/// decorative for introspection only — the generated client never
+/// reads or writes through it directly. Mirrors the canonical shape
+/// documented in `PgConsumerDedupStore`'s doc-comment.
+///
+/// The state lifecycle is `unseen` (no row) → `in_flight` (first
+/// attempt or retry) → `processed` (handler succeeded) or
+/// `dead_lettered` (attempts exhausted). The CHECK constraint on
+/// `state` lives in the migration SQL.
+///
+/// Why a partial index on `dead_lettered_at IS NOT NULL`. Ops queries
+/// the dead-letter queue via the future TS-142-followup-5 admin
+/// surface; the partial index keeps the index footprint bounded
+/// against an ever-growing table because the vast majority of rows
+/// are `processed` and don't carry a `dead_lettered_at` timestamp.
+/// Materialised in the migration SQL because Prisma's `@@index`
+/// syntax cannot directly express the partial predicate.
+model OutboxConsumerDedup {
+  /// Consumer group name (the consuming service's name by convention,
+  /// e.g. `service-accounting`). Part of the composite PK.
+  consumerGroup    String    @map("consumer_group")
+  /// Event id stamped by the producer at outbox-append time. Part of
+  /// the composite PK; the dedup invariant is enforced at the PK
+  /// layer.
+  eventId          String    @map("event_id")
+  /// Dot-notation event name (e.g. `subscription.activated`).
+  /// Captured so the dedup row is self-describing without joining
+  /// back to the consumer-side handler registry.
+  eventName        String    @map("event_name")
+  /// Three-valued lifecycle: `in_flight` | `processed` |
+  /// `dead_lettered`. The CHECK constraint lives in the migration.
+  state            String
+  /// Monotonic attempt counter. Incremented by the SDK's
+  /// `recordAttempt` on every redelivery.
+  attempts         Int       @default(1)
+  /// Truncated to 2000 chars by the SDK's `recordFailure` /
+  /// `recordDeadLetter` paths.
+  lastError        String?   @map("last_error")
+  /// Wall-clock time the consumer first saw the event. Useful for
+  /// SLA + lag dashboards.
+  firstSeenAt      DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  /// Stamped on every attempt.
+  lastAttemptAt    DateTime  @default(now()) @map("last_attempt_at") @db.Timestamptz(6)
+  /// Stamped on success; NULL until then.
+  processedAt      DateTime? @map("processed_at") @db.Timestamptz(6)
+  /// Stamped when state flips to `dead_lettered`.
+  deadLetteredAt   DateTime? @map("dead_lettered_at") @db.Timestamptz(6)
+
+  @@id([consumerGroup, eventId])
+  @@map("outbox_consumer_dedup")
+  @@schema("accounting")
+}
+
+/// Daily SaaS-metrics snapshot (TS-260, PDD §8.2 `saas_metrics_daily`,
+/// §11.2, §23.2).
+///
+/// **Why this table exists.** Investors + the finance team need MRR /
+/// ARR / ARPU / retention as a daily time-series. The nightly
+/// `accounting-metrics` worker computes one row per UTC calendar date
+/// from accounting **ledger primitives** — specifically the
+/// `deferred_revenue_balances` rows the revenue-recognition driver
+/// (TS-082) maintains. The metrics are therefore a derived read-model
+/// of the ledger, recomputable at any time from the durable balance
+/// rows + the per-subscription snapshot (`SaasSubscriptionMrrDaily`).
+///
+/// **One row per `metric_date` (UNIQUE).** Re-running the worker for the
+/// same date replaces the row idempotently (the computation is
+/// deterministic given ledger state). The unique index doubles as the
+/// time-series scan index for the dashboard's "last N days" query.
+///
+/// **Money discipline.** Every monetary column is `Decimal(12, 2)` —
+/// never floats (CLAUDE.md §17.6). `net_new_mrr` is the only one that
+/// can go negative (a contraction + churn heavy day). Retention ratios
+/// are `Decimal(9, 6)` (e.g. `1.027100` = 102.71% NRR), nullable when
+/// there is no prior baseline. `ltv` / `cac` are nullable and NULL in
+/// Phase 1 — neither is derivable from the ledger alone (TS-260-followup-1).
+///
+/// **No cross-service references.** The metrics aggregate the
+/// service-local `deferred_revenue_balances`; nothing here points at
+/// another schema.
+model SaasMetricsDaily {
+  id                      String    @id @default(cuid())
+  /// The UTC calendar date this snapshot describes. UNIQUE — one
+  /// snapshot per day; a recompute replaces the row.
+  metricDate              DateTime  @map("metric_date") @db.Date
+  /// ISO 4217. Phase-1 USD only; multi-currency-ready schema.
+  currency                String    @default("USD") @db.Char(3)
+  /// Monthly recurring revenue — Σ monthly-normalised active-balance MRR.
+  mrr                     Decimal   @db.Decimal(12, 2)
+  /// Annual recurring revenue — `mrr × 12`.
+  arr                     Decimal   @db.Decimal(12, 2)
+  /// Average revenue per active subscription — `mrr / activeSubscriptions`.
+  arpu                    Decimal   @db.Decimal(12, 2)
+  /// Count of distinct subscriptions with an active covering balance.
+  activeSubscriptions     Int       @map("active_subscriptions")
+  /// MRR from subscriptions present today but absent in the comparison
+  /// snapshot.
+  newMrr                  Decimal   @map("new_mrr") @db.Decimal(12, 2)
+  /// Increase in MRR across subscriptions present in both snapshots that
+  /// grew.
+  expansionMrr            Decimal   @map("expansion_mrr") @db.Decimal(12, 2)
+  /// Decrease in MRR across subscriptions present in both snapshots that
+  /// shrank.
+  contractionMrr          Decimal   @map("contraction_mrr") @db.Decimal(12, 2)
+  /// MRR lost from subscriptions in the comparison snapshot gone today.
+  churnedMrr              Decimal   @map("churned_mrr") @db.Decimal(12, 2)
+  /// Count of subscriptions in the comparison snapshot gone today.
+  churnedSubscriptions    Int       @map("churned_subscriptions")
+  /// `new + expansion − contraction − churned`. May be negative — no
+  /// CHECK constraint defends sign.
+  netNewMrr               Decimal   @map("net_new_mrr") @db.Decimal(12, 2)
+  /// MRR in the comparison snapshot (the retention baseline).
+  priorMrr                Decimal   @map("prior_mrr") @db.Decimal(12, 2)
+  /// Net revenue retention ratio (e.g. `1.027100`). NULL when there is
+  /// no prior baseline or prior MRR is zero.
+  netRevenueRetention     Decimal?  @map("net_revenue_retention") @db.Decimal(9, 6)
+  /// Gross revenue retention ratio. NULL under the same conditions.
+  grossRevenueRetention   Decimal?  @map("gross_revenue_retention") @db.Decimal(9, 6)
+  /// Lifetime value. NULL in Phase 1 — TS-260-followup-1.
+  ltv                     Decimal?  @db.Decimal(12, 2)
+  /// Customer-acquisition cost. NULL in Phase 1 — TS-260-followup-1.
+  cac                     Decimal?  @db.Decimal(12, 2)
+  /// The prior snapshot date the movement was decomposed against. NULL
+  /// on the first-ever run.
+  comparisonDate          DateTime? @map("comparison_date") @db.Date
+  /// When the worker computed this snapshot.
+  computedAt              DateTime  @map("computed_at") @db.Timestamptz(6)
+  createdAt               DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt               DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// One snapshot per day. The unique index also serves the dashboard's
+  /// `ORDER BY metric_date DESC LIMIT N` time-series scan (Postgres
+  /// scans the b-tree backwards).
+  @@unique([metricDate], map: "saas_metrics_daily_metric_date_unique")
+  @@map("saas_metrics_daily")
+  @@schema("accounting")
+}
+
+/// Per-subscription MRR snapshot (TS-260) — the working state behind the
+/// daily movement decomposition.
+///
+/// **Why a separate table.** Movement metrics (new / expansion /
+/// contraction / churn) need each subscription's MRR AS IT WAS on the
+/// prior snapshot date. The `deferred_revenue_balances` table only
+/// reflects each balance's CURRENT status — a subscription canceled
+/// between yesterday and today would be misclassified if we recomputed
+/// yesterday's coverage from current state. Persisting the snapshot at
+/// compute time captures the historical truth so day-over-day movement
+/// is exact regardless of later status flips.
+///
+/// **One row per `(metric_date, subscription_id)` (UNIQUE).** A
+/// recompute for a date deletes the date's rows + re-inserts. The
+/// per-date prefix of the unique index serves both the delete-by-date
+/// and the "load the prior snapshot date" reads.
+///
+/// **Money discipline.** `mrr` is `Decimal(12, 2)`. No cross-service
+/// references — `subscription_id` is a soft pointer into
+/// `subscription.subscriptions.id` (cross-schema joins forbidden,
+/// CLAUDE.md §2.3).
+model SaasSubscriptionMrrDaily {
+  id              String                        @id @default(cuid())
+  /// The UTC calendar date of the snapshot. Part of the UNIQUE key.
+  metricDate      DateTime                      @map("metric_date") @db.Date
+  /// Soft pointer into `subscription.subscriptions.id`. Part of the
+  /// UNIQUE key.
+  subscriptionId  String                        @map("subscription_id")
+  customerGroup   DeferredRevenueCustomerGroup  @map("customer_group")
+  /// Stable plan code matching `subscription.plans.code`.
+  planCode        String                        @map("plan_code")
+  /// Monthly-normalised recurring revenue for this subscription on this
+  /// date.
+  mrr             Decimal                       @db.Decimal(12, 2)
+  /// ISO 4217. Phase-1 USD only.
+  currency        String                        @default("USD") @db.Char(3)
+  createdAt       DateTime                      @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// One row per (date, subscription). The per-date prefix serves the
+  /// delete-by-date (recompute) + the prior-snapshot load.
+  @@unique([metricDate, subscriptionId], name: "metric_date_subscription_unique", map: "saas_subscription_mrr_daily_date_subscription_unique")
+  @@map("saas_subscription_mrr_daily")
+  @@schema("accounting")
+}
+
+/// Which reconciliation dimension a `stripe_reconciliation_checks` row
+/// describes (TS-261; PDD §11.2; CLAUDE.md §6).
+///
+/// - `balance`  — Stripe's reported balance (available + pending) vs. the
+///                ledger Cash account (`1000`) net balance at end-of-day.
+/// - `activity` — Stripe's net balance-transaction activity for the day
+///                vs. the ledger Cash account's net movement over the
+///                same UTC-day window.
+enum StripeReconciliationCategory {
+  balance
+  activity
+
+  @@map("stripe_reconciliation_category")
+  @@schema("accounting")
+}
+
+/// Lifecycle status of a per-(day, category) reconciliation check. The row
+/// doubles as the run checkpoint AND the ops ticket (TS-261).
+///
+/// - `matched`           — `|delta| <= tolerance`; informational checkpoint.
+/// - `mismatch_open`     — `|delta| > tolerance`; an OPEN ops ticket. The
+///                         reconciliation NEVER auto-corrects the ledger
+///                         (CLAUDE.md §6) — an operator triages.
+/// - `mismatch_resolved` — an operator reviewed + closed the ticket. A
+///                         later re-run that still mismatches does NOT
+///                         silently reopen this (it preserves the human
+///                         decision).
+/// - `skipped_stub`      — Stripe was not queried (Phase-1 stub mode); the
+///                         ledger figure is recorded with null Stripe
+///                         figures and no ticket is raised.
+enum StripeReconciliationStatus {
+  matched
+  mismatch_open
+  mismatch_resolved
+  skipped_stub
+
+  @@map("stripe_reconciliation_status")
+  @@schema("accounting")
+}
+
+/// Whether the run actually queried Stripe (`live`) or stubbed it out
+/// (`stub`) because no live secret key is configured (TS-261).
+enum StripeReconciliationMode {
+  live
+  stub
+
+  @@map("stripe_reconciliation_mode")
+  @@schema("accounting")
+}
+
+/// Daily Stripe → ledger reconciliation check (TS-261; PRD §10.3; PDD
+/// §11.2; CLAUDE.md §6). One row per `(reconciliation_date, category)` —
+/// the row is BOTH the run checkpoint (always recorded, even when matched)
+/// AND the ops ticket (a `mismatch_open` row is an open ticket).
+///
+/// **Idempotent re-run.** A re-run for the same `(reconciliation_date,
+/// category)` upserts: it refreshes the computed figures + `computed_at`
+/// and recomputes `status`, but a `mismatch_resolved` row that still
+/// mismatches keeps its resolution (human decisions are not auto-undone).
+///
+/// **Money discipline.** Every monetary column is `Decimal(12, 2)` — never
+/// a float (CLAUDE.md §17.6). `expected_amount` (the ledger figure),
+/// `actual_amount` (Stripe's figure), and `delta_amount` may be negative
+/// (a payout-heavy day nets the Cash account below zero on the activity
+/// dimension); no CHECK defends sign. `actual_amount` / `delta_amount` /
+/// `stripe_transaction_count` are null in stub mode.
+///
+/// **No cross-service references.** `resolved_by_user_id` is a soft pointer
+/// into `identity.users.id` — no FK crosses the schema boundary (CLAUDE.md
+/// §2.3, §4.1).
+model StripeReconciliationCheck {
+  id                     String                        @id @default(cuid())
+  /// The UTC calendar date this check describes. Part of the UNIQUE key.
+  reconciliationDate     DateTime                      @map("reconciliation_date") @db.Date
+  category               StripeReconciliationCategory
+  status                 StripeReconciliationStatus
+  mode                   StripeReconciliationMode
+  /// ISO 4217. Phase-1 USD only.
+  currency               String                        @default("USD") @db.Char(3)
+  /// Ledger figure — Cash balance (`balance`) or Cash net movement
+  /// (`activity`).
+  expectedAmount         Decimal                       @map("expected_amount") @db.Decimal(12, 2)
+  /// Stripe reported figure. Null in stub mode.
+  actualAmount           Decimal?                      @map("actual_amount") @db.Decimal(12, 2)
+  /// `actual − expected`. Null in stub mode.
+  deltaAmount            Decimal?                      @map("delta_amount") @db.Decimal(12, 2)
+  /// Absolute tolerance applied — `|delta| > tolerance` flags a mismatch.
+  toleranceAmount        Decimal                       @map("tolerance_amount") @db.Decimal(12, 2)
+  /// Count of Stripe balance transactions scanned (activity check). Null
+  /// for the balance check + in stub mode.
+  stripeTransactionCount Int?                          @map("stripe_transaction_count")
+  /// Start of the compared UTC-day window (inclusive).
+  windowStart            DateTime                      @map("window_start") @db.Timestamptz(6)
+  /// End of the compared UTC-day window (exclusive).
+  windowEnd              DateTime                      @map("window_end") @db.Timestamptz(6)
+  /// Human-readable summary of the check outcome.
+  detail                 String
+  /// When the worker computed this check.
+  computedAt             DateTime                      @map("computed_at") @db.Timestamptz(6)
+  /// When an operator resolved the ticket. Null while open / matched.
+  resolvedAt             DateTime?                     @map("resolved_at") @db.Timestamptz(6)
+  /// Soft pointer into `identity.users.id` — the resolving operator.
+  resolvedByUserId       String?                       @map("resolved_by_user_id")
+  /// Operator resolution notes.
+  resolutionNotes        String?                       @map("resolution_notes")
+  createdAt              DateTime                      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime                      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// One row per (day, dimension). Drives the idempotent re-run upsert.
+  @@unique([reconciliationDate, category], name: "reconciliation_date_category_unique", map: "stripe_reconciliation_checks_date_category_unique")
+  /// The ops-queue read: open mismatches, most-recent first
+  /// (`WHERE status = 'mismatch_open' ORDER BY reconciliation_date DESC`).
+  @@index([status, reconciliationDate(sort: Desc)], map: "stripe_reconciliation_checks_status_date_idx")
+  @@map("stripe_reconciliation_checks")
+  @@schema("accounting")
+}
+
+/// Outbox row — accounting domain events emitted transactionally with
+/// the journal/balance-row mutation per the outbox pattern (PDD §7.3,
+/// CLAUDE.md §5.3). Shape is identical to every other producer
+/// service's `outbox_events` table; the `@taste-and-see/nest-outbox`
+/// SDK is schema-agnostic and consumes this table via raw SQL inside
+/// the caller's Prisma `$transaction`.
+///
+/// This is the PRODUCER-side outbox — the events accounting EMITS
+/// (`journal.posted` TS-081-followup-3, recognition lifecycle
+/// TS-082-followup-3, `period.closed` / `period.reopened`
+/// TS-085-followup-3, refunds + contra-revenue lifecycle
+/// TS-084-followup-7). It is orthogonal to `OutboxConsumerDedup`
+/// (`accounting.outbox_consumer_dedup`), which is the CONSUMER-side
+/// idempotency ledger the `@taste-and-see/nest-outbox-consumer` SDK
+/// writes for inbound events. One records "events I will publish", the
+/// other "events I have consumed" — they never overlap.
+///
+/// The relay worker (`apps/workers/outbox-relay`) polls
+/// `WHERE dispatched_at IS NULL ORDER BY created_at` via its own
+/// `pg` pool — NOT through this Prisma client — so cross-service
+/// reads stay outside the service's Prisma boundary
+/// (CLAUDE.md §2.3 / §4.1).
+model OutboxEvent {
+  /// Dedup key — consumers must idempotency-check on this. UUID v4
+  /// generated by the SDK by default; producers may pass an explicit
+  /// id (e.g. a deterministic `{journalId}.posted` composite) for
+  /// cross-boundary exactly-once-effective delivery.
+  eventId         String    @id @map("event_id")
+  /// Dot-notation event name from `packages/contracts/events`. The
+  /// SDK validates the name against the registry before inserting
+  /// — unknown names are rejected at the producer boundary.
+  eventName       String    @map("event_name")
+  /// Validated domain payload (validated by the SDK against the
+  /// matching `eventRegistry` schema before insert).
+  payload         Json
+  /// Producer wall-clock time the event semantically happened. May
+  /// differ from `created_at` for backfilled events.
+  occurredAt      DateTime  @map("occurred_at") @db.Timestamptz(6)
+  /// Service name that produced the row (`service-accounting`). Useful
+  /// for relay observability + per-service throughput metrics.
+  producerService String    @map("producer_service")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Stamped by the relay when the row has been successfully
+  /// forwarded onto the bus. Null means undispatched + eligible for
+  /// the next poll cycle.
+  dispatchedAt    DateTime? @map("dispatched_at") @db.Timestamptz(6)
+  /// Failed dispatch counter. The relay stops retrying once this
+  /// reaches `MAX_ATTEMPTS` — those rows are dead-lettered for ops
+  /// attention (surfaced via metrics + an admin endpoint).
+  attempts        Int       @default(0)
+  /// Stamped by the relay on the most recent failed attempt.
+  lastAttemptAt   DateTime? @map("last_attempt_at") @db.Timestamptz(6)
+  /// Most recent failure message — capped at 2000 chars at the
+  /// relay's record-failure path.
+  lastError       String?   @map("last_error")
+
+  /// Relay's dominant read query: "give me the next batch of
+  /// undispatched rows ordered by created_at". A partial index on
+  /// `dispatched_at IS NULL` keeps the index footprint bounded
+  /// against an ever-growing table (the table is append-only; the
+  /// partial filter is highly selective at steady state).
+  ///
+  /// Prisma's `@@index` cannot directly express the partial
+  /// predicate; the index is materialised in the migration SQL
+  /// (TS-142-followup-1).
+  @@index([eventName], map: "outbox_events_event_name_idx")
+  @@map("outbox_events")
+  @@schema("accounting")
+}

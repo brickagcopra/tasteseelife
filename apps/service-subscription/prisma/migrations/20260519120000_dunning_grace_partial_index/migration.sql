@@ -1,0 +1,65 @@
+-- TS-042-followup-1 — swap subscriptions_dunning_grace_idx from plain
+-- composite to partial.
+--
+-- TS-042's migration shipped a plain composite
+--   CREATE INDEX subscriptions_dunning_grace_idx
+--     ON subscription.subscriptions (dunning_grace_until);
+-- The dunning sweeper's read path is
+--   WHERE status = 'past_due' AND dunning_grace_until < now()
+-- — and at steady state >95% of `subscriptions` rows are `active` /
+-- `trialing` / `canceled` with a NULL `dunning_grace_until`. The plain
+-- index covers every row including the NULLs; a partial index keyed
+-- on the sweeper's filter is far more selective and the footprint
+-- stays bounded against the ever-growing table.
+--
+--   CREATE INDEX subscriptions_dunning_grace_idx
+--     ON subscription.subscriptions (dunning_grace_until)
+--     WHERE status = 'past_due' AND dunning_grace_until IS NOT NULL;
+--
+-- CLAUDE.md §7.3 prescribes a partial index for exactly this status-
+-- filtered shape. Mirrors the pattern used by
+-- `outbox_events_undispatched_idx` (TS-142) and the swap landed in
+-- TS-041a-followup-1 for `stripe_processed_events_undispatched_idx`
+-- + `checkr_processed_events_undispatched_idx`.
+--
+-- Schema-of-record reconciliation. Prisma 5.x's `@@index` syntax cannot
+-- directly express the partial predicate, so the
+-- `@@index([dunningGraceUntil], map: "subscriptions_dunning_grace_idx")`
+-- declaration is removed from `schema.prisma` in the same change. The
+-- partial index is materialised here in the migration SQL and lives
+-- outside Prisma's introspection — same pattern as
+-- `outbox_events_undispatched_idx` (TS-142). Without that removal, the
+-- next `prisma migrate dev` would attempt to recreate the plain
+-- composite.
+--
+-- Drop-then-create ordering. The dunning sweeper (TS-042-followup-2)
+-- is not yet running, so there is no live reader against this index
+-- at the time the migration lands. The `applyDunningExhaustion`
+-- service operates per-subscription via primary-key `findUnique`
+-- and does NOT touch this index; admin tooling (TS-127) reads the
+-- `subscriptions` table by `(customerId, customerGroup, status)`
+-- (a different index). The brief no-index window between DROP and
+-- CREATE is operationally acceptable. NOT using `CREATE INDEX
+-- CONCURRENTLY` because Prisma's migration runner wraps each migration
+-- in a transaction and concurrent index creation cannot run inside
+-- one.
+--
+-- Reversal plan (manual; no automatic down-migration in Prisma):
+--   DROP INDEX IF EXISTS "subscription"."subscriptions_dunning_grace_idx";
+--   CREATE INDEX "subscriptions_dunning_grace_idx"
+--     ON "subscription"."subscriptions" ("dunning_grace_until");
+-- Reversal also requires re-adding the `@@index([dunningGraceUntil],
+-- map: "subscriptions_dunning_grace_idx")` line in `schema.prisma`.
+-- Safe in isolation — the index change does not affect any FK / CHECK
+-- constraint and no other service schema references this column
+-- (CLAUDE.md §2.3).
+--
+-- Apply locally with:
+--   pnpm -F @taste-and-see/service-subscription prisma:migrate:deploy
+-- against a Postgres reachable at $DATABASE_URL.
+
+DROP INDEX IF EXISTS "subscription"."subscriptions_dunning_grace_idx";
+
+CREATE INDEX "subscriptions_dunning_grace_idx"
+    ON "subscription"."subscriptions" ("dunning_grace_until")
+    WHERE "status" = 'past_due' AND "dunning_grace_until" IS NOT NULL;

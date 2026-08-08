@@ -1,0 +1,73 @@
+# AppProject: platform-staging.
+#
+# Twin of platform-dev with one operational difference: a sync window that
+# matches the PDD §11 "soak window" pattern. Staging auto-syncs on every push
+# but the syncWindow restricts WHO can manually sync outside the window
+# (admin only), so a developer cannot accidentally short-circuit a soak by
+# clicking "sync" in the UI mid-soak.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: platform-staging
+  namespace: argocd
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    tastesee.io/env: staging
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: >-
+    Staging environment — auto-sync + self-heal. Soak gate between staging
+    and prod is enforced at the prod AppProject level via manualSync.
+
+  sourceRepos:
+    - https://github.com/brickagcopra/tasteseelife.git
+    - https://github.com/brickagcopra/tasteseelife
+
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: platform-system
+    - server: https://kubernetes.default.svc
+      namespace: platform-data
+    - server: https://kubernetes.default.svc
+      namespace: platform-services
+    - server: https://kubernetes.default.svc
+      namespace: platform-workers
+    - server: https://kubernetes.default.svc
+      namespace: platform-frontends
+    - server: https://kubernetes.default.svc
+      namespace: observability
+    - server: https://kubernetes.default.svc
+      namespace: ingress
+
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: scheduling.k8s.io
+      kind: PriorityClass
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+    - group: cert-manager.io
+      kind: ClusterIssuer
+    - group: networking.k8s.io
+      kind: IngressClass
+
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  roles: []
+
+  syncWindows: []
+
+  orphanedResources:
+    warn: true

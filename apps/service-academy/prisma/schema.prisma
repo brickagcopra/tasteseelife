@@ -1,0 +1,747 @@
+// Cooking Academy bounded context — see PDD §7.2 (service inventory entry
+// #12) and §15 (Cooking Academy Subsystem: courses → modules → lessons,
+// cohorts, enrollments, certifications). The product framing is PRD §9
+// ("Functional Requirements — Cooking Academy") and the §5.3 pricing.
+//
+// Scope so far:
+//   - TS-250 ships the skeleton: the `academy` Postgres schema and the
+//     six core tables — `academy_courses`, `academy_course_modules`,
+//     `academy_lessons`, `academy_cohorts`, `academy_enrollments`,
+//     `academy_certifications` — plus their enums and indexes. No HTTP
+//     surface beyond `/healthz` + `/readyz` yet.
+//
+// Forthcoming (captured so the layout is predictable):
+//   - TS-251 — course-catalog admin tooling (create / edit / archive
+//     courses, modules, lessons; manage cohorts + instructors). Brings the
+//     first authenticated write surface, the JWT-verification + idempotency
+//     env clusters, and `academy:write` permission gating.
+//   - TS-252 — lesson player (`apps/web-academy`) + per-enrollment
+//     per-lesson progress tracking (the dedicated `lesson_progress` table is
+//     a TS-252 concern; TS-250 tracks coarse progress on the enrollment row).
+//   - TS-253 — live cohort sessions (Daily.co rooms + attendance).
+//   - TS-254 — quiz engine (versioned question banks + randomized selection
+//     + scoring); adds its own tables.
+//   - TS-255 — certification issuance (PDF via pdfkit + public verification
+//     URL); populates `certificate_pdf_key` + drives the `provider.svc`
+//     tier-eligibility sync (PDD §15.2).
+//   - TS-256 — renewal cycles + continuing-education (a scheduled worker
+//     reads `expires_at`).
+//
+// Each addition is a forward-compatible expand → migrate → contract
+// migration per CLAUDE.md §4.1; enum value sets evolve additively
+// (`ALTER TYPE … ADD VALUE`) per the TS-205 / TS-220 convention.
+//
+// Cross-service references are by id only — never a foreign key into
+// another service schema (CLAUDE.md §2.3, §4.1). Specifically:
+//
+//   - `academy_cohorts.instructor_user_id`      soft FK → `identity.users.id`.
+//   - `academy_enrollments.student_user_id`     soft FK → `identity.users.id`.
+//   - `academy_certifications.student_user_id`  soft FK → `identity.users.id`.
+//   - media keys (`hero_image_key`, `content_key`, `certificate_pdf_key`)
+//     reference `media-svc` (TS-110) S3 assets by key, never by FK.
+//
+// In-service relations (course → module → lesson, course → cohort,
+// course/cohort → enrollment, course/enrollment → certification) ARE real
+// Prisma relations because both sides live in the `academy` schema —
+// CLAUDE.md §4.1 forbids FKs only ACROSS service schemas.
+//
+// Joins across the soft-FK boundaries happen via the gateway BFF (TS-140)
+// or via events (TS-142), never via SQL JOIN.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. The feature has been
+  // production-stable since Prisma 5.0 even though it remains under the
+  // `previewFeatures` umbrella in 5.x — see Prisma migration notes.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `academy` Postgres schema. Every other service
+  // gets its own schema in the same database (Phase 1) or its own database
+  // entirely (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["academy"]
+}
+
+/// Course delivery format (PRD §9.1 "Course Catalog"). Drives how a course
+/// is consumed and which downstream features apply.
+///
+///   `self_paced`         = online, on-demand; no cohort window.
+///   `cohort_based`       = scheduled run with start/end dates + a peer group
+///                          (the `academy_cohorts` rows).
+///   `in_person_workshop` = the Elite in-person certification (PRD §5.3,
+///                          §9.1); cohort-backed with a physical venue.
+///
+/// Additive only — new formats arrive via `ALTER TYPE … ADD VALUE`.
+enum AcademyCourseKind {
+  self_paced
+  cohort_based
+  in_person_workshop
+
+  @@map("academy_course_kind")
+  @@schema("academy")
+}
+
+/// Specialty track a course belongs to (PRD §9.1 "Specialty tracks:
+/// dementia-sensitive dining, therapeutic meals, luxury in-home service,
+/// cultural comfort cuisine"). The track a certification carries gates
+/// provider tier eligibility (PDD §15.2 — synced to `provider-svc`).
+///
+///   `general`                  = foundational / non-specialty course.
+///   `dementia_sensitive`       = dementia-sensitive dining.
+///   `therapeutic_meals`        = therapeutic / dietary-restricted meals.
+///   `luxury_in_home`           = luxury in-home hospitality service.
+///   `cultural_comfort_cuisine` = cultural comfort cuisine.
+///
+/// Additive only.
+enum AcademyCourseTrack {
+  general
+  dementia_sensitive
+  therapeutic_meals
+  luxury_in_home
+  cultural_comfort_cuisine
+
+  @@map("academy_course_track")
+  @@schema("academy")
+}
+
+/// Course publication lifecycle (PRD §9.5 admin requirements). The public
+/// catalog (web-academy) renders only `published` courses; `draft` is the
+/// admin compose buffer; `archived` retires a course from the catalog while
+/// preserving it for existing enrollments + certifications.
+enum AcademyCourseStatus {
+  draft
+  published
+  archived
+
+  @@map("academy_course_status")
+  @@schema("academy")
+}
+
+/// Lesson content type (PDD §15.1 "lessons can be video, reading, quiz, or
+/// assignment"). The lesson player (TS-252) branches on this to choose the
+/// renderer; `quiz` lessons bind to the TS-254 quiz engine.
+enum AcademyLessonKind {
+  video
+  reading
+  quiz
+  assignment
+
+  @@map("academy_lesson_kind")
+  @@schema("academy")
+}
+
+/// Cohort run lifecycle (PRD §9.1 cohort-based courses with start/end dates).
+///
+///   `scheduled`   = created, dates set, enrollment not yet open.
+///   `open`        = accepting enrollments.
+///   `in_progress` = running (between start and end).
+///   `completed`   = finished (terminal).
+///   `canceled`    = called off (terminal).
+///
+/// Terminal-state enforcement lives at the service layer (TS-253), not a DB
+/// constraint. Additive only.
+enum AcademyCohortStatus {
+  scheduled
+  open
+  in_progress
+  completed
+  canceled
+
+  @@map("academy_cohort_status")
+  @@schema("academy")
+}
+
+/// Enrollment lifecycle (PDD §15.1 "Progress and completion tracking per
+/// enrollment").
+///
+///   `active`    = enrolled, in progress.
+///   `completed` = finished the course (gates certification issuance,
+///                 TS-255); stamps `completed_at`.
+///   `dropped`   = the student withdrew.
+///   `expired`   = time-bounded access lapsed (`expires_at` passed).
+///
+/// Additive only.
+enum AcademyEnrollmentStatus {
+  active
+  completed
+  dropped
+  expired
+
+  @@map("academy_enrollment_status")
+  @@schema("academy")
+}
+
+/// Certification lifecycle (PDD §15.2 "Certifications"). A certification is
+/// issued on course completion + assessment passage and may later lapse or
+/// be revoked.
+///
+///   `active`  = valid (within `expires_at`, not revoked).
+///   `expired` = past `expires_at`; renewal required (TS-256).
+///   `revoked` = administratively invalidated; stamps `revoked_at`.
+///
+/// Additive only.
+enum AcademyCertificationStatus {
+  active
+  expired
+  revoked
+
+  @@map("academy_certification_status")
+  @@schema("academy")
+}
+
+/// A Cooking Academy course (PRD §9.1; PDD §15.1) — the top of the
+/// catalog hierarchy (course → module → lesson). Platform-wide catalog
+/// content: the same course is the same for every student, so it carries
+/// NO tenant axis and is listed in `unscopedModels` (the gate is not
+/// consulted on catalog reads/writes — mirrors `Plan` in
+/// service-subscription).
+///
+/// `hero_image_key` references a `media-svc` (TS-110) S3 asset by key —
+/// never a Prisma relation (cross-service; CLAUDE.md §2.3).
+///
+/// `passing_score_percent` is the quiz threshold that gates certification
+/// issuance (TS-254 / TS-255). Null until an assessment is attached.
+///
+/// Soft-delete (`deleted_at`) retires a course while preserving the rows
+/// existing enrollments + certifications point at. Read-paths filter
+/// `deleted_at = null` unless explicitly auditing.
+model AcademyCourse {
+  id                  String              @id @default(cuid())
+  /// Public catalog slug (web-academy URL). Unique across the catalog.
+  slug                String              @unique
+  title               String
+  /// Short catalog blurb shown on the course card.
+  summary             String
+  /// Full course description (Markdown). Null until authored.
+  description         String?
+  kind                AcademyCourseKind
+  track               AcademyCourseTrack  @default(general)
+  status              AcademyCourseStatus @default(draft)
+  /// Free-text difficulty label (e.g. "beginner" / "intermediate"). Kept as
+  /// a nullable string in the skeleton — promoted to an enum only if the
+  /// catalog UX needs a fixed set.
+  level               String?
+  /// Total estimated duration in minutes (sum of lesson durations or an
+  /// editor-supplied estimate). Null until set.
+  estimatedMinutes    Int?                @map("estimated_minutes")
+  /// `media-svc` S3 asset key for the course hero image (TS-110). Null until
+  /// uploaded. Never a Prisma relation (cross-service).
+  heroImageKey        String?             @map("hero_image_key")
+  /// Quiz pass threshold (0–100) gating certification issuance (TS-254 /
+  /// TS-255). Null when the course has no graded assessment.
+  passingScorePercent Int?                @map("passing_score_percent")
+  createdAt           DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone; populated by admin only. Read-paths must filter
+  /// `deleted_at = null` unless explicitly auditing.
+  deletedAt           DateTime?           @map("deleted_at") @db.Timestamptz(6)
+
+  /// In-service relations (all within the `academy` schema — real FKs are
+  /// allowed; CLAUDE.md §4.1 forbids FKs only ACROSS service schemas).
+  modules        AcademyCourseModule[]
+  cohorts        AcademyCohort[]
+  enrollments    AcademyEnrollment[]
+  certifications AcademyCertification[]
+
+  /// Catalog browse: "published courses in a track".
+  @@index([status, track], map: "academy_courses_status_track_idx")
+  /// Soft-delete filter on list reads.
+  @@index([deletedAt], map: "academy_courses_deleted_at_idx")
+  @@map("academy_courses")
+  @@schema("academy")
+}
+
+/// A module within a course (PDD §15.1 "Courses → Modules → Lessons") — the
+/// middle of the catalog hierarchy. Platform-wide catalog content (no tenant
+/// axis; `unscopedModels`).
+///
+/// `course_id` is an in-service relation to `AcademyCourse` (both in the
+/// `academy` schema). `ON DELETE CASCADE` keeps the catalog tree consistent
+/// if a course is ever hard-deleted (today courses are soft-deleted, so this
+/// is defence-in-depth).
+model AcademyCourseModule {
+  id           String        @id @default(cuid())
+  courseId     String        @map("course_id")
+  course       AcademyCourse @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  title        String
+  /// Optional module description / overview (Markdown).
+  description  String?
+  /// Ordering within the course (0-based).
+  sortPosition Int           @map("sort_position")
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  lessons AcademyLesson[]
+
+  /// Dominant read: "this course's modules in order". Composite so one index
+  /// scan filters by course AND returns rows ordered by position.
+  @@index([courseId, sortPosition], map: "academy_course_modules_course_sort_idx")
+  @@map("academy_course_modules")
+  @@schema("academy")
+}
+
+/// A lesson within a module (PDD §15.1) — the leaf of the catalog hierarchy.
+/// Platform-wide catalog content (no tenant axis; `unscopedModels`).
+///
+/// `module_id` is an in-service relation to `AcademyCourseModule`. `ON DELETE
+/// CASCADE` keeps the catalog tree consistent on a course/module hard-delete.
+///
+/// `content_key` references a `media-svc` (TS-110) S3 asset by key (the video
+/// served via a signed CloudFront URL per PDD §15.1) — never a Prisma
+/// relation. `body_markdown` holds the inline content for `reading` lessons.
+/// `quiz` lessons bind to the TS-254 quiz engine via a future column.
+model AcademyLesson {
+  id              String              @id @default(cuid())
+  moduleId        String              @map("module_id")
+  module          AcademyCourseModule @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  title           String
+  kind            AcademyLessonKind
+  /// `media-svc` S3 asset key for `video` lessons (signed-URL delivery,
+  /// PDD §15.1). Null for non-video lessons. Never a Prisma relation.
+  contentKey      String?             @map("content_key")
+  /// Inline Markdown body for `reading` lessons. Null otherwise.
+  bodyMarkdown    String?             @map("body_markdown")
+  /// Ordering within the module (0-based).
+  sortPosition    Int                 @map("sort_position")
+  /// Lesson duration in minutes (video length / estimated reading time).
+  durationMinutes Int?                @map("duration_minutes")
+  createdAt       DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Optional in-service back-relation to the lesson's quiz (TS-254). Present
+  /// only for `kind = 'quiz'` lessons that have had a quiz attached.
+  quiz AcademyQuiz?
+
+  /// Dominant read: "this module's lessons in order". Composite so one index
+  /// scan filters by module AND returns rows ordered by position.
+  @@index([moduleId, sortPosition], map: "academy_lessons_module_sort_idx")
+  @@map("academy_lessons")
+  @@schema("academy")
+}
+
+/// A scheduled run of a cohort-based course (PRD §9.1; PDD §15.1) — a peer
+/// group moving through a course between a start and end date, optionally
+/// with a live instructor (TS-253). Platform-wide catalog/operational content
+/// (no tenant axis; `unscopedModels`) — students bind to a cohort via their
+/// per-student `AcademyEnrollment`, not by the cohort itself.
+///
+/// `course_id` is an in-service relation to `AcademyCourse` (default
+/// `Restrict` onDelete — a cohort that ran is a record we preserve; a course
+/// cannot be hard-deleted while cohorts reference it).
+///
+/// `instructor_user_id` is a soft FK into `identity.users.id` — never a
+/// Prisma relation (cross-service; CLAUDE.md §2.3). Null until an instructor
+/// is assigned.
+///
+/// Soft-delete (`deleted_at`) preserves cohort history. Read-paths filter
+/// `deleted_at = null` unless explicitly auditing.
+model AcademyCohort {
+  id               String              @id @default(cuid())
+  courseId         String              @map("course_id")
+  course           AcademyCourse       @relation(fields: [courseId], references: [id])
+  name             String
+  status           AcademyCohortStatus @default(scheduled)
+  /// When the cohort run begins.
+  startsAt         DateTime            @map("starts_at") @db.Timestamptz(6)
+  /// When the cohort run ends. Null when only a start is known.
+  endsAt           DateTime?           @map("ends_at") @db.Timestamptz(6)
+  /// Maximum seats. Null = uncapped.
+  capacity         Int?
+  /// Soft FK into `identity.users.id` — the assigned instructor (TS-253).
+  /// Null while unassigned. Never a Prisma relation (cross-service).
+  instructorUserId String?             @map("instructor_user_id")
+  createdAt        DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone; populated by admin only.
+  deletedAt        DateTime?           @map("deleted_at") @db.Timestamptz(6)
+
+  enrollments AcademyEnrollment[]
+
+  /// "Cohorts for this course, soonest-starting first."
+  @@index([courseId, startsAt], map: "academy_cohorts_course_starts_idx")
+  /// Status-filtered ops views ("which cohorts are open / in progress").
+  @@index([status], map: "academy_cohorts_status_idx")
+  /// Soft-delete filter on list reads.
+  @@index([deletedAt], map: "academy_cohorts_deleted_at_idx")
+  @@map("academy_cohorts")
+  @@schema("academy")
+}
+
+/// A student's enrollment in a course (PDD §15.1 "Progress and completion
+/// tracking per enrollment"). PER-STUDENT data — it flows through the TS-141
+/// tenant-scope gate (NOT in `unscopedModels`); row-level filtering by
+/// `student_user_id` is the service's responsibility when the enrollment
+/// endpoints land (TS-252), the same posture as `Subscription` in
+/// service-subscription.
+///
+/// `student_user_id` is a soft FK into `identity.users.id` — a provider
+/// (TS-052 tier-eligibility path) or an external student. Never a Prisma
+/// relation (cross-service; CLAUDE.md §2.3).
+///
+/// `course_id` is an in-service relation to `AcademyCourse` (default
+/// `Restrict` onDelete — enrollment records are preserved). `cohort_id` is an
+/// OPTIONAL in-service relation (null for self-paced enrollments); `ON DELETE
+/// SET NULL` keeps the enrollment if its cohort is hard-deleted.
+///
+/// `progress_percent` is the coarse enrollment-level progress (0–100). The
+/// fine-grained per-lesson progress table is a TS-252 (lesson player) concern.
+///
+/// Soft-delete (`deleted_at`) preserves enrollment history. Read-paths filter
+/// `deleted_at = null` unless explicitly auditing.
+model AcademyEnrollment {
+  id              String                  @id @default(cuid())
+  courseId        String                  @map("course_id")
+  course          AcademyCourse           @relation(fields: [courseId], references: [id])
+  /// Optional in-service relation to the cohort (null for self-paced).
+  cohortId        String?                 @map("cohort_id")
+  cohort          AcademyCohort?          @relation(fields: [cohortId], references: [id], onDelete: SetNull)
+  /// Soft FK into `identity.users.id` — the enrolled student. Tenant-scope
+  /// key (row-level filtering is the service's responsibility). Never a
+  /// Prisma relation (cross-service).
+  studentUserId   String                  @map("student_user_id")
+  status          AcademyEnrollmentStatus @default(active)
+  /// Coarse enrollment-level progress, 0–100 (per-lesson detail → TS-252).
+  progressPercent Int                     @default(0) @map("progress_percent")
+  enrolledAt      DateTime                @default(now()) @map("enrolled_at") @db.Timestamptz(6)
+  /// Set when `status = 'completed'`; gates certification issuance (TS-255).
+  completedAt     DateTime?               @map("completed_at") @db.Timestamptz(6)
+  /// Time-bounded-access expiry (e.g. membership-gated content). Null =
+  /// no expiry.
+  expiresAt       DateTime?               @map("expires_at") @db.Timestamptz(6)
+  createdAt       DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone; populated by admin only.
+  deletedAt       DateTime?               @map("deleted_at") @db.Timestamptz(6)
+
+  certifications AcademyCertification[]
+
+  /// Dominant student read: "my enrollments by status" (the web-academy "my
+  /// courses" view). Composite so one scan filters by student AND status.
+  @@index([studentUserId, status], map: "academy_enrollments_student_status_idx")
+  /// "Enrollments for this course" — admin + completion reads.
+  @@index([courseId], map: "academy_enrollments_course_id_idx")
+  /// "Enrollments in this cohort" — cohort roster + attendance (TS-253).
+  @@index([cohortId], map: "academy_enrollments_cohort_id_idx")
+  /// Soft-delete filter on list reads.
+  @@index([deletedAt], map: "academy_enrollments_deleted_at_idx")
+  @@map("academy_enrollments")
+  @@schema("academy")
+}
+
+/// A certification awarded to a student (PDD §15.2; PRD §9.3). Issued on
+/// course completion + assessment passage (TS-255), it carries a public
+/// verification token (the `/verify/cert/{token}` URL), an optional renewal
+/// expiry (TS-256), and the generated PDF's S3 key. PER-STUDENT data — it
+/// flows through the TS-141 tenant-scope gate (NOT in `unscopedModels`).
+///
+/// `student_user_id` is a soft FK into `identity.users.id`. `course_id` is an
+/// in-service relation to `AcademyCourse` (default `Restrict` — cert records
+/// are preserved). `enrollment_id` is an OPTIONAL in-service relation to the
+/// earning enrollment (`ON DELETE SET NULL`).
+///
+/// `title` + `track` + `holder_name` are captured at issue time (the course
+/// title/track may change later, and the holder's name lives in
+/// `identity.users` — a different service — so the certificate, and the PUBLIC
+/// verification page, must snapshot what was earned without a cross-service
+/// read at render/verify time). `track` is the value `provider-svc` reads to
+/// gate tier eligibility (PDD §15.2). `holder_name` is the only field the
+/// public `/verify/cert/{token}` page surfaces alongside the course + dates —
+/// a deliberate, diploma-style credential disclosure (PRD §9.3).
+///
+/// `verification_token` is globally unique (the public verification URL key).
+/// `certificate_pdf_key` references the `media-svc` / S3 PDF asset by key —
+/// never a Prisma relation. Populated by TS-255.
+///
+/// No soft-delete: a certification is never deleted; it is `revoked` (status +
+/// `revoked_at`), preserving the audit + verification trail (CLAUDE.md §3.6).
+model AcademyCertification {
+  id                String                     @id @default(cuid())
+  /// Soft FK into `identity.users.id` — the certified student. Tenant-scope
+  /// key. Never a Prisma relation (cross-service).
+  studentUserId     String                     @map("student_user_id")
+  courseId          String                     @map("course_id")
+  course            AcademyCourse              @relation(fields: [courseId], references: [id])
+  /// Optional in-service relation to the earning enrollment.
+  enrollmentId      String?                    @map("enrollment_id")
+  enrollment        AcademyEnrollment?         @relation(fields: [enrollmentId], references: [id], onDelete: SetNull)
+  /// Course title captured at issue time (see model header).
+  title             String
+  /// Track captured at issue time — read by `provider-svc` for tier
+  /// eligibility (PDD §15.2).
+  track             AcademyCourseTrack
+  /// Holder display name captured at issue time (TS-255). The student's name
+  /// lives in `identity.users` (a different service) — never joined; the
+  /// issuance caller supplies it so the PDF + public verification page render
+  /// without a cross-service read. Null only for legacy rows issued before
+  /// this column existed (none in practice — expand-only column).
+  holderName        String?                    @map("holder_name")
+  status            AcademyCertificationStatus @default(active)
+  /// Public verification URL key (`/verify/cert/{token}`). Globally unique.
+  verificationToken String                     @unique @map("verification_token")
+  /// `media-svc` / S3 key for the generated PDF certificate (TS-255). Null
+  /// until rendered. Never a Prisma relation.
+  certificatePdfKey String?                    @map("certificate_pdf_key")
+  issuedAt          DateTime                   @default(now()) @map("issued_at") @db.Timestamptz(6)
+  /// Renewal expiry (PDD §15.2 — default 24 months at issue). Null = no
+  /// expiry. Read by the renewal-reminder worker (TS-256).
+  expiresAt         DateTime?                  @map("expires_at") @db.Timestamptz(6)
+  /// Set when `status = 'revoked'`.
+  revokedAt         DateTime?                  @map("revoked_at") @db.Timestamptz(6)
+  createdAt         DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Dominant student read: "my certifications" + the provider-sync read.
+  @@index([studentUserId], map: "academy_certifications_student_user_id_idx")
+  /// "Certifications for this course" — admin reads.
+  @@index([courseId], map: "academy_certifications_course_id_idx")
+  /// Status-filtered reads (active vs expired vs revoked).
+  @@index([status], map: "academy_certifications_status_idx")
+  /// Powers the renewal-reminder worker (TS-256): "certs expiring before X".
+  @@index([expiresAt], map: "academy_certifications_expires_at_idx")
+  @@map("academy_certifications")
+  @@schema("academy")
+}
+
+/// Quiz question type (TS-254; PDD §15.1 quiz engine). Drives how an attempt's
+/// answer is graded.
+///
+///   `single_choice`   = exactly one option is correct; the student picks one.
+///   `multiple_choice` = one OR more options correct; the student's selected
+///                       set must equal the correct set EXACTLY (all-or-nothing
+///                       — no partial credit in Phase 1).
+///   `true_false`      = a `single_choice` with exactly two options.
+///
+/// Additive only — new kinds arrive via `ALTER TYPE … ADD VALUE`.
+enum AcademyQuizQuestionKind {
+  single_choice
+  multiple_choice
+  true_false
+
+  @@map("academy_quiz_question_kind")
+  @@schema("academy")
+}
+
+/// Quiz attempt lifecycle (TS-254). An attempt is created `in_progress` when a
+/// student starts (the engine draws + freezes the question set); it transitions
+/// once to `submitted` when answers are graded. There is no edit-after-submit
+/// path — a retake is a NEW attempt (subject to the quiz's retake policy).
+///
+/// Additive only.
+enum AcademyQuizAttemptStatus {
+  in_progress
+  submitted
+
+  @@map("academy_quiz_attempt_status")
+  @@schema("academy")
+}
+
+/// A quiz attached to a `quiz`-kind lesson (TS-254; PRD §9.2–§9.3; PDD §15.1) —
+/// the configuration that the engine reads to draw, score, and gate. One quiz
+/// per lesson (`lesson_id` unique). Platform-wide CATALOG content (no tenant
+/// axis; in `unscopedModels`) — the question bank is the same for every student;
+/// only the per-student `AcademyQuizAttempt` rows carry a tenant axis.
+///
+/// `lesson_id` is an in-service relation to `AcademyLesson` (`ON DELETE CASCADE`
+/// — the quiz is part of its lesson). The lesson SHOULD be `kind = 'quiz'`; the
+/// service enforces that at create time (not a DB constraint).
+///
+/// Selection: `questions_per_attempt` (N) drawn at random from the quiz's active
+/// (non-deleted) question bank (M). A start is rejected when M < N.
+///
+/// Scoring: an attempt's percent score gates on `passing_score_percent` (0–100).
+/// This is the per-quiz threshold; it defaults from the course's
+/// `passing_score_percent` at the authoring layer but is stored here so a course
+/// with several graded lessons can set per-quiz thresholds (PRD §9.3 — "passing
+/// threshold gates certification issuance").
+///
+/// Retake policy (PRD §9.2 "retake policy configurable"):
+///   - `max_attempts`            = cap on total attempts per student (null =
+///                                 unlimited).
+///   - `retake_cooldown_minutes` = minimum wait after a submitted attempt before
+///                                 a new one may start (null = no cooldown).
+///
+/// `bank_version` is bumped by the authoring layer on every question/option
+/// mutation; each attempt records the version it was taken against so a later
+/// bank edit never silently rewrites a historical attempt's meaning (the
+/// "versioned question bank" requirement).
+model AcademyQuiz {
+  id                    String        @id @default(cuid())
+  /// In-service relation to the owning lesson. Unique — one quiz per lesson.
+  lessonId              String        @unique @map("lesson_id")
+  lesson                AcademyLesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  title                 String
+  /// Optional pre-quiz instructions (Markdown) shown before the first question.
+  instructions          String?
+  /// How many questions to draw per attempt (N-of-M). A start is rejected when
+  /// the active bank holds fewer than this.
+  questionsPerAttempt   Int           @map("questions_per_attempt")
+  /// Pass threshold (0–100). An attempt passes when its percent ≥ this.
+  passingScorePercent   Int           @map("passing_score_percent")
+  /// Total-attempts cap per student. Null = unlimited.
+  maxAttempts           Int?          @map("max_attempts")
+  /// Minimum wait (minutes) after a submitted attempt before a retake. Null = none.
+  retakeCooldownMinutes Int?          @map("retake_cooldown_minutes")
+  /// When true, the drawn question set is presented in a shuffled order.
+  shuffleQuestions      Boolean       @default(true) @map("shuffle_questions")
+  /// Monotonic bank revision — bumped on every question/option mutation.
+  bankVersion           Int           @default(1) @map("bank_version")
+  createdAt             DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  questions AcademyQuizQuestion[]
+  attempts  AcademyQuizAttempt[]
+
+  @@map("academy_quizzes")
+  @@schema("academy")
+}
+
+/// A question in a quiz's bank (TS-254). Platform-wide CATALOG content
+/// (`unscopedModels`).
+///
+/// `quiz_id` is an in-service relation to `AcademyQuiz` (`ON DELETE CASCADE`).
+///
+/// Soft-delete (`deleted_at`) removes a question from the DRAW POOL while
+/// preserving it for historical attempts that referenced it (an attempt freezes
+/// its drawn `question_ids` + `bank_version`; result rendering still resolves
+/// the question text). Read-paths that build the draw pool filter
+/// `deleted_at = null`.
+///
+/// `points` weights the question in the attempt score (default 1). `kind` drives
+/// grading (see `AcademyQuizQuestionKind`).
+model AcademyQuizQuestion {
+  id           String                  @id @default(cuid())
+  quizId       String                  @map("quiz_id")
+  quiz         AcademyQuiz             @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  /// The question text (Markdown).
+  prompt       String
+  kind         AcademyQuizQuestionKind
+  /// Score weight (≥ 1). Default 1.
+  points       Int                     @default(1)
+  /// Ordering within the authoring view (0-based). Attempts shuffle independently.
+  sortPosition Int                     @map("sort_position")
+  createdAt    DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone; excludes the question from the draw pool.
+  deletedAt    DateTime?               @map("deleted_at") @db.Timestamptz(6)
+
+  options AcademyQuizQuestionOption[]
+
+  /// Dominant read: "this quiz's questions in authoring order".
+  @@index([quizId, sortPosition], map: "academy_quiz_questions_quiz_sort_idx")
+  /// Soft-delete filter when building the draw pool.
+  @@index([deletedAt], map: "academy_quiz_questions_deleted_at_idx")
+  @@map("academy_quiz_questions")
+  @@schema("academy")
+}
+
+/// An answer option for a question (TS-254). Platform-wide CATALOG content
+/// (`unscopedModels`). `question_id` is an in-service relation
+/// (`ON DELETE CASCADE`). `is_correct` marks the option(s) that score; never
+/// exposed to the student-facing attempt view (only the admin authoring view +
+/// the post-submit result reveal carry it).
+model AcademyQuizQuestionOption {
+  id           String              @id @default(cuid())
+  questionId   String              @map("question_id")
+  question     AcademyQuizQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  label        String
+  isCorrect    Boolean             @default(false) @map("is_correct")
+  /// Ordering within the question (0-based).
+  sortPosition Int                 @map("sort_position")
+  createdAt    DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Dominant read: "this question's options in order".
+  @@index([questionId, sortPosition], map: "academy_quiz_question_options_question_sort_idx")
+  @@map("academy_quiz_question_options")
+  @@schema("academy")
+}
+
+/// A student's attempt at a quiz (TS-254). PER-STUDENT data — it flows through
+/// the TS-141 tenant-scope gate (NOT in `unscopedModels`); row-level filtering
+/// by `student_user_id` is the service's responsibility (the same posture as
+/// `AcademyEnrollment` / `Subscription`).
+///
+/// `quiz_id` is an in-service relation to `AcademyQuiz` (default `Restrict` —
+/// attempt records are preserved). `student_user_id` is a soft FK into
+/// `identity.users.id` — never a Prisma relation (cross-service; CLAUDE.md §2.3).
+///
+/// `question_ids` freezes the drawn N-of-M set (in presentation order);
+/// `bank_version` freezes the bank revision — together they make the attempt a
+/// stable snapshot even after a later bank edit. Scoring columns
+/// (`points_awarded` / `points_possible` / `score_percent` / `passed`) are null
+/// until `status = 'submitted'`.
+model AcademyQuizAttempt {
+  id             String                   @id @default(cuid())
+  quizId         String                   @map("quiz_id")
+  quiz           AcademyQuiz              @relation(fields: [quizId], references: [id])
+  /// Soft FK into `identity.users.id` — the attempting student. Tenant-scope key.
+  studentUserId  String                   @map("student_user_id")
+  status         AcademyQuizAttemptStatus @default(in_progress)
+  /// 1-based ordinal among this student's attempts at this quiz.
+  attemptNumber  Int                      @map("attempt_number")
+  /// The quiz `bank_version` this attempt was drawn against.
+  bankVersion    Int                      @map("bank_version")
+  /// The drawn question ids, in presentation order. Frozen at start.
+  questionIds    String[]                 @map("question_ids")
+  /// Sum of awarded points (null until submitted).
+  pointsAwarded  Int?                     @map("points_awarded")
+  /// Sum of possible points across the drawn set (null until submitted).
+  pointsPossible Int?                     @map("points_possible")
+  /// Rounded percent score 0–100 (null until submitted).
+  scorePercent   Int?                     @map("score_percent")
+  /// Whether the percent met the quiz threshold (null until submitted).
+  passed         Boolean?
+  startedAt      DateTime                 @default(now()) @map("started_at") @db.Timestamptz(6)
+  /// Stamped when graded.
+  submittedAt    DateTime?                @map("submitted_at") @db.Timestamptz(6)
+  createdAt      DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  answers AcademyQuizAttemptAnswer[]
+
+  /// Dominant student read: "my attempts at this quiz" (retake-policy + history).
+  @@index([studentUserId, quizId], map: "academy_quiz_attempts_student_quiz_idx")
+  /// "Attempts for this quiz" — admin reads.
+  @@index([quizId], map: "academy_quiz_attempts_quiz_id_idx")
+  @@map("academy_quiz_attempts")
+  @@schema("academy")
+}
+
+/// A graded answer within a submitted attempt (TS-254). PER-STUDENT data
+/// (scoped). `attempt_id` is an in-service relation (`ON DELETE CASCADE`).
+/// `question_id` references the question drawn for the attempt (resolved at
+/// render time; not an FK so a soft-deleted question still resolves).
+/// `selected_option_ids` is the student's submitted choice set; `correct` +
+/// `points_awarded` are the grading outcome.
+model AcademyQuizAttemptAnswer {
+  id                String             @id @default(cuid())
+  attemptId         String             @map("attempt_id")
+  attempt           AcademyQuizAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  questionId        String             @map("question_id")
+  /// The student's selected option ids (one for single/true-false; ≥0 for multiple).
+  selectedOptionIds String[]           @map("selected_option_ids")
+  correct           Boolean
+  pointsAwarded     Int                @map("points_awarded")
+  createdAt         DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// Dominant read: "this attempt's answers" (result reveal).
+  @@index([attemptId], map: "academy_quiz_attempt_answers_attempt_id_idx")
+  @@map("academy_quiz_attempt_answers")
+  @@schema("academy")
+}

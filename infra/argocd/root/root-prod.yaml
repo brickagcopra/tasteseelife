@@ -1,0 +1,53 @@
+# Root Application for prod.
+#
+# Critical difference from dev / staging: `syncPolicy.automated` is OMITTED
+# entirely. Per PDD §11 promotion is an explicit operator action. The root
+# Application still tracks drift (the UI shows OutOfSync for child manifests
+# that have moved on main) but does NOT auto-apply.
+#
+# An operator promotes by running:
+#   argocd app sync root-prod
+#
+# That sync creates / updates child Applications under applications/prod/,
+# each of which is ALSO manual-sync (see applications/prod/platform.yaml).
+# Promotion is therefore a two-step explicit action — root then child —
+# which makes the soak-then-promote gate visible in the audit log.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root-prod
+  namespace: argocd
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    tastesee.io/env: prod
+    tastesee.io/role: root
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: platform-prod
+
+  source:
+    repoURL: https://github.com/brickagcopra/tasteseelife.git
+    path: infra/argocd/applications/prod
+    targetRevision: main
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+
+  # No automated.* block — prod is manual-sync only per PDD §11.
+  # Retry policy still applies once a sync is triggered (network blips
+  # mid-sync don't require operator re-action).
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=false
+      - ApplyOutOfSyncOnly=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 10m

@@ -1,0 +1,68 @@
+# Observability stack (TS-151-followup-6). Closes PDD §20.5 +
+# CLAUDE.md §10 — "structured logs / metrics / traces from day one".
+#
+# Three Helm charts are inflated at `kustomize build` time (same
+# HelmChartInflationGenerator pattern as base/ingress-nginx/ and
+# base/cert-manager/ — `--enable-helm` is mandatory):
+#
+#   - kube-prometheus-stack → Prometheus + Alertmanager + Grafana
+#     + node-exporter + kube-state-metrics + the Prometheus Operator
+#     (installs the ServiceMonitor / PodMonitor / PrometheusRule CRDs
+#     the rest of the platform can adopt going forward).
+#   - loki    → log aggregation (SingleBinary mode, filesystem store).
+#   - tempo   → distributed tracing (monolithic, local store, OTLP in).
+#
+# Everything lands in the `observability` namespace, which sits at PSS
+# `baseline` (base/namespaces/namespaces.yaml) because these upstream
+# charts are not hardened to `restricted` — tracked in TS-152-followup-3
+# / TS-151-followup-3.
+#
+# Chart versions are pinned for reproducibility — bump via PR, never via
+# floating ranges. They are author-blind on the Windows dev host (no
+# local `helm`); the kubernetes-validate CI gate (`kubectl kustomize
+# --enable-helm | kubeconform`) is what confirms the render — identical
+# posture to the ingress-nginx / cert-manager charts.
+#
+# Grafana's own chart Ingress is DISABLED; a standalone grafana-ingress.yaml
+# ships instead so each env overlay can patch the host + LE issuer the same
+# way the web-app Ingresses are patched (grafana.<env>.tasteseelife.com).
+#
+# Prometheus discovers scrape targets two ways:
+#   1. Operator CRDs (ServiceMonitor / PodMonitor) — for future adoption.
+#   2. The classic annotation-based `kubernetes-pods` job in
+#      values-kube-prometheus-stack.yaml `additionalScrapeConfigs` — this
+#      honours the `prometheus.io/scrape` / `prometheus.io/port` /
+#      `prometheus.io/path` annotations the nestjs-service + bullmq-worker
+#      components already emit, so every existing workload is scraped with
+#      zero per-service change. cluster-network-policy.yaml opens the
+#      channel through the workload namespaces' default-deny baselines.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: observability
+
+helmCharts:
+  - name: kube-prometheus-stack
+    repo: https://prometheus-community.github.io/helm-charts
+    version: 65.5.1
+    releaseName: kube-prometheus-stack
+    namespace: observability
+    valuesFile: values-kube-prometheus-stack.yaml
+
+  - name: loki
+    repo: https://grafana.github.io/helm-charts
+    version: 6.18.0
+    releaseName: loki
+    namespace: observability
+    valuesFile: values-loki.yaml
+
+  - name: tempo
+    repo: https://grafana.github.io/helm-charts
+    version: 1.14.0
+    releaseName: tempo
+    namespace: observability
+    valuesFile: values-tempo.yaml
+
+resources:
+  - cluster-network-policy.yaml
+  - grafana-ingress.yaml

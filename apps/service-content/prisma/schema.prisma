@@ -1,0 +1,439 @@
+// Content & CMS bounded context — see PDD §7.2 (service inventory, content-svc)
+// and §19 (Content / CMS / Help Center). PRD §10.10 (Blog) + §10.11 (Help
+// Center).
+//
+// Scope so far:
+//   - TS-280 ships the skeleton: the `content` Postgres schema and the five
+//     core tables — `pages`, `page_versions`, `articles`, `article_versions`,
+//     `help_categories` (PDD §8.2). No HTTP surface beyond `/healthz` +
+//     `/readyz` yet, and no authoring endpoints (those land across
+//     TS-281..TS-289).
+//
+// Versioning model: `pages` / `articles` are the live editorial entities; their
+// content bodies live in append-only `page_versions` / `article_versions` rows
+// (a new row per save — never an in-place update of published copy). The live
+// entity carries a nullable `current_version_id` soft pointer to the version it
+// currently renders. Editorial rollback = repoint `current_version_id` at an
+// older version row (TS-281/282). This mirrors the audit-style "immutable
+// history + movable head" shape (CLAUDE.md §3.6 append-only posture applied to
+// content).
+//
+// Each addition is a forward-compatible expand → migrate → contract migration
+// per CLAUDE.md §4.1; enum value sets evolve additively (`ALTER TYPE … ADD
+// VALUE`) per the TS-205 / TS-220 convention.
+//
+// Cross-service references are by id only — never a foreign key into another
+// service schema (CLAUDE.md §2.3, §4.1). `*_versions.created_by` is a soft FK
+// (the authoring staff user id, into service-identity) — never a declared
+// foreign key. In-schema relations (`page_versions.page_id`,
+// `article_versions.article_id` → their parents; `articles.category_id` →
+// `help_categories.id`; `help_categories.parent_id` self-reference) are
+// declared FKs because they live inside this service's own `content` schema.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. The feature has been
+  // production-stable since Prisma 5.0 even though it remains under the
+  // `previewFeatures` umbrella in 5.x — see Prisma migration notes.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `content` Postgres schema. Every other service gets
+  // its own schema in the same database (Phase 1) or its own database entirely
+  // (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["content"]
+}
+
+/// Publication lifecycle of a page or article (PDD §19).
+///
+///   `draft`     = being authored in the admin UI; not publicly served.
+///   `published` = live; served by the public blog / page / help read API.
+///   `archived`  = retired; retained for history, never publicly served.
+///
+/// Additive only — new states arrive via `ALTER TYPE … ADD VALUE`.
+enum ContentStatus {
+  draft
+  published
+  archived
+
+  @@map("content_status")
+  @@schema("content")
+}
+
+/// A marketing / CMS page (PRD §10.10; PDD §19). The live editorial entity;
+/// its rendered body lives in append-only `page_versions` rows.
+model Page {
+  id     String        @id @default(cuid())
+  /// URL-addressable slug (e.g. `about`, `pricing`). Unique across pages.
+  slug   String        @unique
+  status ContentStatus @default(draft)
+  /// Current editorial title (per-version titles also live on `page_versions`).
+  title  String
+  /// Soft pointer to the `page_versions.id` this page currently renders. NULL
+  /// for a freshly-created page with no saved version yet. A soft pointer (not
+  /// a declared FK) to avoid the circular page ⇄ page_version insert-order
+  /// constraint — the head is moved by the authoring service (TS-282), not by
+  /// referential integrity.
+  currentVersionId String? @map("current_version_id")
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  versions PageVersion[]
+
+  /// Status-filtered admin / public view ("which pages are published").
+  @@index([status], map: "pages_status_idx")
+  @@map("pages")
+  @@schema("content")
+}
+
+/// An append-only saved revision of a page's content (PDD §19). Never updated
+/// in place — a new row per save; the live `pages.current_version_id` selects
+/// the rendered head.
+model PageVersion {
+  id        String @id @default(cuid())
+  pageId    String @map("page_id")
+  /// Monotonically increasing per-page revision number (1, 2, 3, …). Unique
+  /// within a page so a save can address "version 3 of page X".
+  versionNo Int    @map("version_no")
+  title     String
+  /// Rendered body (Markdown / serialized rich-text). TEXT — no length cap so
+  /// the schema never constrains the editorial format (TipTap → TS-281).
+  body      String
+  /// When this version became (or is scheduled to become) the live, legally-
+  /// effective copy (TS-284; PDD §19.2). NULL until the version is published —
+  /// the `publish` action stamps it (omitted = the publish instant; supplied =
+  /// a future / backdated compliance-effective date). A published-then-
+  /// superseded version retains its historical `effective_at` so the compliance
+  /// trail ("which terms were in force on date X") is reconstructable.
+  effectiveAt DateTime? @map("effective_at") @db.Timestamptz(6)
+  /// Whether this version was published as a MATERIAL change (TS-285; PDD §19.2)
+  /// — a substantive Terms / Privacy / etc. change that active subscribers must
+  /// be notified of (and, for Terms / Privacy, re-acknowledge). Set at publish
+  /// time; false for an ordinary publish or an unpublished draft. A material
+  /// publish additionally emits `content.page.material_changed` to the outbox
+  /// inside the publish transaction.
+  isMaterialChange Boolean @default(false) @map("is_material_change")
+  /// The editor's summary of what changed / why it is material. NULL unless the
+  /// version was flagged material with a note. Rides the material-change event.
+  materialChangeNote String? @map("material_change_note")
+  /// Soft FK: the authoring staff user id (into service-identity). Never a
+  /// declared cross-service FK (CLAUDE.md §2.3).
+  createdBy String   @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  page Page @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+  /// "Versions for this page" — the dominant history read.
+  @@index([pageId], map: "page_versions_page_id_idx")
+  /// "Which version was effective as of date X" — the compliance lookup
+  /// (TS-284). Bounded by `page_id` in practice; the standalone `effective_at`
+  /// index serves the cross-page "all versions taking effect this window" scan.
+  @@index([effectiveAt], map: "page_versions_effective_at_idx")
+  /// A page addresses its revisions by number; also pins per-page uniqueness.
+  @@unique([pageId, versionNo], map: "page_versions_page_id_version_no_key")
+  @@map("page_versions")
+  @@schema("content")
+}
+
+/// Transactional outbox (TS-284; PDD §7.3, CLAUDE.md §5.3, §3.6). service-content
+/// appends `audit.action_recorded` rows here INSIDE the same `$transaction` as
+/// each content-admin mutation (page create, version append, version publish),
+/// so the audit record commits atomically with the state change. The
+/// `worker-outbox-relay` drains undispatched rows onto Redis Streams;
+/// `service-audit`'s consumer persists append-only + hash-chained, idempotent on
+/// `event_id`. The shape is identical to every other producer service's
+/// `outbox_events` table — the `@taste-and-see/nest-outbox` SDK is
+/// schema-agnostic. The partial "undispatched" index is materialised in the
+/// migration SQL (Prisma's `@@index` cannot express the predicate).
+model OutboxEvent {
+  /// Dedup key — consumers idempotency-check on this. UUID v4 from the SDK by
+  /// default; the producer passes an explicit id for exactly-once-effective
+  /// cross-boundary delivery.
+  eventId         String    @id @map("event_id")
+  /// Dot-notation event name from `packages/contracts/events`. Validated by the
+  /// SDK against the registry before insert — unknown names are rejected at the
+  /// producer boundary.
+  eventName       String    @map("event_name")
+  /// Validated domain payload (validated by the SDK against the matching
+  /// `eventRegistry` schema before insert).
+  payload         Json
+  /// Producer wall-clock time the event semantically happened.
+  occurredAt      DateTime  @map("occurred_at") @db.Timestamptz(6)
+  /// Service name that produced the row (`service-content`).
+  producerService String    @map("producer_service")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Stamped by the relay once forwarded onto the bus. Null = undispatched +
+  /// eligible for the next poll cycle.
+  dispatchedAt    DateTime? @map("dispatched_at") @db.Timestamptz(6)
+  /// Failed-dispatch counter. The relay dead-letters once it reaches MAX_ATTEMPTS.
+  attempts        Int       @default(0)
+  /// Stamped by the relay on the most recent failed attempt.
+  lastAttemptAt   DateTime? @map("last_attempt_at") @db.Timestamptz(6)
+  /// Most recent failure message — capped at 2000 chars at the relay.
+  lastError       String?   @map("last_error")
+
+  /// Secondary scroll by event_name (admin filters / metrics). The relay's
+  /// dominant "next batch of undispatched rows ordered by created_at" read is
+  /// served by a PARTIAL index on `dispatched_at IS NULL` that Prisma's
+  /// `@@index` cannot express — materialised in the migration SQL (CLAUDE.md §7.3).
+  @@index([eventName], map: "content_outbox_events_event_name_idx")
+  @@map("outbox_events")
+  @@schema("content")
+}
+
+/// A help-center / blog taxonomy category (PRD §10.11; PDD §19). Self-nesting
+/// via `parent_id` for a category tree.
+model HelpCategory {
+  id        String  @id @default(cuid())
+  /// URL-addressable slug (e.g. `getting-started`). Unique across categories.
+  slug      String  @unique
+  name      String
+  /// Self-referential parent for a category tree. NULL = a root category.
+  parentId  String? @map("parent_id")
+  /// Manual display ordering within a parent (ascending). Default 0.
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  parent   HelpCategory?  @relation("HelpCategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children HelpCategory[] @relation("HelpCategoryTree")
+  articles Article[]
+
+  /// "Child categories of this parent" — the tree-walk read.
+  @@index([parentId], map: "help_categories_parent_id_idx")
+  @@map("help_categories")
+  @@schema("content")
+}
+
+/// The credited-author role of an `ArticleAuthor` link (TS-283; PDD §19.1).
+///
+///   `primary`   = the lead byline (typically one per article).
+///   `co_author` = an additional credited collaborator.
+///
+/// Additive only — new roles arrive via `ALTER TYPE … ADD VALUE`.
+enum ContentAuthorRole {
+  primary
+  co_author
+
+  @@map("content_author_role")
+  @@schema("content")
+}
+
+/// A content author profile (TS-283; PRD §10.10; PDD §19.1). Represents a
+/// content-staff user's public authoring identity — bio, photo, social links —
+/// decoupled from their service-identity account so the byline persists
+/// independently of role/account churn. `user_id` is a SOFT reference into
+/// service-identity (never a declared cross-service FK, CLAUDE.md §2.3, §4.1),
+/// unique so one identity maps to at most one author profile.
+model ContentAuthor {
+  id String @id @default(cuid())
+  /// Soft FK — the service-identity user this author profile represents.
+  /// Unique (one profile per identity). Never a declared cross-service FK.
+  userId String @unique @map("user_id")
+  /// Public display name on the byline.
+  displayName String @map("display_name")
+  /// Author biography (Markdown / plain text). NULL until filled in.
+  bio String?
+  /// Profile photo — a media assetKey reference (nullable), like ad creatives /
+  /// article OG images. The media-upload flow is a separate concern.
+  photoAssetKey String? @map("photo_asset_key")
+  /// Social links as a JSON object (e.g. `{ "twitter": "…", "website": "…" }`).
+  /// NULL = none set. URLs are http/https-validated at the contract boundary.
+  socialLinks Json? @map("social_links")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  authorships ArticleAuthor[]
+
+  @@map("content_authors")
+  @@schema("content")
+}
+
+/// The many-to-many credit linking an `Article` to its `ContentAuthor`s, ordered
+/// (TS-283; PDD §19.1). Co-authorship = N author links per article. `sort_order`
+/// gives the byline ordering; `author_role` distinguishes the lead from
+/// collaborators. Both FKs are in-schema (declared): `article_id` cascades (the
+/// credit dies with the article); `author_id` RESTRICTs (an author still credited
+/// on an article cannot be deleted — the byline must be unlinked first, protecting
+/// the historical credit).
+model ArticleAuthor {
+  id         String            @id @default(cuid())
+  articleId  String            @map("article_id")
+  authorId   String            @map("author_id")
+  authorRole ContentAuthorRole @default(co_author) @map("author_role")
+  /// Byline ordering within the article (ascending). Assigned from the set-order.
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  article Article       @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  author  ContentAuthor @relation(fields: [authorId], references: [id], onDelete: Restrict)
+
+  /// "Authors of this article" — the byline read (ordered by sort_order).
+  @@index([articleId], map: "article_authors_article_id_idx")
+  /// "Articles this author is credited on" — the RESTRICT existence check.
+  @@index([authorId], map: "article_authors_author_id_idx")
+  /// An author is credited at most once per article.
+  @@unique([articleId, authorId], map: "article_authors_article_id_author_id_key")
+  @@map("article_authors")
+  @@schema("content")
+}
+
+/// A blog / help article (PRD §10.10, §10.11; PDD §19). The live editorial
+/// entity; its rendered body lives in append-only `article_versions` rows.
+model Article {
+  id     String        @id @default(cuid())
+  /// URL-addressable slug. Unique across articles.
+  slug   String        @unique
+  status ContentStatus @default(draft)
+  title  String
+  /// Optional help-center category. NULL for an uncategorised blog post.
+  categoryId String? @map("category_id")
+  /// Soft pointer to the `article_versions.id` this article currently renders
+  /// (see `Page.currentVersionId` for the soft-pointer rationale).
+  currentVersionId String? @map("current_version_id")
+
+  /// SEO metadata (TS-282; PDD §19.1). Lives on the ARTICLE (stable canonical /
+  /// social identity), NOT per version. All nullable — an editor fills them in
+  /// via the SEO PATCH. Image fields are media assetKey references (like ad
+  /// creatives); `jsonLd` is a schema.org JSON-LD object stored as `jsonb`.
+  seoTitle           String? @map("seo_title")
+  metaDescription    String? @map("meta_description")
+  canonicalUrl       String? @map("canonical_url")
+  ogTitle            String? @map("og_title")
+  ogDescription      String? @map("og_description")
+  ogImageKey         String? @map("og_image_key")
+  twitterCard        String? @map("twitter_card")
+  twitterTitle       String? @map("twitter_title")
+  twitterDescription String? @map("twitter_description")
+  twitterImageKey    String? @map("twitter_image_key")
+  jsonLd             Json?   @map("json_ld")
+
+  /// Newsletter send guard (TS-288; PDD §12.3). Set when an editor triggers
+  /// "send to newsletter" on a published article — the idempotency guard so a
+  /// post is never double-sent to the newsletter. NULL = not yet sent.
+  /// `newsletterSentBy` is the soft-ref staff id who triggered the send.
+  newsletterSentAt DateTime? @map("newsletter_sent_at") @db.Timestamptz(6)
+  newsletterSentBy String?   @map("newsletter_sent_by")
+
+  /// Per-post comments configuration (TS-289; PDD §19.1). Lives on the ARTICLE
+  /// (like SEO — stable per-post config, not per version). `commentsEnabled`
+  /// defaults false — comments stay dark until the public read surface ships
+  /// (TS-289-followup-1). `commentsProvider` is the wire enum `disqus` (the PDD
+  /// default) / `none`, persisted as text so new providers arrive without DDL.
+  /// `disqusIdentifier` is the stable per-thread Disqus identifier; NULL = the
+  /// public embed falls back to the article slug/id.
+  commentsEnabled  Boolean @default(false) @map("comments_enabled")
+  commentsProvider String  @default("disqus") @map("comments_provider")
+  disqusIdentifier String? @map("disqus_identifier")
+
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  category HelpCategory?    @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  versions ArticleVersion[]
+  authors  ArticleAuthor[]
+  feedback ArticleFeedback[]
+
+  /// Status-filtered admin / public view ("which articles are published").
+  @@index([status], map: "articles_status_idx")
+  /// "Articles in this category" — the help-center category-page read.
+  @@index([categoryId], map: "articles_category_id_idx")
+  @@map("articles")
+  @@schema("content")
+}
+
+/// The thumbs verdict of an `ArticleFeedback` row (TS-287; PDD §19.3).
+///
+///   `helpful`     = "Was this helpful?" → yes.
+///   `not_helpful` = "Was this helpful?" → no.
+///
+/// Additive only — new verdicts arrive via `ALTER TYPE … ADD VALUE`.
+enum ArticleFeedbackRating {
+  helpful
+  not_helpful
+
+  @@map("article_feedback_rating")
+  @@schema("content")
+}
+
+/// End-user "Was this helpful?" feedback on a published article (TS-287; PRD
+/// §10.10, §10.11; PDD §19.3). One vote per (article, user) — the composite
+/// unique makes a re-vote an UPSERT (flips helpful ↔ not_helpful) rather than a
+/// duplicate row. This is USER-FACING telemetry (any authenticated family /
+/// senior / staff reader), NOT an admin mutation, so it is deliberately NOT
+/// audit-logged per vote (CLAUDE.md §3.6 audit is for admin mutations; a per-vote
+/// audit row would flood the append-only log). `user_id` is a SOFT reference into
+/// service-identity (never a declared cross-service FK, CLAUDE.md §2.3, §4.1).
+/// Aggregate helpful / not-helpful counts are COMPUTED on read (a `count` per
+/// rating) — no denormalised counter to drift.
+model ArticleFeedback {
+  id        String                @id @default(cuid())
+  articleId String                @map("article_id")
+  /// Soft FK — the service-identity user who voted. Never a cross-service FK.
+  userId    String                @map("user_id")
+  rating    ArticleFeedbackRating
+  createdAt DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime              @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  /// "Aggregate feedback for this article" — the count-by-rating read.
+  @@index([articleId], map: "article_feedback_article_id_idx")
+  /// One vote per user per article — a re-vote UPSERTs on this key.
+  @@unique([articleId, userId], map: "article_feedback_article_id_user_id_key")
+  @@map("article_feedback")
+  @@schema("content")
+}
+
+/// An append-only saved revision of an article's content (PDD §19). Never
+/// updated in place — a new row per save; the live `articles.current_version_id`
+/// selects the rendered head.
+model ArticleVersion {
+  id        String @id @default(cuid())
+  articleId String @map("article_id")
+  /// Monotonically increasing per-article revision number. Unique within an
+  /// article.
+  versionNo Int    @map("version_no")
+  title     String
+  /// Rendered body (Markdown / serialized rich-text). TEXT — no length cap.
+  body      String
+  /// When this version became (or is scheduled to become) the live copy
+  /// (TS-284-followup-3; PDD §19). NULL until published — the `publish` action
+  /// stamps it (omitted = the publish instant; supplied = a future / backdated
+  /// effective date). Mirrors `PageVersion.effectiveAt`.
+  effectiveAt DateTime? @map("effective_at") @db.Timestamptz(6)
+  /// Soft FK: the authoring staff user id (into service-identity).
+  createdBy String   @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  /// "Versions for this article" — the dominant history read.
+  @@index([articleId], map: "article_versions_article_id_idx")
+  /// "Which article version was effective as of date X" — the cross-article
+  /// effective-window scan (mirrors `page_versions_effective_at_idx`).
+  @@index([effectiveAt], map: "article_versions_effective_at_idx")
+  /// An article addresses its revisions by number; also pins per-article uniqueness.
+  @@unique([articleId, versionNo], map: "article_versions_article_id_version_no_key")
+  @@map("article_versions")
+  @@schema("content")
+}

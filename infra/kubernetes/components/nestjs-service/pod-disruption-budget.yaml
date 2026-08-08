@@ -1,0 +1,17 @@
+# PDB ensures at least one replica stays up during voluntary
+# disruptions (node drains, rolling cluster upgrades). minAvailable=1
+# is appropriate for the standard 2-replica baseline; high-criticality
+# services (booking, gateway, identity, accounting per PDD §20.2) can
+# override to a higher value in their per-service base.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nestjs-service
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: backend
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: backend

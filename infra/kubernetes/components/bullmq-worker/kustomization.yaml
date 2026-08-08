@@ -1,0 +1,19 @@
+# Reusable Kustomize Component for a BullMQ background worker.
+#
+# Workers are headless: no Service, no Ingress, no HPA in this slice
+# (queue-depth-driven autoscaling requires the prometheus-adapter or
+# KEDA, captured as TS-151-followup-N). The Deployment scales
+# manually via the env overlay's replica patch until the custom
+# metrics pipeline lands.
+#
+# `priorityClassName: taste-and-see-workload-batch` — workers yield
+# first under node pressure so live request traffic doesn't suffer.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - service-account.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - network-policy.yaml
+  - pod-disruption-budget.yaml

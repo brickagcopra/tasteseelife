@@ -1,0 +1,33 @@
+-- TS-295 — kind-wide listing index for the RBAC History view (PDD §17.1;
+-- PRD §10.12/§10.13; CLAUDE.md §7.3).
+--
+-- Forward-only expand migration. Adds one index; no data movement, no
+-- table rewrite (Postgres builds btree indexes without blocking reads;
+-- audit_events write traffic is low enough that a plain CREATE INDEX is
+-- fine — CONCURRENTLY can't run inside Prisma's migration transaction).
+--
+-- Why: `GET /api/v1/admin/audit/events/by-resource-kind` runs
+--
+--   SELECT ... FROM audit.audit_events
+--   WHERE resource_kind IN ($1, ...) [AND action = $n] [AND actor_user_id = $m]
+--   ORDER BY occurred_at DESC, id DESC
+--   LIMIT k
+--
+-- The existing `audit_events_resource_occurred_idx (resource_kind,
+-- resource_id, occurred_at DESC)` cannot serve a kind-only predicate in
+-- order: `resource_id` sits between the kind and the sort key, so the
+-- planner would have to merge every per-resource run or fall back to a
+-- sort. With `(resource_kind, occurred_at DESC, id DESC)` each kind is a
+-- single ordered run; an IN over ≤5 kinds is a cheap merge-append of ≤5
+-- runs, and the trailing `id DESC` lets the keyset cursor's tie-break
+-- ride the index with no re-sort.
+--
+-- Reversal plan:
+--   DROP INDEX IF EXISTS "audit"."audit_events_kind_occurred_idx";
+-- Safe in isolation — indexes carry no data.
+--
+-- Apply locally with:
+--   pnpm -F @taste-and-see/service-audit prisma:migrate:deploy
+
+CREATE INDEX "audit_events_kind_occurred_idx"
+    ON "audit"."audit_events" ("resource_kind", "occurred_at" DESC, "id" DESC);

@@ -1,0 +1,83 @@
+-- TS-308c — mass-cancellation detection.
+--
+-- Two expand-only changes, neither of which touches an existing row or
+-- an existing read path.
+--
+-- ─────────────────────────────────────────────────────────────────────
+-- 1. bookings.canceled_by_user_id
+-- ─────────────────────────────────────────────────────────────────────
+--
+-- The `booking.canceled` event has carried `canceledByUserId` since
+-- TS-060, but the ROW never did — so the only durable record of who
+-- cancelled a visit was an outbox entry, which is relayed and then
+-- pruned. The decline path has recorded its actor since TS-205
+-- (`declined_by_user_id`); this closes the same gap on the cancel path.
+--
+-- The detector needs it for one specific reason: `bookings` names the
+-- provider and the household a cancellation is ABOUT, but nothing on
+-- this platform can tell service-booking whether the user who pressed
+-- cancel was the provider, a family member, or an admin — that lookup
+-- lives in two other services and CLAUDE.md §2.3 forbids reaching for
+-- it. A distinct-actor count over this column separates "one person
+-- walked away from a day of commitments" from "eight families
+-- independently cancelled on the same provider" without any
+-- cross-service call.
+--
+-- NULLABLE and NOT backfilled: the actor of a past cancellation is not
+-- recoverable from the row, and inventing a value would be worse than
+-- an honest null. Readers must treat null as "unknown", never as
+-- "system" — the detector counts unattributed rows separately and puts
+-- that number on its event so a reviewer knows the actor count is a
+-- floor rather than a fact.
+--
+-- Reversal: `ALTER TABLE booking.bookings DROP COLUMN canceled_by_user_id;`
+-- Data implication of reversing: the actor recorded on cancellations
+-- made while the column existed is lost. Nothing else reads it (it is
+-- deliberately absent from `BookingResponse`), so no API breaks.
+--
+-- ─────────────────────────────────────────────────────────────────────
+-- 2. bookings_canceled_at_idx (PARTIAL)
+-- ─────────────────────────────────────────────────────────────────────
+--
+-- The sweep scans "every booking cancelled since <window start>". The
+-- table's existing indexes are all leading on household_id, provider_id,
+-- senior_id, series_id, status, accept_window_expires_at, or
+-- held_by_incident_id — none of them serves a predicate on `canceled_at`
+-- alone, so the scan falls back to a sequential read of the whole
+-- bookings table on every tick of a timer-driven job.
+--
+--   EXPLAIN (before): Seq Scan on bookings
+--                       Filter: ((canceled_at IS NOT NULL) AND (canceled_at >= $1))
+--   EXPLAIN (after) : Index Scan using bookings_canceled_at_idx
+--                       Index Cond: (canceled_at >= $1)
+--
+-- PARTIAL on `canceled_at IS NOT NULL` because cancellations are a small
+-- minority of rows in steady state (the long-lived states are
+-- `confirmed` and `completed`), so the partial index is a fraction of
+-- the size of a full one and never has to be consulted for the dominant
+-- read paths. Prisma's `@@index` cannot express the predicate, hence the
+-- explicit DDL here (CLAUDE.md §7.3); `schema.prisma` declares the plain
+-- form so the model stays in sync.
+--
+-- The predicate is `canceled_at IS NOT NULL` rather than
+-- `status = 'canceled'` deliberately: `canceled_at` is stamped exactly
+-- once on the transition into `canceled` and `canceled` is terminal, so
+-- the two are equivalent today — but the timestamp predicate matches the
+-- query's own WHERE clause exactly, which is what makes the planner
+-- willing to use it.
+--
+-- Reversal: `DROP INDEX booking.bookings_canceled_at_idx;` — no data
+-- implication.
+--
+-- NOT created CONCURRENTLY: Prisma migrations run inside a transaction
+-- and `CREATE INDEX CONCURRENTLY` cannot. `IF NOT EXISTS` makes the
+-- statement a no-op if the index was built out-of-band first, which is
+-- the escape hatch if `bookings` has grown past the point where a brief
+-- blocking build is acceptable.
+
+ALTER TABLE "booking"."bookings"
+  ADD COLUMN IF NOT EXISTS "canceled_by_user_id" TEXT;
+
+CREATE INDEX IF NOT EXISTS "bookings_canceled_at_idx"
+  ON "booking"."bookings" ("canceled_at")
+  WHERE "canceled_at" IS NOT NULL;

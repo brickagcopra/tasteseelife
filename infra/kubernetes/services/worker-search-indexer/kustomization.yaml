@@ -1,0 +1,135 @@
+# Per-worker base for worker-search-indexer (TS-151-followup-1 rollout,
+# Batch 5 — final web/worker fleet). Consumes the reusable bullmq-worker
+# component.
+#
+# The worker subscribes via Redis Streams (outbox CONSUMER) to the three
+# provider domain-event streams (`provider.tier_changed` /
+# `.certification_granted` / `.certification_revoked`), then for each event
+# GETs service-provider's internal discovery-snapshot and PUTs the
+# materialised doc onto service-search's internal index endpoint
+# (apps/workers/search-indexer/src/config/env.ts).
+#
+# Lives in `platform-workers`. Headless: the bullmq-worker component ships
+# NO Service / Ingress / HPA — only /healthz + /readyz for the k8s probes.
+# PORT is pinned to the component default 3000 (the probe port) rather than
+# the env schema's 3051 default — purely a healthz listener, so matching
+# the component avoids per-port patching.
+#
+# OUTBOX_CONSUMER_NAME is wired to the pod name via the downward API
+# (`fieldRef: metadata.name`) so each replica presents a DISTINCT consumer
+# name inside the shared `worker-search-indexer` group (Redis tracks each
+# pod's pending entries independently).
+#
+# Egress: Redis lives on the external data node (already permitted by the
+# base data-access egress policy). The two internal HTTP hops cross into
+# platform-services — egress-network-policy.yaml opens exactly those two
+# paths (service-provider:3014, service-search:3020). The matching ingress
+# admissions live in the service-provider + service-search bases.
+#
+# The two shared-secret API keys (provider-discovery + search-index) match
+# the receivers' INTERNAL_API_KEY values — rotation is a two-side deploy.
+# Base URLs + header names are env-independent and ride the ConfigMap.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-workers
+
+components:
+  - ../../components/bullmq-worker
+
+resources:
+  - secret-placeholder.yaml
+  - egress-network-policy.yaml
+
+commonLabels:
+  app.kubernetes.io/name: worker-search-indexer
+  app.kubernetes.io/instance: worker-search-indexer
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-search-indexer
+
+  - target:
+      kind: ConfigMap
+      name: bullmq-worker-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-search-indexer-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3000"
+          SERVICE_VERSION: dev
+          # TS-504-followup-2a-2 — this worker now boots the OTel SDK + Sentry
+          # (`src/observability/bootstrap.ts`, first import in main.ts). Both OTel
+          # flags default true in the Zod schema; stated here so the enabled
+          # posture is visible in the manifest rather than implied. SENTRY_DSN
+          # EMPTY = off, and the worker logs that it is off rather than staying quiet.
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          SENTRY_DSN: ""
+          OUTBOX_CONSUMER_GROUP: worker-search-indexer
+          OUTBOX_STREAM_PREFIX: events
+          OUTBOX_MAX_ATTEMPTS: "10"
+          OUTBOX_POLL_BLOCK_MS: "5000"
+          OUTBOX_RECLAIM_IDLE_MS: "60000"
+          OUTBOX_POLL_INTERVAL_MS: "1000"
+          PROVIDER_SERVICE_BASE_URL: http://service-provider.platform-services.svc.cluster.local:3014
+          PROVIDER_DISCOVERY_INTERNAL_HEADER_NAME: x-provider-discovery-internal-api-key
+          PROVIDER_REQUEST_TIMEOUT_MS: "5000"
+          SEARCH_SERVICE_BASE_URL: http://service-search.platform-services.svc.cluster.local:3020
+          SEARCH_INDEX_HEADER_NAME: x-internal-api-key
+          SEARCH_REQUEST_TIMEOUT_MS: "5000"
+
+  - target:
+      kind: Deployment
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-search-indexer
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: worker-search-indexer
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/worker-search-indexer:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: worker-search-indexer-config
+          - secretRef:
+              name: worker-search-indexer-secrets
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: OUTBOX_CONSUMER_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+
+  - target:
+      kind: NetworkPolicy
+      name: bullmq-worker-ingress-deny
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-search-indexer-ingress-deny
+
+  - target:
+      kind: PodDisruptionBudget
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-search-indexer

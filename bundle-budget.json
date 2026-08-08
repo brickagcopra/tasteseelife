@@ -1,0 +1,16 @@
+{
+  "$schema": "./scripts/bundle-budget.schema.json",
+  "$comment": "Per-app bundle-size budgets (gzipped JS bytes). Enforced by `pnpm bundle:check` and the `bundle-size` CI gate (TS-009b). Bumping a budget should be a deliberate review decision, not a side-effect of an unrelated change.",
+  "apps": {
+    "@taste-and-see/web-marketing": {
+      "path": "apps/web-marketing",
+      "framework": "next-app-router",
+      "routes": {
+        "/": {
+          "maxGzippedJsBytes": 160000,
+          "comment": "Marketing home is RSC-heavy + a few client islands. Aim under 160 KB gzipped first-load JS on the / route. Tighten as we ship more code-splitting (TS-120-followups)."
+        }
+      }
+    }
+  }
+}

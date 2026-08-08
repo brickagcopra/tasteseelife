@@ -1,0 +1,31 @@
+# Taste & See — senior-care + culinary synonym dictionary (TS-216)
+# Solr / Elasticsearch synonym format: comma-separated equivalent terms, one group per line.
+#
+# GENERATED ARTIFACT — do not hand-edit. Source of truth:
+#   apps/service-search/src/common/synonyms/senior-care-dictionary.ts
+# Regenerate: write serializeSynonymGroupsToSolr(SENIOR_CARE_SYNONYM_GROUPS) here.
+#
+# Phase 1 (TS-216): consumed in-memory by service-search query-time expansion.
+# Live ES synonym token filter application (provider + content indices) is TS-216-followup-1.
+
+dementia, memory care, alzheimers, cognitive decline, cognitive impairment
+companion, companionship, companion dining, social visit
+caregiver, caregiving, care companion
+kosher, kashrut, religious dietary
+halal, religious dietary
+gluten free, celiac, gluten intolerant
+vegetarian, plant based
+vegan
+diabetic, diabetes, diabetic friendly, low sugar
+low sodium, low salt, heart healthy
+pureed, soft food, texture modified, dysphagia
+lactose free, dairy free
+nut free, allergy friendly
+italian, tuscan, sicilian
+chinese, cantonese, szechuan, sichuan
+jewish, ashkenazi, jewish cuisine
+southern, soul food
+mediterranean, greek
+mexican, tex mex
+indian, south asian
+comfort food, home cooking, home cooked

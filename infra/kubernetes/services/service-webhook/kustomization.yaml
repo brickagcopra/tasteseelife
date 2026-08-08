@@ -1,0 +1,155 @@
+# Per-service base for service-webhook (TS-151-followup-1 rollout,
+# Batch 2 — billing/payments path). Mirrors the canonical
+# service-identity base: consumes the reusable nestjs-service component +
+# overrides every placeholder for the webhook receiver's specifics (port
+# 3013, env-var contract from apps/service-webhook/src/config/env.ts,
+# Secret refs for the secret-class envs).
+#
+# service-webhook is the signature-verified inbound receiver for Stripe +
+# Checkr (CLAUDE.md §3.5 / §17.8). It owns no JWT verification and no
+# Redis — it persists every verified event under its own Postgres schema
+# and (optionally) dispatches to service-identity / service-provider. It
+# is reached server-side by the api-gateway, so the component-default
+# ingress (admit platform-services) is exactly right; no own Ingress.
+#
+# The two webhook signing secrets are REQUIRED from the first request —
+# the service refuses to boot without them (a missing signing secret
+# means no security boundary at all). The OPTIONAL KYC / background-check
+# dispatch URL+key pairs (both-or-neither per the env superRefine) are
+# omitted: when absent the dispatcher is a no-op and the verified events
+# wait for the TS-142 outbox relay — no silent ack-then-drop.
+#
+# Env overlays in infra/kubernetes/overlays/<env>/ patch image tag,
+# replica count, and a handful of ConfigMap values per env.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-services
+
+components:
+  - ../../components/nestjs-service
+
+resources:
+  - secret-placeholder.yaml
+  # TS-151-followup-12 — ArgoCD PreSync hook (wave -10) that applies this
+  # service's Prisma migrations before anything else in the sync. Listed ahead
+  # of any seed Job below because it must also run ahead of it at apply time.
+  - migrate-job.yaml
+
+commonLabels:
+  app.kubernetes.io/name: service-webhook
+  app.kubernetes.io/instance: service-webhook
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-webhook
+
+  - target:
+      kind: ConfigMap
+      name: nestjs-service-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-webhook-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3013"
+          SERVICE_VERSION: dev
+          STRIPE_API_VERSION: 2024-12-18.acacia
+          STRIPE_WEBHOOK_TOLERANCE_SECONDS: "300"
+          CHECKR_WEBHOOK_TOLERANCE_SECONDS: "300"
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          # TS-504-followup-2a — Sentry error reporting (CLAUDE.md §10).
+          # EMPTY = off, and the service logs that it is off rather than
+          # staying quiet. The real DSN is supplied per env by the overlay or
+          # the operator; it is not committed, and it is not a Secret
+          # placeholder because a REPLACE_WITH_ value is not a valid URL and
+          # would fail Zod boot on every workload that does not use Sentry.
+          SENTRY_DSN: ""
+
+  - target:
+      kind: Service
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-webhook
+      - op: replace
+        path: /spec/ports/0/port
+        value: 3013
+
+  - target:
+      kind: Deployment
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-webhook
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: service-webhook
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/service-webhook:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/ports/0/containerPort
+        value: 3013
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: service-webhook-config
+          - secretRef:
+              name: service-webhook-secrets
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe/httpGet/port
+        value: 3013
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe/httpGet/port
+        value: 3013
+      - op: replace
+        path: /spec/template/spec/containers/0/livenessProbe/httpGet/port
+        value: 3013
+      - op: replace
+        path: /spec/template/metadata/annotations/prometheus.io~1port
+        value: "3013"
+
+  - target:
+      kind: NetworkPolicy
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-webhook
+      - op: replace
+        path: /spec/ingress/0/ports/0/port
+        value: 3013
+
+  - target:
+      kind: PodDisruptionBudget
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-webhook
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-webhook
+      - op: replace
+        path: /spec/scaleTargetRef/name
+        value: service-webhook

@@ -1,0 +1,620 @@
+# Taste & See — root CI pipeline.
+#
+# Gates every pull request against `main` (and every push to `main`) on:
+#   - Prettier formatting
+#   - ESLint (root + workspace)
+#   - TypeScript type-check
+#   - Contract drift (regenerates `packages/contracts/generated/openapi.json`
+#     from the Zod source-of-truth and fails if the committed artifact drifts)
+#   - Unit tests (turbo)
+#   - Integration tests (Testcontainers Postgres + Redis)
+#   - Bundle size budget
+#   - Trivy filesystem scan (HIGH/CRITICAL = fail)
+#   - Semgrep (p/ci ruleset = fail on findings)
+#
+# A final `summary` job upserts a single sticky comment on the PR
+# summarising each gate's result. See CLAUDE.md §11 for policy and
+# PDD.md §20.4 for the wider deploy story this slots into.
+#
+# All third-party `uses:` lines below are SHA-pinned (TS-009a) — the
+# trailing `# vX.Y.Z` comment carries the human-readable version. Bumping
+# requires updating both the SHA and the comment in lockstep.
+#
+# Companion workflows (separate files so unrelated triggers don't re-run
+# every gate):
+#   - .github/workflows/migration-review-label.yml — Schema-migration review
+#     label gate (TS-009d).
+#   - .github/workflows/build-push-image.yml — Reusable image build / push /
+#     sign / scan + GitOps overlay bump (TS-009g).
+#   - .github/workflows/service-identity-build.yml — Canonical per-service
+#     trigger for the reusable workflow above.
+#   - .github/workflows/kubernetes-validate.yml — Renders + schema-validates
+#     (kubeconform) and security-lints (kube-linter) the infra/kubernetes
+#     tree on changes under infra/kubernetes/** (TS-151-followup-9).
+#
+# Deferred (tracked in Pending_tasks.md as TS-009c):
+#   - Lighthouse for frontend changes (needs preview deploys)
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same PR/branch so reviewers don't wait on
+# stale pipelines.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Default to read-only. Jobs that need to write (SARIF upload, PR comment)
+# expand permissions in their own block.
+permissions:
+  contents: read
+
+env:
+  # Single source of truth for runtime versions — must stay in lockstep with
+  # `.nvmrc` and `package.json#engines`.
+  NODE_VERSION: "22.20.0"
+  PNPM_VERSION: "9.12.3"
+
+jobs:
+  format-check:
+    name: Format (prettier)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: pnpm/action-setup@a15d269cd4658e1107c09f1fabf4cbd7bd1f308a # v4.4.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Prettier check
+        run: pnpm format:check
+
+  lint:
+    name: Lint (eslint)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: pnpm/action-setup@a15d269cd4658e1107c09f1fabf4cbd7bd1f308a # v4.4.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Restore turbo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .turbo
+          key: turbo-lint-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            turbo-lint-${{ runner.os }}-
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        run: pnpm lint
+
+  type-check:
+    name: Type-check (tsc)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: pnpm/action-setup@a15d269cd4658e1107c09f1fabf4cbd7bd1f308a # v4.4.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Restore turbo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .turbo
+          key: turbo-typecheck-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            turbo-typecheck-${{ runner.os }}-
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Type-check
+        run: pnpm type-check
+
+  contract-check:
+    # TS-009f — Contract drift gate. The `packages/contracts` package owns
+    # the canonical Zod source-of-truth for every HTTP DTO + domain event
+    # the platform publishes. A small CLI (`pnpm -F @taste-and-see/contracts
+    # check`) regenerates the OpenAPI artifact from those Zod schemas and
+    # compares it against the committed `packages/contracts/generated/
+    # openapi.json`. Drift = an engineer touched a Zod schema (or an
+    # OpenAPI registration call in `src/openapi/generate.ts`) without
+    # regenerating + committing the artifact, which would let downstream
+    # consumers ship against a stale shape. Failing fast on drift makes
+    # contract changes a PR diff signal rather than a runtime surprise.
+    #
+    # The turbo `check` task `dependsOn: ["build"]` (see turbo.json) so a
+    # fresh `dist/` is produced before the CLI runs — no separate build
+    # step needed here.
+    name: Contract drift (packages/contracts)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: pnpm/action-setup@a15d269cd4658e1107c09f1fabf4cbd7bd1f308a # v4.4.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Restore turbo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .turbo
+          key: turbo-check-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            turbo-check-${{ runner.os }}-
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Contract drift check
+        # Scope turbo to `@taste-and-see/contracts` explicitly. Turbo task
+        # definitions in turbo.json apply to every workspace package by
+        # default, so a bare `pnpm check` would also fan out a build to
+        # every web-*/service-* package (which the type-check + bundle-size
+        # gates already cover under saner conditions). Filtering here keeps
+        # the gate cheap (~30s) and avoids needing CI to know Next.js
+        # build-time env vars that don't matter for contract drift.
+        #
+        # Turbo's `check` task `dependsOn: ["build"]` (turbo.json) so a
+        # fresh `dist/openapi/cli.js` is produced before the CLI runs —
+        # no separate build step needed.
+        #
+        # Exit codes from the CLI (see packages/contracts/src/openapi/cli.ts):
+        #   0  — committed artifact matches the regenerated document
+        #   1  — drift detected; engineer must run
+        #         `pnpm -F @taste-and-see/contracts generate:openapi`
+        #         and commit the result
+        #   2  — committed artifact is missing entirely (treated as drift)
+        run: pnpm exec turbo run check --filter=@taste-and-see/contracts
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: pnpm/action-setup@a15d269cd4658e1107c09f1fabf4cbd7bd1f308a # v4.4.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Restore turbo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .turbo
+          key: turbo-test-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            turbo-test-${{ runner.os }}-
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run tests
+        run: pnpm test
+
+  boot-graph:
+    # TS-506-followup-2 — the job name IS the property being asserted.
+    #
+    # These 30 suites compile each Nest app's REAL AppModule and run the
+    # injector over it. TS-506 added them because 8 of 20 services had
+    # shipped unable to start: every unit suite builds a narrow, hand-wired
+    # `Test.createTestingModule` graph, so a provider no module declared
+    # stayed invisible until a process actually booted.
+    #
+    # They also run inside the `test` job (each app's include glob still
+    # covers them, so `pnpm test` locally still finds a broken graph). This
+    # job exists because burying that result among hundreds of unit
+    # assertions makes it read as "service-X unit tests failed", and
+    # because a failure to BOOT deserves to gate on its own.
+    #
+    # `--concurrency=4` is deliberate. At the runner's default these suites
+    # contend badly — three consecutive local full-gate runs each failed on
+    # a DIFFERENT service, every one of which passed standalone, so the
+    # failure named a service that was fine. A lane that misattributes its
+    # own failures is worse than a slow one.
+    name: Every app's dependency graph resolves
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: pnpm/action-setup@a15d269cd4658e1107c09f1fabf4cbd7bd1f308a # v4.4.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Restore turbo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .turbo
+          key: turbo-boot-graph-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            turbo-boot-graph-${{ runner.os }}-
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Compile every AppModule
+        # No Prisma-generate step, matching the `test` job above — which
+        # already runs these same suites green without one. If that ever
+        # changes it changes for both jobs at once, and keeping them
+        # identical is what makes that true.
+        run: pnpm exec turbo run test:boot-graph --concurrency=4
+
+  integration-test:
+    # TS-009e — Integration tests against ephemeral Postgres + Redis via
+    # `testcontainers`. Each spec owns its container lifecycle (see
+    # `apps/service-identity/vitest.integration.config.ts` rationale) so
+    # this job is a thin wrapper that installs deps, generates the Prisma
+    # client, and runs the dedicated `test:integration` turbo task.
+    #
+    # `ubuntu-24.04` ships the Docker engine preinstalled (the
+    # `actions/runner-images` baseline includes it for every Ubuntu
+    # variant), so `testcontainers` finds a socket at the default path
+    # without any docker-setup action. We do NOT enable rootless / DinD
+    # — testcontainers uses the runner's root-owned engine directly.
+    name: Integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: pnpm/action-setup@a15d269cd4658e1107c09f1fabf4cbd7bd1f308a # v4.4.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Generate Prisma clients
+        # Services with integration tests need their Prisma client
+        # generated before the test boots — `prisma migrate deploy`
+        # against the ephemeral DB needs the client to apply the
+        # schema. Add each new prisma-touching service to this filter
+        # when it lands a `test:integration` script — a workspace-wide
+        # loop is overkill while the count is small.
+        run: |
+          pnpm --filter "@taste-and-see/service-identity" prisma:generate
+          pnpm --filter "@taste-and-see/service-subscription" prisma:generate
+          pnpm --filter "@taste-and-see/service-provider" prisma:generate
+          pnpm --filter "@taste-and-see/service-household" prisma:generate
+          pnpm --filter "@taste-and-see/service-booking" prisma:generate
+          pnpm --filter "@taste-and-see/service-ads" prisma:generate
+      - name: Verify Docker engine is reachable
+        # Defensive: surface a clear error before testcontainers tries
+        # and produces a confusing "could not connect to Docker daemon"
+        # stack trace four minutes into the run.
+        run: docker info --format '{{.ServerVersion}}'
+      - name: Restore Testcontainers image cache
+        # TS-009e-followup-4 — Docker image pre-pull cache. Without this
+        # step every run pays the cold pull of `postgres:16-alpine` (~80 MB)
+        # and `redis:7-alpine` (~20 MB) from Docker Hub before any test
+        # boots, adding ~5–10 s of wall-clock. The cache key is a hash of
+        # `infra/docker/testcontainers-images.txt`, so changing the image
+        # set (or its pinned tags) invalidates the cache and the next run
+        # repopulates it.
+        id: tc-image-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/testcontainers-images
+          key: tc-images-${{ runner.os }}-${{ hashFiles('infra/docker/testcontainers-images.txt') }}
+      - name: Hydrate Docker image store
+        # Single loop covers cache-hit, cache-miss, and partial-hit:
+        # for each image in the pin list, load its tarball if present,
+        # otherwise pull from Docker Hub and save the tarball so the
+        # next run hits cache. `actions/cache` writes back the directory
+        # on cache-miss automatically at job end.
+        run: |
+          set -euo pipefail
+          cache_dir="$HOME/.cache/testcontainers-images"
+          mkdir -p "$cache_dir"
+          while IFS= read -r raw; do
+            img="${raw%%#*}"
+            img="$(echo "$img" | xargs)"
+            [ -z "$img" ] && continue
+            safe="$(echo "$img" | tr '/:' '__')"
+            tar_path="${cache_dir}/${safe}.tar"
+            if [ -f "$tar_path" ]; then
+              echo "Loading $img from cache ($tar_path)"
+              docker load -i "$tar_path"
+            else
+              echo "Pulling $img and saving to $tar_path"
+              docker pull "$img"
+              docker save "$img" -o "$tar_path"
+            fi
+          done < infra/docker/testcontainers-images.txt
+      - name: Run integration tests
+        # turbo schedules the per-app `test:integration` task with
+        # cache: false (turbo.json) — every run hits a fresh
+        # container, never a cached "PASS" record.
+        run: pnpm test:integration
+
+  e2e-test:
+    # TS-505 — the end-to-end suite. Starts a real fleet of services from their
+    # compiled `dist/` and drives the api-gateway over HTTP.
+    #
+    # A `services:` block rather than testcontainers, unlike `integration-test`
+    # above: those specs each own an ephemeral container because they are
+    # per-service and isolation is the point. This suite is the opposite — one
+    # fleet, one shared database, one narrative — so a job-scoped Postgres and
+    # Redis are both simpler and closer to what the fleet sees in a cluster.
+    #
+    # No `playwright install`. The suite drives HTTP through Playwright's
+    # `request` machinery and launches no browser, so the ~400 MB of browser
+    # binaries are not downloaded. If a browser-level slice ever lands it gets
+    # its own job and its own install step.
+    name: E2E (money path)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tastesee
+          POSTGRES_PASSWORD: tastesee_dev_only
+          POSTGRES_DB: tastesee
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tastesee -d tastesee"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: pnpm/action-setup@a15d269cd4658e1107c09f1fabf4cbd7bd1f308a # v4.4.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Generate Prisma clients
+        # Every schema-owning member of `apps/e2e/src/fleet.ts` needs its client
+        # generated before `dist/main.js` can open a connection. Keep this list
+        # in step with `FLEET` — a service added there and missed here fails at
+        # fleet start-up with a Prisma "did you forget to run generate" error.
+        run: pnpm --filter "@taste-and-see/service-identity" prisma:generate
+      - name: Run E2E suite
+        # `test:e2e` carries `dependsOn: ["^build"]` (TS-503) so the fleet's
+        # `dist/` is built first, and `cache: false` so a green run is never
+        # replayed from cache.
+        run: pnpm test:e2e
+      - name: Upload fleet logs
+        # The per-service log files are usually the explanation for a failure —
+        # the gateway's 502 says less than the downstream's stderr.
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-fleet-logs
+          path: |
+            apps/e2e/test-results/
+            apps/e2e/playwright-report/
+          retention-days: 7
+
+  bundle-size:
+    name: Bundle size
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: pnpm/action-setup@a15d269cd4658e1107c09f1fabf4cbd7bd1f308a # v4.4.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Restore Next.js build cache
+        # `.next/cache/` survives across builds when the inputs are stable;
+        # restoring it cuts the marketing-app build from ~45s to ~10s on warm
+        # cache hits, which keeps the bundle-size gate cheap enough to run on
+        # every PR.
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            apps/web-marketing/.next/cache
+          key: nextjs-marketing-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.sha }}
+          restore-keys: |
+            nextjs-marketing-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
+            nextjs-marketing-${{ runner.os }}-
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build budgeted apps
+        # Only build the apps named in bundle-budget.json. Adding a new app
+        # to the budget file should also extend this filter list.
+        run: pnpm -F @taste-and-see/web-marketing build
+      - name: Check bundle budgets
+        run: pnpm bundle:check
+
+  trivy:
+    name: Trivy (filesystem)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2 # v0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+          # Fail the job when HIGH/CRITICAL findings are discovered. Lower
+          # severities are reported but don't block.
+          exit-code: "1"
+          ignore-unfixed: true
+          # Skip noisy directories — node_modules is reproducible from the
+          # lockfile and gets covered by `pnpm audit` follow-ups.
+          skip-dirs: "node_modules,.next,.turbo,dist,build,coverage"
+      - name: Upload Trivy SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@1521896cd211af95be3f02edf6f436e10b819c27 # v3.35.4
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+
+  semgrep:
+    name: Semgrep (p/ci)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # Full history lets `semgrep ci` produce diff-aware results on
+          # PRs (it compares HEAD against the merge-base).
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Install Semgrep
+        run: python -m pip install --user --no-cache-dir semgrep==1.94.0
+      - name: Semgrep scan
+        # `--config p/ci` is the curated CI ruleset. SARIF output feeds the
+        # Security tab and a non-zero exit is what fails the job on findings.
+        run: |
+          semgrep ci \
+            --config p/ci \
+            --sarif --output semgrep.sarif \
+            --metrics off
+      - name: Upload Semgrep SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@1521896cd211af95be3f02edf6f436e10b819c27 # v3.35.4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  summary:
+    name: PR summary
+    if: always() && github.event_name == 'pull_request'
+    needs:
+      [
+        format-check,
+        lint,
+        type-check,
+        contract-check,
+        test,
+        integration-test,
+        e2e-test,
+        bundle-size,
+        trivy,
+        semgrep,
+      ]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Upsert sticky PR comment
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          R_FORMAT: ${{ needs.format-check.result }}
+          R_LINT: ${{ needs.lint.result }}
+          R_TYPECHECK: ${{ needs.type-check.result }}
+          R_CONTRACT: ${{ needs['contract-check'].result }}
+          R_TEST: ${{ needs.test.result }}
+          R_INTEGRATION: ${{ needs['integration-test'].result }}
+          R_E2E: ${{ needs['e2e-test'].result }}
+          R_BUNDLE: ${{ needs['bundle-size'].result }}
+          R_TRIVY: ${{ needs.trivy.result }}
+          R_SEMGREP: ${{ needs.semgrep.result }}
+        with:
+          script: |
+            const marker = '<!-- ts-ci-summary -->';
+            const icon = (r) => {
+              if (r === 'success') return 'PASS';
+              if (r === 'skipped') return 'SKIP';
+              if (r === 'cancelled') return 'CANCELLED';
+              return 'FAIL';
+            };
+            const rows = [
+              ['Format (prettier)', process.env.R_FORMAT],
+              ['Lint (eslint)', process.env.R_LINT],
+              ['Type-check (tsc)', process.env.R_TYPECHECK],
+              ['Contract drift', process.env.R_CONTRACT],
+              ['Unit tests', process.env.R_TEST],
+              ['Integration tests', process.env.R_INTEGRATION],
+              ['E2E (money path)', process.env.R_E2E],
+              ['Bundle size', process.env.R_BUNDLE],
+              ['Trivy (filesystem)', process.env.R_TRIVY],
+              ['Semgrep (p/ci)', process.env.R_SEMGREP],
+            ];
+            const anyFail = rows.some(([, r]) => r && r !== 'success' && r !== 'skipped');
+            const header = anyFail
+              ? '### CI Summary — failures detected'
+              : '### CI Summary — all gates passed';
+            const table = [
+              '| Gate | Status |',
+              '| --- | --- |',
+              ...rows.map(([n, r]) => `| ${n} | ${icon(r)} (\`${r ?? 'unknown'}\`) |`),
+            ].join('\n');
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              marker,
+              '',
+              header,
+              '',
+              table,
+              '',
+              `_Run [#${context.runNumber}](${runUrl}) · commit \`${context.sha.slice(0, 7)}\`_`,
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find((c) => c.body && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

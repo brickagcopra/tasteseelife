@@ -1,0 +1,57 @@
+# kube-linter configuration for the Taste & See Kubernetes tree (TS-151-followup-9).
+#
+# Scope
+# -----
+# The CI job (.github/workflows/kubernetes-validate.yml, `kube-linter` job)
+# renders every per-service base under `infra/kubernetes/services/*/` with
+# `kubectl kustomize` (no Helm required — each base consumes a reusable
+# component and carries a concrete `:replace-me` image tag the overlays rewrite
+# to a digest) and runs `kube-linter lint` over the result. That is precisely
+# the surface we author and own.
+#
+# The version-pinned upstream charts (`base/ingress-nginx`, `base/cert-manager`)
+# are intentionally NOT kube-lint-gated. They are schema-validated by the
+# sibling `kubeconform` job, but linting their rendered output would couple our
+# gate to third-party chart hygiene we do not control and cannot fix without
+# forking the chart. kubeconform validates *correctness*; kube-linter here
+# validates *our* security posture.
+#
+# Why an explicit include-list instead of kube-linter's defaults
+# --------------------------------------------------------------
+# `doNotAutoAddDefaults: true` + `addAllBuiltIn: false` means ONLY the checks
+# named below run. This makes the gate deterministic across kube-linter
+# releases (its default set has changed between versions) and self-documenting:
+# every check here is one the three reusable components
+# (`components/{nestjs-service,web-app,bullmq-worker}`) are built to satisfy, so
+# a red result means a real regression in a workload's security posture rather
+# than a tooling-default drift. The PSS `restricted` bar (TS-151-followup-3)
+# this list mirrors: non-root, no privilege escalation, read-only root fs,
+# all capabilities dropped, CPU/memory bounded, concrete image tag, no host
+# namespaces, probes present.
+checks:
+  addAllBuiltIn: false
+  doNotAutoAddDefaults: true
+  include:
+    # --- Privilege / isolation ---
+    - run-as-non-root
+    - privileged-container
+    - privilege-escalation-container
+    - drop-net-raw-capability
+    - host-network
+    - host-pid
+    - host-ipc
+    - sensitive-host-mounts
+    - writable-host-mount
+    - ssh-port
+    - privileged-ports
+    # --- Immutability ---
+    - no-read-only-root-fs
+    - latest-tag
+    # --- Resource bounds ---
+    - unset-cpu-requirements
+    - unset-memory-requirements
+    # --- Reliability / correctness ---
+    - no-readiness-probe
+    - no-liveness-probe
+    - mismatching-selector
+    - non-existent-service-account

@@ -1,0 +1,67 @@
+# NetworkPolicy carve-out for Prometheus scraping (TS-151-followup-6).
+#
+# The workload namespaces (platform-services / platform-workers) run a
+# default-deny ingress baseline (base/network-policies/default-deny.yaml).
+# The nestjs-service component only admits ingress from inside
+# platform-services; the bullmq-worker component admits NO ingress at
+# all. Prometheus lives in the `observability` namespace, so without
+# these additive rules every annotation-based scrape of an app's
+# /metrics endpoint (port 3000) is dropped.
+#
+# NetworkPolicy semantics are additive across selected policies, so
+# these rules OPEN the metrics channel without touching the component
+# policies. They are scoped to port 3000 only — the scrape port the
+# nestjs-service + bullmq-worker components expose — so this does not
+# widen the app's HTTP surface to the observability namespace.
+#
+# platform-frontends is intentionally omitted: the Next.js web apps do
+# not export a Prometheus /metrics endpoint. Node-, pod-, and
+# kube-state-level metrics for every namespace are scraped by the
+# kube-prometheus-stack's host-network exporters, which are not subject
+# to pod NetworkPolicies.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-metrics-from-observability
+  namespace: platform-services
+  annotations:
+    taste-and-see/policy: >-
+      Permit Prometheus pods in the observability namespace to scrape
+      the workload /metrics endpoint on port 3000. Additive to the
+      default-deny baseline; does not open any other port.
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - protocol: TCP
+          port: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-metrics-from-observability
+  namespace: platform-workers
+  annotations:
+    taste-and-see/policy: >-
+      Permit Prometheus pods in the observability namespace to scrape
+      the worker /metrics endpoint on port 3000. The bullmq-worker
+      component otherwise admits no ingress at all.
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - protocol: TCP
+          port: 3000

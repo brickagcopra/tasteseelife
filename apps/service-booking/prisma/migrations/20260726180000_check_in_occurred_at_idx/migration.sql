@@ -1,0 +1,35 @@
+-- TS-308a — impossible-travel detection on provider check-ins.
+--
+-- The detection sweep scans every check-in in a recent lookback window
+-- ("what has been recorded since the last tick"), joins to `bookings`
+-- for the provider, and walks each provider's check-ins in time order.
+-- `booking_check_ins` had two indexes and neither serves that scan:
+--
+--   booking_check_ins_booking_kind_unique_idx  (booking_id, kind)
+--   booking_check_ins_booking_occurred_idx     (booking_id, occurred_at)
+--
+-- Both are booking-leading, so a predicate on `occurred_at` alone falls
+-- back to a sequential scan of the whole table. That is tolerable today
+-- and stops being tolerable at exactly the point the platform has enough
+-- visits for the detector to matter — and it would degrade a sweep that
+-- runs on a timer, where a slow query is a queue backing up rather than
+-- one slow request.
+--
+--   EXPLAIN (before): Seq Scan on booking_check_ins
+--                       Filter: (occurred_at >= $1)
+--   EXPLAIN (after) : Index Scan using booking_check_ins_occurred_at_idx
+--                       Index Cond: (occurred_at >= $1)
+--
+-- Expand-only and non-destructive: adds one index, touches no row, and
+-- changes no existing read path. Reversal is `DROP INDEX
+-- booking.booking_check_ins_occurred_at_idx;` with no data implication.
+--
+-- NOT created CONCURRENTLY: Prisma migrations run inside a transaction
+-- and `CREATE INDEX CONCURRENTLY` cannot. The table is small enough at
+-- Phase 1 that the brief ACCESS SHARE-blocking build is not a concern;
+-- if this table grows past the point where that is true, the index
+-- should be created out-of-band before the migration is applied and the
+-- IF NOT EXISTS below turns the migration into a no-op.
+
+CREATE INDEX IF NOT EXISTS "booking_check_ins_occurred_at_idx"
+  ON "booking"."booking_check_ins" ("occurred_at");

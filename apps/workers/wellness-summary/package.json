@@ -1,0 +1,48 @@
+{
+  "name": "@taste-and-see/worker-wellness-summary",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Wellness-summary worker (TS-235). A scheduled process that, monthly, walks every active household, compiles the prior 30 days' wellness observations per senior, and dispatches a rendered MJML+Handlebars summary email to each family member + senior via service-notification. Joins three shared-secret internal reads (service-household households batch + service-identity recipient contacts + service-booking observation summary) and the service-notification dispatch endpoint. PRD §6.9; PDD §12.2.",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "start:dev": "tsc -p tsconfig.build.json --watch",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:boot-graph": "vitest run test/app-module-graph.test.ts",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.0.0",
+    "@nestjs/core": "11.0.0",
+    "@nestjs/platform-express": "11.0.0",
+    "@taste-and-see/contracts": "workspace:*",
+    "@taste-and-see/logger": "workspace:*",
+    "@taste-and-see/nest-common": "workspace:*",
+    "@taste-and-see/nest-observability": "workspace:*",
+    "@taste-and-see/sentry": "workspace:*",
+    "@taste-and-see/tracing": "workspace:*",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.1",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/testing": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/express": "5.0.0",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "rimraf": "6.0.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

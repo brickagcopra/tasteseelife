@@ -1,0 +1,19 @@
+# AppProjects aggregate.
+#
+# `kubectl apply -k infra/argocd/projects/` after the install overlay is healthy.
+# The three AppProjects must exist BEFORE the root Applications reconcile —
+# Applications reference their AppProject by name and fail to sync if the
+# referenced AppProject does not exist.
+#
+# AppProjects are cluster-managed CRDs (argoproj.io/v1alpha1) so no namespace
+# field is set on the kustomization — each manifest carries its own metadata.namespace=argocd.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - platform-dev.yaml
+  - platform-staging.yaml
+  - platform-prod.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: taste-and-see

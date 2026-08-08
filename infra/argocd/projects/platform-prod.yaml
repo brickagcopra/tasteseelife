@@ -1,0 +1,99 @@
+# AppProject: platform-prod.
+#
+# Tightest of the three. Per PDD §11:
+#   "PR merge → image build → manifest update → ArgoCD reconciles to staging
+#    → soak window → promote to prod"
+#
+# Promotion to prod is an explicit operator action — never automatic.
+# The prod Application (applications/prod/platform.yaml) therefore ships with
+# `syncPolicy.automated` UNSET (manual sync), and this AppProject reinforces
+# the gate by:
+#   - signatureKeys (TS-152-followup-6 hardens this further with cosign-attested
+#     commits — until then the gate is operator-discretion via manualSync)
+#   - a "deny synchronisation outside business hours" syncWindow as the
+#     default-deny floor (overridable by admin via the UI for emergencies)
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: platform-prod
+  namespace: argocd
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    tastesee.io/env: prod
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: >-
+    Production environment — manual promotion only. Operator runs
+    `argocd app sync platform-prod` after a staging soak. Self-heal disabled
+    so an out-of-band hotfix can stand until the next deliberate sync.
+
+  sourceRepos:
+    - https://github.com/brickagcopra/tasteseelife.git
+    - https://github.com/brickagcopra/tasteseelife
+
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: platform-system
+    - server: https://kubernetes.default.svc
+      namespace: platform-data
+    - server: https://kubernetes.default.svc
+      namespace: platform-services
+    - server: https://kubernetes.default.svc
+      namespace: platform-workers
+    - server: https://kubernetes.default.svc
+      namespace: platform-frontends
+    - server: https://kubernetes.default.svc
+      namespace: observability
+    - server: https://kubernetes.default.svc
+      namespace: ingress
+
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: scheduling.k8s.io
+      kind: PriorityClass
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+    - group: cert-manager.io
+      kind: ClusterIssuer
+    - group: networking.k8s.io
+      kind: IngressClass
+
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  roles: []
+
+  # Default-deny outside business-hours window. Admin can override per-event.
+  # The window applies to BOTH automated sync (none configured at the
+  # Application level) and manual sync (the operator-driven path). Treats
+  # weekend mornings as the "easy rollback window".
+  syncWindows:
+    - kind: allow
+      schedule: "0 9 * * 1-5" # Mon-Fri 09:00 local
+      duration: 8h
+      applications:
+        - "*"
+      manualSync: true
+    - kind: allow
+      schedule: "0 9 * * 6,0" # Sat-Sun 09:00 local
+      duration: 4h
+      applications:
+        - "*"
+      manualSync: true
+      # Outside these windows, sync is denied by the default-deny floor;
+      # admin can override via the argocd CLI in an incident.
+
+  orphanedResources:
+    warn: true

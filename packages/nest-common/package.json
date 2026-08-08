@@ -1,0 +1,49 @@
+{
+  "name": "@taste-and-see/nest-common",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Shared Nest plumbing for the Taste & See platform. Exports ZodValidationPipe (RFC 7807-shaped Bad Request body on schema parse failure, .strict() rejection of unknown fields per CLAUDE.md §3.3) and RfcProblemFilter (global exception filter converting HttpException + unhandled exceptions into RFC 7807 Problem Details JSON with traceId per CLAUDE.md §5.1). Lifts the verbatim copies that lived in every service's src/common/{pipes,filters}/. TS-080-followup-2.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@taste-and-see/sentry": "workspace:*",
+    "zod": "3.23.8"
+  },
+  "peerDependencies": {
+    "@nestjs/common": "^11.0.0",
+    "reflect-metadata": "^0.2.0"
+  },
+  "devDependencies": {
+    "@nestjs/common": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/express": "5.0.0",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "reflect-metadata": "0.2.2",
+    "rimraf": "6.0.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

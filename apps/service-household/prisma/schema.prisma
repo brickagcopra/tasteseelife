@@ -1,0 +1,893 @@
+// Household bounded context — see PDD §7.2 (service inventory) and §8.2
+// (`household` schema column inventory).
+//
+// Scope so far:
+//   - TS-030 added the three base tables — `households`,
+//     `household_members`, `seniors` — with their enums and indexes.
+//   - TS-031 adds the senior intake surface as an *additive* expand-only
+//     migration: a new `senior_mobility_level` enum + a `senior_dementia_status`
+//     enum + nine columns on `seniors` (three operational TEXT[] tag arrays,
+//     two operational enums for mobility / dementia stage, four BYTEA columns
+//     for the AES-256-GCM encrypted payload that holds DOB + freeform
+//     dietary/allergy/mobility/medical notes, plus `intake_completed_at`).
+//     The split is documented in detail on `Senior` and PDD §21.3 — what's
+//     operational ships as plain columns (chef-match queries read them);
+//     what's sensitive ships as a single encrypted blob (DOB / medical /
+//     dementia context). See CLAUDE.md §17.1 — no unencrypted full DOBs.
+//   - TS-032 adds emergency contacts (`emergency_contacts` table) and
+//     household-access instructions (encrypted blob columns on `households`).
+//     Contacts ship as a plain table — operational concierge / visit-prep
+//     reads need name + phone + relationship at speed. Access instructions
+//     ship as a single AES-256-GCM blob with its OWN key (separate from the
+//     intake key) — door codes and alarm codes have a sharper threat model
+//     than medical notes, so the blast radius of either key leak is bounded.
+//   - TS-033 adds the senior memory surface — two tables. `memory_recipes`
+//     is a per-senior catalog of culturally-meaningful dishes (PRD §6.5):
+//     family contributions, cultural-catalog imports, and senior-requested
+//     specific dishes for upcoming visits. `senior_preferences` is a flat
+//     `(senior_id, key, value)` key/value store for the memory profile —
+//     favourite-childhood-food, regional-tradition, comfort-food cues that
+//     give a chef the personal hooks PRD §1 frames as Food + Memory +
+//     Companionship. Both ship as plain columns: the family dashboard,
+//     visit-prep card, and chef portal all read them at speed. Story-level
+//     PII (free-form descriptions, key/value entries) sits in the same
+//     tier as emergency-contact names — defended by encryption-at-rest +
+//     audit + row-level auth, not field-level encryption.
+//
+// Each addition is a forward-compatible expand → migrate → contract
+// migration per CLAUDE.md §4.1.
+//
+// Cross-service references are by id only — never a foreign key into another
+// service schema (CLAUDE.md §2.3, §4.1). Specifically:
+//
+//   - `households.primary_payer_user_id` is a soft FK into `identity.users.id`.
+//   - `household_members.user_id`       is a soft FK into `identity.users.id`.
+//
+// Joins across these boundaries happen via the gateway BFF (TS-140) or via
+// events (TS-142), never via SQL JOIN.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. The feature has been
+  // production-stable since Prisma 5.0 even though it remains under the
+  // `previewFeatures` umbrella in 5.x — see Prisma migration notes.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `household` Postgres schema. Every other service
+  // gets its own schema in the same database (Phase 1) or its own database
+  // entirely (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["household"]
+}
+
+/// Household lifecycle status. Drives whether bookings, subscriptions,
+/// and family-member invites are accepted.
+/// `pending`  = freshly created, primary payer has not yet completed
+///              the senior intake or invited the senior household;
+///              billing has not yet been activated.
+/// `active`   = normal state — bookings allowed, subscription billing
+///              honoured.
+/// `paused`   = primary payer (or ops) has paused the household; no
+///              new bookings, existing recurring bookings honour their
+///              own cancellation policy. Subscription typically also
+///              paused per TS-042.
+/// `archived` = household has been closed (senior moved out / passed /
+///              account self-deactivated). No further activity allowed;
+///              row preserved for audit / accounting historical reads.
+enum HouseholdStatus {
+  pending
+  active
+  paused
+  archived
+
+  @@map("household_status")
+  @@schema("household")
+}
+
+/// Household — the unit of subscription, billing, and family group.
+///
+/// One paying account ("primary payer") plus zero or more additional
+/// family members (observers, senior end-user accounts). Bookings are
+/// scoped to the household; subscriptions are charged at the household
+/// level; family-member visibility into senior data is gated by the
+/// senior's consent (PRD §6.4, CLAUDE.md §12).
+///
+/// `primary_payer_user_id` is a soft FK into `identity.users.id` — see
+/// the schema-level header for the no-cross-service-FK convention.
+/// A user can be the primary payer of at most one household; in
+/// practice the application enforces this via the signup / household-
+/// creation flow (TS-121). A DB-level partial unique index against
+/// `deletedAt IS NULL` arrives if we observe primary-payer drift in
+/// production.
+///
+/// The address columns are *structured* (line1/line2/city/region/postal/
+/// country) rather than a free-form `address` blob so the booking
+/// service (TS-060) can compute distance-to-provider without parsing.
+/// Address-level PII protection: addresses sit one tier below the
+/// strictly-protected fields (DOB, dementia status) that TS-031 wraps
+/// with field-level encryption — they remain plain columns here.
+/// Consent / opt-in for sharing the household address with providers
+/// is handled at the booking layer (PRD §6.4).
+///
+/// `time_zone` is a required IANA zone (e.g. "America/New_York"). The
+/// booking service uses it to interpret recurring-schedule rules and
+/// to render visit times in the senior's local clock; defaulting to
+/// the primary payer's timezone is a TS-121 concern, not a schema
+/// default.
+model Household {
+  id                  String          @id @default(cuid())
+  /// Soft FK into `identity.users.id`. Never declare a Prisma relation
+  /// here — cross-service relations would couple the two services'
+  /// Prisma clients and violate CLAUDE.md §2.3 / §4.1.
+  primaryPayerUserId  String          @map("primary_payer_user_id")
+  addressLine1        String          @map("address_line1")
+  addressLine2        String?         @map("address_line2")
+  addressCity         String          @map("address_city")
+  /// State (US) / province / region. Free-text TEXT rather than enum
+  /// so international expansion (Phase 3 — PDD §11.8) is forward-
+  /// compatible without a schema change.
+  addressRegion       String          @map("address_region")
+  addressPostalCode   String          @map("address_postal_code")
+  /// ISO-3166-1 alpha-2 country code. TEXT(2) at the application layer;
+  /// validation done at the controller boundary, not in the DB, so a
+  /// future ISO update doesn't require a CHECK rewrite.
+  addressCountry      String          @map("address_country")
+  /// IANA timezone identifier. Required — the booking service relies
+  /// on this for visit-time computation.
+  timeZone            String          @map("time_zone")
+  status              HouseholdStatus @default(pending)
+  createdAt           DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime        @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone; populated by ops only. Read-paths must filter
+  /// `deletedAt = null` unless explicitly auditing deleted households.
+  deletedAt           DateTime?       @map("deleted_at") @db.Timestamptz(6)
+
+  // ── TS-032: household access instructions (encrypted payload) ──────
+  /// AES-256-GCM ciphertext of the household-access JSON payload
+  /// (door code, key location, alarm code + disarm instructions,
+  /// parking instructions, doorman info, pet info, general notes).
+  /// Null until the family completes at least one progressive save.
+  /// The four columns are written and cleared atomically — a partially-
+  /// non-null group is a service-layer bug.
+  ///
+  /// Why a SEPARATE key from the senior-intake payload (TS-031)? The
+  /// threat model differs: a leak of the intake key exposes medical-ish
+  /// notes; a leak of the access key exposes the means of physical
+  /// entry. Decoupling the keys bounds blast radius per data class and
+  /// lets ops rotate them on independent cadences. See
+  /// `AccessInstructionsCipherService` for the algorithm rationale.
+  accessInstructionsCiphertext   Bytes?    @map("access_instructions_ciphertext")
+  /// 12-byte GCM IV. Always paired with the ciphertext.
+  accessInstructionsIv           Bytes?    @map("access_instructions_iv")
+  /// 16-byte GCM authentication tag.
+  accessInstructionsAuthTag      Bytes?    @map("access_instructions_auth_tag")
+  /// Pointer into the env-managed keyring (HOUSEHOLD_ACCESS_ENC_KEY_VERSION).
+  /// Decrypt rejects key-version mismatch — fail-closed rotation contract.
+  accessInstructionsKeyVersion   Int?      @map("access_instructions_key_version")
+  /// First time a non-empty access-instructions payload landed. Drives
+  /// the family-dashboard "you haven't entered access instructions yet"
+  /// nudge; reset to null only if ops explicitly clear the row. Once
+  /// set, subsequent updates do NOT advance this timestamp — the
+  /// canonical "last update" is `updated_at` on the row.
+  accessInstructionsUpdatedAt    DateTime? @map("access_instructions_updated_at") @db.Timestamptz(6)
+
+  members             HouseholdMember[]
+  seniors             Senior[]
+  emergencyContacts   EmergencyContact[]
+
+  /// Hot lookup — "find the household this user pays for" runs on
+  /// every authenticated request from a primary payer (TS-121
+  /// dashboard, TS-124 checkout).
+  @@index([primaryPayerUserId], map: "households_primary_payer_user_id_idx")
+  @@index([status], map: "households_status_idx")
+  @@index([deletedAt], map: "households_deleted_at_idx")
+  @@map("households")
+  @@schema("household")
+}
+
+/// Role a household member plays inside the household.
+/// `primary_payer`    = the paying account, full management rights.
+/// `family_observer`  = adult child / sibling / spouse with consent-
+///                      gated visibility into senior wellness; cannot
+///                      change billing or subscription tier.
+/// `senior_user`      = the senior end-user themselves with their own
+///                      (simplified) login (PRD §6.1). Optional — many
+///                      seniors do not log in directly.
+enum HouseholdMemberRole {
+  primary_payer
+  family_observer
+  senior_user
+
+  @@map("household_member_role")
+  @@schema("household")
+}
+
+/// Household membership — links a `users.id` (identity service) to a
+/// `households.id` with a role and an invitation lifecycle.
+///
+/// Lifecycle columns:
+///   - `invited_at`   when the primary payer issued the invite
+///                    (or null if the row was created directly,
+///                    e.g. for the primary payer themselves at signup).
+///   - `accepted_at`  when the invitee actually accepted via the
+///                    invite link. Null for pending invites.
+///   - `removed_at`   tombstone — explicit removal by the primary
+///                    payer or self-removal. Distinct from `deletedAt`
+///                    so the audit history of memberships remains
+///                    queryable.
+///
+/// Uniqueness: a given `user_id` can hold at most one role per
+/// `household_id` per "active" period (i.e. `removed_at IS NULL`).
+/// The constraint is service-layer-enforced (the membership-invite
+/// flow rejects duplicates); a partial unique index is added when
+/// admin tooling lands (TS-126) and bulk operations create the need
+/// to lean on the DB.
+model HouseholdMember {
+  id          String              @id @default(cuid())
+  householdId String              @map("household_id")
+  /// Soft FK into `identity.users.id`. See the schema header.
+  userId      String              @map("user_id")
+  memberRole  HouseholdMemberRole @map("member_role")
+  invitedAt   DateTime?           @map("invited_at") @db.Timestamptz(6)
+  acceptedAt  DateTime?           @map("accepted_at") @db.Timestamptz(6)
+  removedAt   DateTime?           @map("removed_at") @db.Timestamptz(6)
+  createdAt   DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  household   Household           @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  @@index([householdId], map: "household_members_household_id_idx")
+  @@index([userId], map: "household_members_user_id_idx")
+  /// Powers "for this user, list every household I belong to" reads
+  /// that filter out removed memberships in a single index scan.
+  @@index([userId, removedAt], map: "household_members_user_active_idx")
+  @@map("household_members")
+  @@schema("household")
+}
+
+/// Senior lifecycle status. Distinct from the parent household's
+/// status because a household can survive a senior transition (e.g.
+/// one senior passes while a spouse remains served by the same
+/// household record).
+/// `active`   = receiving services
+/// `paused`   = temporarily suspended (hospitalization, travel)
+/// `archived` = no longer served (moved away, deceased, opted out);
+///              row retained for audit / accounting reads.
+enum SeniorStatus {
+  active
+  paused
+  archived
+
+  @@map("senior_status")
+  @@schema("household")
+}
+
+/// Mobility level — coarse operational classification (PDD §6.4 / §6.3
+/// visit-prep context). Drives provider planning (does the senior come
+/// to the table, do we need step-stool reach, etc.). Plain column —
+/// providers and the chef-match query read it directly.
+///
+///   `unknown`       = intake not yet filled in; placeholder
+///   `independent`   = full mobility
+///   `aided_cane`    = uses a cane / minor support
+///   `aided_walker`  = uses a walker
+///   `wheelchair`    = primarily seated
+///   `bedridden`     = limited transfers, bedside care
+enum SeniorMobilityLevel {
+  unknown
+  independent
+  aided_cane
+  aided_walker
+  wheelchair
+  bedridden
+
+  @@map("senior_mobility_level")
+  @@schema("household")
+}
+
+/// Dementia stage — coarse operational classification (PRD §3 Persona B,
+/// PDD §6.3 dementia-sensitive booking type). Drives provider matching
+/// (Tier 2/3 Certified Culinary Companions / Elite Concierge Providers
+/// hold dementia-sensitive certifications per PRD §5.2 / §7.2). Plain
+/// column despite being medical-ish data because the chef-match query
+/// reads it directly; the *richer* narrative (recent decline patterns,
+/// specific behavioural triggers) lives in the encrypted `medical_notes`
+/// payload alongside DOB.
+///
+///   `none`                      = no diagnosis / not yet assessed
+///   `mild_cognitive_impairment` = early signs, mostly self-managed
+///   `early_dementia`            = recent diagnosis, mostly independent
+///   `moderate_dementia`         = needs structured support
+///   `advanced_dementia`         = patient, low-stimulation care required
+enum SeniorDementiaStatus {
+  none
+  mild_cognitive_impairment
+  early_dementia
+  moderate_dementia
+  advanced_dementia
+
+  @@map("senior_dementia_status")
+  @@schema("household")
+}
+
+/// Senior — the actual aging adult who receives chef visits, companion
+/// dining, and concierge services. One household can serve multiple
+/// seniors (e.g. an elder couple under the same primary payer).
+///
+/// **Storage split for sensitive vs operational PII** (PDD §21.3, CLAUDE.md
+/// §17.1):
+///
+///   Operational (plain columns, queryable):
+///     `language_tags`      TEXT[]
+///     `dietary_tags`       TEXT[]
+///     `allergen_tags`      TEXT[]
+///     `mobility_level`     senior_mobility_level
+///     `dementia_status`    senior_dementia_status
+///
+///   Sensitive (AES-256-GCM ciphertext, decrypted only in `IntakeService`):
+///     `intake_payload_ciphertext`  BYTEA  -- JSON { dob, dietaryNotes,
+///                                                   allergyNotes,
+///                                                   mobilityNotes,
+///                                                   medicalNotes }
+///     `intake_payload_iv`          BYTEA  -- 12-byte GCM IV
+///     `intake_payload_auth_tag`    BYTEA  -- 16-byte GCM auth tag
+///     `intake_payload_key_version` INT    -- pointer into the keyring
+///     `intake_completed_at`        TIMESTAMPTZ  -- nudge state for the dashboard
+///
+/// Why a single encrypted JSON blob instead of per-field encryption?
+/// The intake is read as a unit (the family dashboard and the visit-prep
+/// surface both want the whole picture, not one field), the cleartext
+/// fields are small enough that GCM overhead is dominated by IV+tag
+/// (28 bytes / row), and one blob means one IV/tag/key_version trio
+/// instead of four — narrower attack surface for key rotation. Provider
+/// search (PDD §8.5 / §14.1) reads only the operational tags + enums and
+/// never decrypts; the cipher boundary lives entirely inside `IntakeService`.
+///
+/// Why allergens are plain rather than encrypted: a chef MUST see the
+/// allergen list at booking time (it's safety-critical operational
+/// data); encrypting it would force the chef-match query to decrypt
+/// every candidate row at search time, defeating the search index.
+/// The medical *context* behind an allergen ("anaphylaxis on peanut in
+/// 2008", "tested at hospital X") lives in the encrypted `allergyNotes`
+/// payload field, never the plain tag list.
+model Senior {
+  id          String       @id @default(cuid())
+  householdId String       @map("household_id")
+  firstName   String       @map("first_name")
+  lastName    String       @map("last_name")
+  /// Preferred greeting / nickname rendered in family-dashboard
+  /// cards and provider visit-prep notes. Null = fall back to
+  /// `first_name`.
+  displayName String?      @map("display_name")
+  status      SeniorStatus @default(active)
+  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone; populated by ops only. Read-paths must filter
+  /// `deletedAt = null` unless explicitly auditing deleted seniors.
+  deletedAt   DateTime?    @map("deleted_at") @db.Timestamptz(6)
+
+  // ── TS-031: operational intake (plain columns) ──────────────────────
+  /// BCP-47 language tags. Operational filter input — provider search
+  /// boosts providers who speak the same language. Empty array =
+  /// "no filter".
+  languageTags     String[]                @default([]) @map("language_tags")
+  /// Snake_case dietary tags (`vegetarian`, `kosher`, `low_sodium`, …).
+  /// Operational chef-match filter. Empty array = "no filter".
+  dietaryTags      String[]                @default([]) @map("dietary_tags")
+  /// Common-allergen tags (`peanut`, `tree_nut`, `shellfish`, …).
+  /// Operational chef-match filter — providers who can't accommodate
+  /// are filtered out before the result page renders.
+  allergenTags     String[]                @default([]) @map("allergen_tags")
+  /// Coarse mobility level — operational, drives visit prep.
+  mobilityLevel    SeniorMobilityLevel     @default(unknown) @map("mobility_level")
+  /// Coarse dementia stage — operational, drives provider matching
+  /// (Tier 2/3 dementia-sensitive certifications).
+  dementiaStatus   SeniorDementiaStatus    @default(none) @map("dementia_status")
+
+  // ── TS-031: sensitive intake (encrypted payload) ────────────────────
+  /// AES-256-GCM ciphertext of the JSON payload (DOB + freeform notes).
+  /// Null until the family completes at least one progressive save.
+  intakePayloadCiphertext   Bytes?  @map("intake_payload_ciphertext")
+  /// 12-byte GCM IV. Always paired with `intake_payload_ciphertext` —
+  /// both columns are null or both are non-null (service-layer invariant).
+  intakePayloadIv           Bytes?  @map("intake_payload_iv")
+  /// 16-byte GCM authentication tag.
+  intakePayloadAuthTag      Bytes?  @map("intake_payload_auth_tag")
+  /// Pointer into the env-managed keyring. `IntakePayloadCipherService`
+  /// rejects rows whose `key_version` does not match the configured
+  /// current version — fail-closed rotation contract (see TS-023 cipher
+  /// service for the same pattern).
+  intakePayloadKeyVersion   Int?    @map("intake_payload_key_version")
+  /// First time a non-empty intake landed. Drives the family-dashboard
+  /// "you haven't completed the intake yet" nudge; reset to null only
+  /// if ops explicitly clear an intake. Once set, subsequent updates do
+  /// NOT advance this timestamp — the canonical "last update" is
+  /// `updated_at` on the row.
+  intakeCompletedAt         DateTime? @map("intake_completed_at") @db.Timestamptz(6)
+
+  household        Household                @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  memoryRecipes    MemoryRecipe[]
+  preferences      SeniorPreference[]
+  consent          SeniorConsent?
+  alertPreferences SeniorAlertPreference[]
+
+  @@index([householdId], map: "seniors_household_id_idx")
+  @@index([status], map: "seniors_status_idx")
+  @@index([deletedAt], map: "seniors_deleted_at_idx")
+  @@map("seniors")
+  @@schema("household")
+}
+
+/// Senior family-observability consent — one row per senior carrying
+/// four surface-visibility booleans (TS-238; PRD §6.4, CLAUDE.md §12).
+///
+/// The map controls what a `family_observer` household member may see.
+/// The primary payer (account manager / guardian) and the senior
+/// end-user always see everything they manage — the gate masks
+/// observers only, per CLAUDE.md §12 ("family observers see what the
+/// senior has consented to share"). Each surface is a single boolean:
+///
+///   - `photos`   — visit photo summaries + memory-recipe images
+///                  (media-svc; consumed by TS-232 / TS-110-followup-10 /
+///                  TS-062-followup-3).
+///   - `notes`    — wellness observation notes (service-booking; consumed
+///                  by a TS-238 follow-up + TS-233).
+///   - `location` — geo check-in coordinates (service-booking; consumed
+///                  by a TS-238 follow-up).
+///   - `health`   — the senior's health/medical profile (DOB, dementia
+///                  stage, encrypted intake notes — service-household).
+///                  Gated LIVE by TS-238: the intake read returns 403 to
+///                  a family observer unless `health` consent is granted.
+///
+/// **Default is opt-out** (CLAUDE.md §12). Every flag defaults to false;
+/// a senior with no row shares nothing. The row is created lazily on the
+/// first `PUT` — `SeniorConsentService.getConsent` synthesises the
+/// all-false shape when the row is absent, so the absence of a row and
+/// an explicit all-false row are observationally identical.
+///
+/// 1:1 with `Senior` — `seniorId` is the primary key, so a PK point-
+/// lookup serves every read (no secondary index). `updatedByUserId` is a
+/// soft FK into `identity.users.id` — never a Prisma relation across the
+/// service boundary (CLAUDE.md §2.3 / §4.1).
+model SeniorConsent {
+  /// PK + in-service FK to `seniors(id)`. 1:1 — at most one consent row
+  /// per senior.
+  seniorId        String   @id @map("senior_id")
+  /// Share visit photo summaries + memory-recipe images with family
+  /// observers. Default opt-out.
+  photos          Boolean  @default(false)
+  /// Share wellness observation notes with family observers. Default
+  /// opt-out.
+  notes           Boolean  @default(false)
+  /// Share geo check-in / check-out coordinates with family observers.
+  /// Default opt-out.
+  location        Boolean  @default(false)
+  /// Share the senior's health / medical profile (DOB, dementia stage,
+  /// encrypted intake notes) with family observers. Default opt-out.
+  /// Gated LIVE on the intake read (TS-238).
+  health          Boolean  @default(false)
+  /// Soft FK into `identity.users.id` — the household member who last
+  /// set consent. Null until first set. See the schema header for the
+  /// no-cross-service-relation convention.
+  updatedByUserId String?  @map("updated_by_user_id")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  senior          Senior   @relation(fields: [seniorId], references: [id], onDelete: Cascade)
+
+  @@map("senior_consent")
+  @@schema("household")
+}
+
+/// Per-(senior × family-member) alert subscription (TS-234; PRD §6.4
+/// "Alert configurations"; PDD §12.3).
+///
+/// Distinct from `SeniorConsent` above. Consent is **one row per senior**,
+/// set by the account manager and applied uniformly to every observer —
+/// it tunes what a `family_observer` may *see*. This table is **one row
+/// per (senior × member)**: each household member (the primary payer AND
+/// every observer) subscribes *themselves* to the alert types they want
+/// about a senior, so the composite PK is `(senior_id, user_id)` and a
+/// member may only read / write their own row. Household membership is the
+/// row-level authorisation (a non-member gets 403); there is no
+/// manager-role gate, because subscribing yourself to alerts is not an act
+/// performed on the senior's behalf.
+///
+/// Defaults (the never-set state). The service synthesises the all-default
+/// shape when no row exists — `missed_visit` + `emergency_flag` true
+/// (operational / safety alerts a family wants without opting in),
+/// `concerning_observation` false (derives from senior wellness data + the
+/// upstream TS-236 detector is a scaffold, so it is opt-in). The columns
+/// carry the same defaults so an explicit first write that matches the
+/// synthesised state is a no-op-equivalent row.
+///
+/// Channels are orthogonal. This table stores *which alert types* a member
+/// subscribes to — not *which channel* fires. Channel selection lives in
+/// the member's notification preferences (TS-073).
+///
+/// `user_id` is a soft FK into `identity.users.id` (no cross-service
+/// relation, per the schema header). `senior_id` is an in-service FK so a
+/// senior delete cascades its subscriptions.
+model SeniorAlertPreference {
+  /// In-service FK to `seniors(id)`. Half of the composite PK.
+  seniorId              String   @map("senior_id")
+  /// Soft FK into `identity.users.id` — the subscribing household member.
+  /// Half of the composite PK.
+  userId                String   @map("user_id")
+  /// Alert on a booked visit the provider did not show up for. Default on.
+  missedVisit           Boolean  @default(true) @map("missed_visit")
+  /// Alert on a concerning wellness-observation pattern (TS-236).
+  /// Observer delivery is gated at emission by the senior's `notes`
+  /// consent. Default off (opt-in).
+  concerningObservation Boolean  @default(false) @map("concerning_observation")
+  /// Alert on a welfare / emergency flag raised during a visit or by
+  /// trust & safety. Default on.
+  emergencyFlag         Boolean  @default(true) @map("emergency_flag")
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  senior                Senior   @relation(fields: [seniorId], references: [id], onDelete: Cascade)
+
+  @@id([seniorId, userId])
+  // The composite PK already indexes `(senior_id, user_id)`, which serves
+  // the dominant read (a member loading their own subscription for a
+  // senior). A standalone `senior_id` index serves the future
+  // alert-dispatch fan-out ("every member subscribed to this senior") that
+  // the deferred detector workers (TS-235 / TS-236) will run.
+  @@index([seniorId], map: "senior_alert_preferences_senior_id_idx")
+  @@map("senior_alert_preferences")
+  @@schema("household")
+}
+
+/// Emergency contact — household-scoped roster of "who to call when
+/// something's wrong". One household can hold up to
+/// `EMERGENCY_CONTACTS_MAX_PER_HOUSEHOLD` (10) active contacts; the cap
+/// is enforced at the service layer for a clean 422 rather than as a
+/// DB constraint that would surface as a generic violation.
+///
+/// Storage shape rationale (CLAUDE.md §17.1, PDD §16.3). Phone, name,
+/// and relationship are PII but the operational concierge and visit-
+/// prep flows read them directly — encrypting these would force a
+/// decrypt-on-read for every chef arrival surface. The platform's
+/// other PII protections (database encryption-at-rest, audit logging,
+/// row-level auth, soft-delete with retention windows) provide the
+/// defence-in-depth layer here. The strictly-sensitive blob — door
+/// codes, alarm codes, key locations — lives in the encrypted
+/// `access_instructions_*` columns on `Household` instead.
+///
+/// Ordering. `priority` (1 = "call first", 10 = "last resort") with
+/// `createdAt` as the tie-breaker. The list endpoint surfaces this
+/// order to clients deterministically.
+///
+/// Soft-delete. Removing a contact never hard-deletes — audit reviews
+/// (e.g. "who did we have on file the night the welfare incident
+/// fired?") need historical reads. `deletedAt` filters out removed
+/// rows from the list endpoint by default; admin / audit-mode reads
+/// can pull all rows.
+model EmergencyContact {
+  id           String   @id @default(cuid())
+  householdId  String   @map("household_id")
+  /// Display name. Stored as the family typed it (Title Case, accents,
+  /// honorifics preserved); the family-dashboard renders it verbatim.
+  name         String
+  /// Free text — "Adult daughter, decision-maker", "Neighbor across the
+  /// hall", "Primary care physician". Deliberately not enum so the
+  /// family can capture nuance that a closed list would erase.
+  relationship String
+  /// E.164 phone number with optional leading `+`. Normalised at the
+  /// contract layer; persisted as the family supplied it (with `+`).
+  phone        String
+  /// Optional email. Null = "no email on file".
+  email        String?
+  /// Display ordering. Lower number = higher priority. The service
+  /// layer caps to 1..10 and uses createdAt as the tie-breaker on
+  /// equal priorities — keep the DB type small and unconstrained at
+  /// the schema layer so a future "split priority into separate
+  /// columns" migration is a forward-compatible expansion.
+  priority     Int
+  /// Free-form notes — "Cell only, no landline", "Best after 7pm",
+  /// "Hard of hearing — text first". Capped at the contract layer
+  /// (500 chars); persisted as raw TEXT so the DB doesn't have to
+  /// enforce a length the Zod validator already does.
+  notes        String?
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone. Read-paths filter `deletedAt = null` by
+  /// default; admin / audit reads can pull all rows.
+  deletedAt    DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  household    Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  /// Powers the list endpoint — "every active contact for this
+  /// household, in priority order". Composite shape so a single index
+  /// scan filters soft-deleted rows AND returns ordered results.
+  @@index([householdId, deletedAt, priority, createdAt], map: "emergency_contacts_household_active_idx")
+  @@map("emergency_contacts")
+  @@schema("household")
+}
+
+/// Provenance of a memory-recipe row. Drives client-side rendering
+/// (a "from your family" badge versus a "from our cultural catalog"
+/// badge) and the audit trail (who/what introduced this row).
+///
+///   `family_contribution` = uploaded by an active household member
+///                           (PRD §6.5 — "Family contribution: upload
+///                           family recipes for the senior"). The
+///                           `contributed_by_user_id` column carries
+///                           the soft FK to that user.
+///   `cultural_catalog`    = imported from the platform-wide curated
+///                           catalog (PRD §6.5 — "Curated catalog of
+///                           culturally meaningful recipes"). The
+///                           catalog itself is admin-managed (Phase 2
+///                           ops territory); a Phase 1 import is a
+///                           service-internal write that flips this
+///                           enum to `cultural_catalog`. The
+///                           `contributed_by_user_id` column is null.
+///   `senior_request`      = a specific dish the senior asked for at
+///                           a recent visit (PRD §6.5 — "Save and
+///                           request specific dishes for upcoming
+///                           visits"). Either the family entered it
+///                           on the senior's behalf, or a provider /
+///                           concierge did via admin tooling. The
+///                           `contributed_by_user_id` column is null
+///                           when ops entered it; otherwise carries
+///                           the family member's id.
+enum MemoryRecipeSource {
+  family_contribution
+  cultural_catalog
+  senior_request
+
+  @@map("memory_recipe_source")
+  @@schema("household")
+}
+
+/// Memory recipe — a culturally / personally meaningful dish bound to
+/// a specific senior. The catalog feeds three surfaces:
+///
+///   1. The family-dashboard "memory meals" card (PRD §6.4 / §6.5) —
+///      "the dishes that mean something to your loved one".
+///   2. The provider visit-prep card — "this senior's favourite dishes,
+///      requested for upcoming visits, and family stories behind them".
+///   3. The chef-match query (TS-053 / TS-111) — `cuisine_tag` joins
+///      against provider specialty tags so a senior who saved 12
+///      Korean recipes surfaces Korean-trained providers first.
+///
+/// Storage shape rationale (mirror of `EmergencyContact`). Title,
+/// description, and cuisine tag are PII-adjacent (the description can
+/// carry family stories — "the pierogi my grandmother taught me to
+/// fold the summer she stayed with us") but the operational dashboard
+/// reads them at speed. Field-level encryption would force a decrypt
+/// on every render of every senior's memory card; the platform's other
+/// PII protections (encryption-at-rest, audit, row-level auth) provide
+/// the defence-in-depth layer here. Strictly-sensitive material (DOB,
+/// medical narrative) lives in the encrypted intake payload (TS-031),
+/// not in this row.
+///
+/// `image_key` is a forward reference to TS-110 `media-svc`. Stored as
+/// a TEXT pointer with no FK or content guarantee — when media-svc
+/// lands, the contract gate requires the key to belong to a
+/// successfully-scanned asset before the family-dashboard renders the
+/// image. Today the family-dashboard treats a non-null key as "an
+/// image was uploaded; render placeholder until media-svc validates".
+///
+/// `requested_for_upcoming_visit` is the "queue this for the next chef
+/// visit" pin (PRD §6.5). Booking-svc (TS-060) reads it via the
+/// gateway during visit-prep assembly; the partial index keeps that
+/// query cheap once the catalog grows. Cleared automatically when the
+/// requested visit completes (TS-060 wiring); a follow-up captures the
+/// cross-service event hook.
+///
+/// `contributed_by_user_id` is a soft FK into `identity.users.id` —
+/// never declare a Prisma relation here per the schema-level header.
+/// Null on `cultural_catalog` and on ops-entered `senior_request`
+/// rows; non-null on family-contributed rows so the dashboard can
+/// render "added by your sister Anna" attribution.
+///
+/// `sort_position` lets the family explicitly order the catalog ("put
+/// Bobchi's pierogi at the top"). Service-layer assigns next-available
+/// on create; the family can re-order later via a dedicated TS-033-
+/// followup if drag-and-drop UX lands.
+///
+/// Soft-delete preserves the audit history of what was on file when a
+/// chef visited (PDD §17 — provider-side "what dishes were the family
+/// requesting last quarter?" reads).
+model MemoryRecipe {
+  id                    String              @id @default(cuid())
+  seniorId              String              @map("senior_id")
+  title                 String
+  description           String
+  source                MemoryRecipeSource
+  /// Snake_case cuisine tag (`italian`, `korean`, `southern_us`, …).
+  /// Operational chef-match input. Null = "no cuisine pinned".
+  cuisineTag            String?             @map("cuisine_tag")
+  /// Optional S3 object key — the family uploaded an image of the
+  /// dish, the recipe card, or the relative who taught the dish.
+  /// Family-dashboard renders a placeholder until TS-110 media-svc
+  /// confirms the asset's virus scan + magic-byte validation passed.
+  imageKey              String?             @map("image_key")
+  /// "Save this for the next chef visit" pin. Default false; flipped
+  /// true via PATCH; cleared automatically on booking completion via
+  /// TS-060 wiring (captured as a TS-033 follow-up).
+  requestedForUpcomingVisit Boolean         @default(false) @map("requested_for_upcoming_visit")
+  /// Soft FK into `identity.users.id`. Null on `cultural_catalog`
+  /// and ops-entered `senior_request` rows.
+  contributedByUserId   String?             @map("contributed_by_user_id")
+  /// Family-controlled ordering within a senior's catalog. Lower =
+  /// earlier. Service layer auto-assigns next-available on create
+  /// (current max + 1). Re-ordering UX is a future follow-up.
+  sortPosition          Int                 @map("sort_position")
+  createdAt             DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone. Read-paths filter `deletedAt = null` by
+  /// default; admin / audit reads can pull all rows.
+  deletedAt             DateTime?           @map("deleted_at") @db.Timestamptz(6)
+
+  senior                Senior              @relation(fields: [seniorId], references: [id], onDelete: Cascade)
+
+  /// Powers the list endpoint — "every active recipe for this senior
+  /// in family-chosen order". Composite shape so a single index scan
+  /// filters soft-deleted rows AND returns ordered results.
+  @@index([seniorId, deletedAt, sortPosition, createdAt], map: "memory_recipes_senior_active_idx")
+  /// Powers the visit-prep "queued dishes" lookup — partial index
+  /// confined to pinned + active rows so the cost stays flat as the
+  /// catalog grows. EXPLAIN ANALYZE confirmation deferred to the
+  /// Testcontainers integration test (TS-033 follow-up).
+  @@index([seniorId, requestedForUpcomingVisit], map: "memory_recipes_senior_requested_idx")
+  @@map("memory_recipes")
+  @@schema("household")
+}
+
+/// Senior memory profile — flat key/value cues that describe a senior
+/// as a person rather than as a clinical case (PRD §6.5 — "favorite
+/// childhood foods, regional traditions, family recipes"). The store
+/// is intentionally schemaless on purpose: the platform learns over
+/// time which keys matter, and a fixed-column model would either
+/// over-fit Phase 1 or rot as Phase 2 / 3 expand the question set.
+///
+/// Read patterns:
+///   - Family dashboard renders the full set as a labelled list (the
+///     "knowing them" card under the senior's profile).
+///   - Provider visit-prep card highlights 3–5 entries for the chef
+///     ahead of arrival ("Anna grew up in Pittsburgh; her mother
+///     made kielbasa every Christmas Eve").
+///   - Chef-match query (TS-053 / TS-111) MAY in future weight
+///     providers higher when their specialty tags align with the
+///     senior's preferences (e.g. `regional_tradition: pittsburgh` →
+///     boost Eastern-European chefs).
+///
+/// Composite primary key on `(senior_id, key)`: each (senior, key)
+/// pair carries at most one value. Upsert semantics are merge-only —
+/// a PATCH supplying a subset of keys touches only those keys.
+/// Setting `value: null` in the contract layer translates to a row
+/// delete here.
+///
+/// Storage shape: same plain-column rationale as `MemoryRecipe`. The
+/// values can carry warmth-laden personal context but are read at
+/// speed by the dashboard and visit-prep flows; field-level encryption
+/// would force decrypt-on-render across every key. Strictly-sensitive
+/// material (DOB, medical narrative) belongs in the encrypted intake
+/// payload (TS-031), not here.
+model SeniorPreference {
+  seniorId  String   @map("senior_id")
+  /// Snake_case key. Open vocabulary with a regex floor enforced at
+  /// the contract layer (`^[a-z][a-z0-9_]*$`) so the key set can grow
+  /// additively without migrations. Capped at 64 chars in the contract.
+  key       String
+  /// Free-form value. Capped at 1000 chars in the contract — long
+  /// enough for a sentence-or-two cue, short enough that the field
+  /// can't be used as an exfil bucket.
+  value     String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  senior    Senior   @relation(fields: [seniorId], references: [id], onDelete: Cascade)
+
+  /// Composite PK — at most one row per (senior, key). Upserts target
+  /// this composite via Prisma `upsert({where: {seniorId_key: ...}})`.
+  @@id([seniorId, key], map: "senior_preferences_pkey")
+  /// Powers the list endpoint — "every preference for this senior".
+  /// The PK already covers (seniorId, key) but a leading-key-only scan
+  /// would not return rows in alphabetical order without this; the
+  /// service layer sorts client-side today, so the index is purely
+  /// belt-and-braces and may be dropped in TS-033 follow-up if the
+  /// client-side sort proves enough at scale.
+  @@index([seniorId, key], map: "senior_preferences_senior_key_idx")
+  @@map("senior_preferences")
+  @@schema("household")
+}
+
+/// Outbox event (TS-142-followup-1, PDD §7.3, CLAUDE.md §5.3).
+///
+/// Producer-side row written in the same Prisma transaction as the
+/// business state change. The `apps/workers/outbox-relay` worker
+/// polls for rows with `dispatched_at IS NULL`, forwards them to
+/// Redis Streams (`events:{event_name}`), and stamps `dispatched_at`
+/// on success. Consumers must be idempotent on `event_id`
+/// (at-least-once delivery semantics).
+///
+/// Column shape is identical across every producer service — each
+/// service ships its own migration that creates a separate
+/// `{schema}.outbox_events` table. The `@taste-and-see/nest-outbox`
+/// SDK is schema-agnostic; services compose `OutboxModule.forRoot`
+/// with their schema name and the SDK writes the row via raw SQL
+/// inside the caller's `prisma.$transaction`.
+///
+/// The model is declared here primarily so `prisma generate` reflects
+/// the table on the local client (for ad-hoc queries via Prisma
+/// Studio + admin tooling). Service code writes via the SDK's raw
+/// SQL surface; reads happen exclusively through the relay's
+/// `pg`-backed claim repository (the worker app does not share this
+/// Prisma client).
+///
+/// Household-side producers land in their own follow-ups — e.g.
+/// `senior.intake_completed` / `senior.intake_updated`
+/// (TS-031-followup-2, consumed by TS-073-followup-14 for the
+/// senior-mode flag sync), emergency-contact + access-instructions
+/// change events (TS-032-followup-2), and memory-recipe +
+/// senior-preferences change events (TS-033-followup-2). The table
+/// ships ahead of those producers so the relay wiring + migration
+/// review are decoupled from the per-event producer work (one
+/// reviewable migration per service).
+model OutboxEvent {
+  /// Dedup key — consumers must idempotency-check on this. UUID v4
+  /// generated by the SDK by default; producers may pass an explicit
+  /// id (e.g. a deterministic `{seniorId}.intake.{occurredAtEpochMs}`
+  /// composite) for cross-boundary exactly-once-effective delivery.
+  eventId         String    @id @map("event_id")
+  /// Dot-notation event name from `packages/contracts/events`. The
+  /// SDK validates the name against the registry before inserting
+  /// — unknown names are rejected at the producer boundary.
+  eventName       String    @map("event_name")
+  /// Validated domain payload (validated by the SDK against the
+  /// matching `eventRegistry` schema before insert).
+  payload         Json
+  /// Producer wall-clock time the event semantically happened. May
+  /// differ from `created_at` for backfilled events.
+  occurredAt      DateTime  @map("occurred_at") @db.Timestamptz(6)
+  /// Service name that produced the row (e.g. `service-household`).
+  /// Useful for relay observability + per-service throughput metrics.
+  producerService String    @map("producer_service")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Stamped by the relay when the row has been successfully
+  /// forwarded onto the bus. Null means undispatched + eligible for
+  /// the next poll cycle.
+  dispatchedAt    DateTime? @map("dispatched_at") @db.Timestamptz(6)
+  /// Failed dispatch counter. The relay stops retrying once this
+  /// reaches `MAX_ATTEMPTS` — those rows are dead-lettered for ops
+  /// attention (surfaced via metrics + an admin endpoint).
+  attempts        Int       @default(0)
+  /// Stamped by the relay on the most recent failed attempt.
+  lastAttemptAt   DateTime? @map("last_attempt_at") @db.Timestamptz(6)
+  /// Most recent failure message — capped at 2000 chars at the
+  /// relay's record-failure path.
+  lastError       String?   @map("last_error")
+
+  /// Relay's dominant read query: "give me the next batch of
+  /// undispatched rows ordered by created_at". A partial index on
+  /// `dispatched_at IS NULL` keeps the index footprint bounded
+  /// against an ever-growing table (the table is append-only; the
+  /// partial filter is highly selective at steady state).
+  ///
+  /// Prisma's `@@index` cannot directly express the partial
+  /// predicate; the partial index is materialised in the migration
+  /// SQL (20260608120000_outbox_events).
+  @@index([eventName], map: "outbox_events_event_name_idx")
+  @@map("outbox_events")
+  @@schema("household")
+}

@@ -1,0 +1,52 @@
+{
+  "name": "@taste-and-see/logger",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Structured pino logger with PII redaction enforced at the logger layer for Taste & See services. See CLAUDE.md §10.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./redaction": {
+      "types": "./dist/redaction.d.ts",
+      "default": "./dist/redaction.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "redaction": [
+        "dist/redaction.d.ts"
+      ]
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "pino": "9.5.0"
+  },
+  "devDependencies": {
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "rimraf": "6.0.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

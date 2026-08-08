@@ -1,0 +1,199 @@
+# Per-service base for service-identity. Consumes the reusable
+# nestjs-service component + overrides every placeholder for the
+# identity service's specifics (namespace, name, port, env vars).
+#
+# Env overlays in infra/kubernetes/overlays/<env>/services/service-identity/
+# patch:
+# - image tag (per-env release)
+# - replica count (dev: 1, staging: 2, prod: 3)
+# - ConfigMap data (JWT_AUDIENCE / SERVICE_VERSION / STRIPE_IDENTITY_RETURN_URL per env)
+# - Secret name (per-env sealed-secret reference)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-services
+
+components:
+  - ../../components/nestjs-service
+
+resources:
+  - secret-placeholder.yaml
+  # TS-151-followup-12 — ArgoCD PreSync hook (wave -10) that applies this
+  # service's Prisma migrations before anything else in the sync. Listed ahead
+  # of any seed Job below because it must also run ahead of it at apply time.
+  - migrate-job.yaml
+  # TS-024-followup-1 — ArgoCD PreSync hook that loads the RBAC catalog before
+  # the Deployment rolls. Not part of the nestjs-service component: it is
+  # specific to this service (no other workload has a catalog to seed).
+  - rbac-seed-job.yaml
+
+commonLabels:
+  app.kubernetes.io/name: service-identity
+  app.kubernetes.io/instance: service-identity
+  app.kubernetes.io/part-of: taste-and-see
+
+# Strategic + JSON 6902 patches rename every resource emitted by the
+# nestjs-service component from `nestjs-service` to `service-identity`
+# AND override the component defaults with service-identity specifics
+# (port 3010, full env-var contract from apps/service-identity/src/config/env.ts,
+# Secret refs for the 9 secret-class envs).
+patches:
+  - target:
+      kind: ServiceAccount
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-identity
+
+  - target:
+      kind: ConfigMap
+      name: nestjs-service-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-identity-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3010"
+          SERVICE_VERSION: dev
+          JWT_ACCESS_TTL_SECONDS: "900"
+          JWT_REFRESH_TTL_SECONDS: "2592000"
+          JWT_ISSUER: taste-and-see/service-identity
+          JWT_AUDIENCE: taste-and-see/api
+          INTERNAL_TRUST_MAX_AGE_SECONDS: "60"
+          REFRESH_COOKIE_SECURE: "true"
+          MFA_TOTP_ENC_KEY_VERSION: "1"
+          MFA_CHALLENGE_TTL_SECONDS: "300"
+          MFA_TOTP_PERIOD_SECONDS: "30"
+          MFA_TOTP_DIGITS: "6"
+          MFA_TOTP_WINDOW: "1"
+          MFA_TOTP_ISSUER: Taste & See
+          IDEMPOTENCY_TTL_SECONDS: "86400"
+          IDEMPOTENCY_IN_FLIGHT_TTL_SECONDS: "60"
+          STRIPE_API_VERSION: ""
+          KYC_PAYLOAD_ENC_KEY_VERSION: "1"
+          # TS-510-followup-3 — per-ADDRESS cooldown on verification resend.
+          # The gateway's per-IP `sensitive` policy covers one host hammering
+          # the endpoint; this covers many hosts aimed at one inbox, which is
+          # the shape that matters when the address is attacker-chosen. It
+          # became live when TS-510-followup-4 landed the consumer that
+          # actually sends the mail. 60s is UNCONFIRMED (TS-300 posture) and
+          # must stay well under EMAIL_VERIFICATION_TTL_SECONDS — a cooldown
+          # longer than the link lasts strands a user whose first one expired.
+          VERIFICATION_RESEND_COOLDOWN_SECONDS: "60"
+          # TS-510-followup-1 — prune spent / long-expired verification
+          # tokens. The table grows one row per signup and one per resend,
+          # forever; the durable record that an address was verified is
+          # `users.email_verified_at`, not the token. Retention is
+          # deliberately far longer than a token's own TTL so a support
+          # question ("did the link we sent you on Tuesday work?") is still
+          # answerable. Setting ENABLED to "false" creates no queue and no
+          # worker at all — the operational lever, not a redeploy.
+          VERIFICATION_TOKEN_PRUNE_ENABLED: "true"
+          VERIFICATION_TOKEN_PRUNE_INTERVAL_MS: "21600000"
+          VERIFICATION_TOKEN_PRUNE_RETENTION_DAYS: "30"
+          VERIFICATION_TOKEN_PRUNE_BATCH_SIZE: "5000"
+          # TS-504-followup-2a-3 — this workload boots the OTel SDK
+          # (`src/observability/bootstrap.ts`, first import in main.ts). Both default
+          # true in the Zod schema; stated here so the enabled posture is visible in
+          # the manifest rather than implied.
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          # TS-504-followup-2a — Sentry error reporting (CLAUDE.md §10).
+          # EMPTY = off, and the service logs that it is off rather than
+          # staying quiet. The real DSN is supplied per env by the overlay or
+          # the operator; it is not committed, and it is not a Secret
+          # placeholder because a REPLACE_WITH_ value is not a valid URL and
+          # would fail Zod boot on every workload that does not use Sentry.
+          SENTRY_DSN: ""
+
+  - target:
+      kind: Service
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-identity
+      - op: replace
+        path: /spec/ports/0/port
+        value: 3010
+
+  - target:
+      kind: Deployment
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-identity
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: service-identity
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/service-identity:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/ports/0/containerPort
+        value: 3010
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: service-identity-config
+          - secretRef:
+              name: service-identity-secrets
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe/httpGet/port
+        value: 3010
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe/httpGet/port
+        value: 3010
+      - op: replace
+        path: /spec/template/spec/containers/0/livenessProbe/httpGet/port
+        value: 3010
+      - op: replace
+        path: /spec/template/metadata/annotations/prometheus.io~1port
+        value: "3010"
+
+  - target:
+      kind: NetworkPolicy
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-identity
+      - op: replace
+        path: /spec/ingress/0/ports/0/port
+        value: 3010
+      # worker-certification-renewal + worker-wellness-summary
+      # (platform-workers) POST the internal recipient-contacts batch
+      # endpoint, so admit that namespace in addition to the component
+      # default (platform-services).
+      - op: add
+        path: /spec/ingress/0/from/-
+        value:
+          namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: platform-workers
+
+  - target:
+      kind: PodDisruptionBudget
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-identity
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-identity
+      - op: replace
+        path: /spec/scaleTargetRef/name
+        value: service-identity

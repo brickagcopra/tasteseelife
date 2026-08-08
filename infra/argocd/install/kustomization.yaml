@@ -1,0 +1,40 @@
+# ArgoCD install (TS-152).
+#
+# Kustomize inflates the upstream argo-cd Helm chart at `kustomize build`
+# time so no Helm-operator dependency lives in the cluster (mirrors the
+# pattern from base/ingress-nginx/ + base/cert-manager/). The operator runs
+# this overlay ONCE per cluster via:
+#
+#   kubectl apply -k infra/argocd/install/ --enable-helm
+#
+# Once ArgoCD is healthy, the operator continues with:
+#   kubectl apply -k infra/argocd/projects/
+#   kubectl apply -k infra/argocd/root/
+#
+# From that point on, every change to infra/kubernetes/ or infra/argocd/
+# propagates via git push + ArgoCD auto-sync.
+#
+# Chart version pinned for reproducibility — bump via PR, not via floating
+# `>=` ranges (mirrors the TS-151 discipline). The chart bundles every
+# ArgoCD CRD (Application, ApplicationSet, AppProject) so a single
+# `--enable-helm` build is sufficient.
+#
+# Helm chart 7.7.0 → ArgoCD v2.13.x (a stable, well-soaked release at the
+# time of TS-152 writing). Bumps to chart v8.x / ArgoCD v3.x land via a
+# dedicated PR with a soak window per CLAUDE.md §11.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: argocd
+
+resources:
+  - namespace.yaml
+
+helmCharts:
+  - name: argo-cd
+    repo: https://argoproj.github.io/argo-helm
+    version: 7.7.0
+    releaseName: argocd
+    namespace: argocd
+    valuesFile: values.yaml
+    includeCRDs: true

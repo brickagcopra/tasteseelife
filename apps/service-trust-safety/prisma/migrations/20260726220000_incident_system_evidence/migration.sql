@@ -1,0 +1,59 @@
+-- TS-308c-followup-2 — evidence on system-opened incidents.
+--
+-- Three detectors open incidents with `source = 'system'` and a NULL
+-- `description` (TS-307a background check, TS-308a impossible travel,
+-- TS-308c mass cancellation). The NULL is correct in each case:
+-- `description` is free text meant for a human reporter's account, and
+-- none of those events carry one. The consequence, until now, was that
+-- an operator opening one of these in the console saw a category, a
+-- severity, a subject and NOTHING about what happened — the numbers
+-- that justified the incident existed only on the outbox event and in a
+-- single WARN log line.
+--
+-- Two nullable columns, expand-only, no backfill, no row touched.
+--
+-- ─────────────────────────────────────────────────────────────────────
+-- incidents.detector
+-- ─────────────────────────────────────────────────────────────────────
+--
+-- Which detector opened it. TEXT rather than an enum so a fourth
+-- detector needs no `CREATE TYPE` migration; the contract
+-- (`TrustSafetyIncidentDetectorSchema`) is the source of truth, matching
+-- the convention already used for `bookings.cancellation_reason`.
+--
+-- Deliberately stored SEPARATELY from `system_facts`, even though the
+-- blob carries the same discriminator inside it: if a stored blob ever
+-- fails to parse — a schema evolved, a row was written by an older
+-- build — the console must still be able to say which detector opened
+-- the incident. Collapsing the two would mean an unparseable blob
+-- renders as nothing at all, which is the exact failure this pair
+-- exists to fix.
+--
+-- ─────────────────────────────────────────────────────────────────────
+-- incidents.system_facts
+-- ─────────────────────────────────────────────────────────────────────
+--
+-- The evidence itself: implied speed and threshold; cancellation counts,
+-- window and actor spread; a background check's categorical status.
+--
+-- JSONB, and written ONLY after validation against a discriminated union
+-- of explicitly-typed variants at the service layer. **This column must
+-- never become a free-text channel.** Free text is precisely what the
+-- source events refuse to carry, and an untyped bag here would become
+-- the route for it the first time someone wanted "a bit more context" on
+-- an incident. Every field in every variant is a scalar, an opaque id,
+-- or a timestamp (CLAUDE.md §3.9).
+--
+-- NOT indexed. Nothing queries by its contents — it is read exactly once
+-- per incident, by id, on the detail page. A GIN index would cost every
+-- write for a read nobody makes.
+--
+-- Reversal: `ALTER TABLE trust_safety.incidents DROP COLUMN system_facts,
+-- DROP COLUMN detector;`. Data implication: the evidence recorded while
+-- the columns existed is lost, and system incidents go back to reaching
+-- the console unexplained. Nothing else reads them and no API breaks —
+-- both fields are nullable on the response.
+
+ALTER TABLE "trust_safety"."incidents"
+  ADD COLUMN IF NOT EXISTS "detector" TEXT,
+  ADD COLUMN IF NOT EXISTS "system_facts" JSONB;

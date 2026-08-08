@@ -1,0 +1,57 @@
+# Root Application for dev — the "app-of-apps" pattern.
+#
+# This Application's source directory is `infra/argocd/applications/dev/`,
+# which contains a Kustomization that aggregates every child Application
+# manifest. When ArgoCD reconciles this root, it creates each child
+# Application in the argocd namespace; each child in turn syncs the actual
+# workload manifests from `infra/kubernetes/overlays/dev/`.
+#
+# Why two levels?
+#   - Adding a new child Application (e.g. a per-service split when service-
+#     subscription's first deploy lands) becomes a one-file add under
+#     applications/dev/ — no manual `kubectl apply` of the new child needed.
+#   - The root Application itself rarely changes; child Applications turn
+#     over every time a new service or workspace lands.
+#
+# Sync policy: automated + prune + selfHeal. ArgoCD will re-create deleted
+# child Applications and remove children that disappear from git.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root-dev
+  namespace: argocd
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    tastesee.io/env: dev
+    tastesee.io/role: root
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: platform-dev
+
+  source:
+    repoURL: https://github.com/brickagcopra/tasteseelife.git
+    path: infra/argocd/applications/dev
+    targetRevision: main
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=false
+      - ApplyOutOfSyncOnly=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m

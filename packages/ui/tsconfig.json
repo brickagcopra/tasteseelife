@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "@taste-and-see/tsconfig/react-library.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": ["src/**/*", ".ladle/**/*"],
+  "exclude": ["node_modules", "dist", "build"]
+}

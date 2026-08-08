@@ -1,0 +1,131 @@
+# Default-deny ingress + egress per workload namespace (PDD §20.2:
+# "NetworkPolicies to restrict service-to-service traffic to declared
+# dependencies"). Every per-service base is then responsible for
+# opening exactly the channels it needs via additive NetworkPolicy
+# manifests in infra/kubernetes/services/<svc>/.
+#
+# The reusable nestjs-service / web-app / bullmq-worker components
+# emit the standard allow patterns (egress to kube-dns + external
+# Postgres + external Redis + Stripe + etc.; ingress from the gateway
+# or from the ingress-nginx namespace where relevant). Anything beyond
+# that explicit set is denied by these default-deny baselines.
+#
+# `platform-system`, `observability`, and `ingress` namespaces are
+# intentionally NOT default-deny in this base — their tenant charts
+# (cert-manager, ingress-nginx, Prometheus, Loki, Tempo) ship their
+# own NetworkPolicies via their upstream Helm charts, and adding a
+# blanket deny here can race the chart's policies on first apply.
+# Tightening these namespaces is captured as TS-151-followup-N.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: platform-services
+  annotations:
+    taste-and-see/policy: >-
+      Default-deny baseline for all workload pods in the namespace.
+      Per-service NetworkPolicy manifests open specific channels
+      additively (Kubernetes NetworkPolicy semantics are additive
+      across selected policies).
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: platform-services
+  annotations:
+    taste-and-see/policy: >-
+      DNS resolution must work for every pod. Allow UDP/53 + TCP/53
+      egress to kube-dns / coredns in the kube-system namespace.
+      Per-service policies do not need to restate this rule.
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: platform-frontends
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: platform-frontends
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: platform-workers
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: platform-workers
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

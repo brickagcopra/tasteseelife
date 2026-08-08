@@ -1,0 +1,78 @@
+# Default build-context filter for any `docker build` rooted at the repo.
+#
+# BuildKit looks for `.dockerignore` in the build-context directory; for the
+# canonical NestJS template at `infra/docker/nestjs.Dockerfile` we pass the
+# repo root as context, so this is the file Docker reads.
+#
+# Per-Dockerfile overrides are possible by placing `<dockerfile>.dockerignore`
+# at the context root (BuildKit only). Add one when a service genuinely needs
+# a different filter — most won't.
+
+# Dependency caches — re-installed inside the deps stage from pnpm-lock.yaml
+**/node_modules
+.pnpm-store
+
+# Build artefacts — compiled inside the builder stage
+**/dist
+**/build
+**/out
+**/.next
+**/.turbo
+**/*.tsbuildinfo
+
+# Generated Prisma clients (TS-502). Excluded for two reasons, both load-bearing:
+#   1. The client embeds a platform-specific query-engine binary. A developer's
+#      tree carries the Windows/macOS engine, and shipping that into an alpine
+#      image is at best dead weight and at worst the only engine present.
+#   2. Excluding it forces the builder stage to run `prisma generate` itself,
+#      so the image is always built from `schema.prisma` rather than from
+#      whatever happened to be on the machine that ran `docker build`.
+# It is gitignored too, so on a clean CI checkout it never existed anyway —
+# which is exactly the case this must not silently depend on.
+**/prisma/generated
+
+# Test outputs
+**/coverage
+**/coverage-integration
+**/playwright-report
+**/test-results
+**/.nyc_output
+
+# Source-control metadata — never needed inside the image
+.git
+.gitignore
+.gitattributes
+.github
+
+# Editor / OS noise
+.vscode
+.idea
+**/.DS_Store
+**/Thumbs.db
+
+# Local-only environment files (CLAUDE.md §3.5, §17.12)
+.env
+.env.*
+!.env.example
+
+# Husky / lint-staged config — only relevant pre-commit
+.husky
+
+# Misc tooling output
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+
+# Docs and trackers — no place in a runtime image
+docs
+PRD.md
+PDD.md
+CLAUDE.md
+Pending_tasks.md
+Completed_tasks.md
+README.md
+*.md
+!apps/*/README.md
+!packages/*/README.md
+!infra/docker/README.md

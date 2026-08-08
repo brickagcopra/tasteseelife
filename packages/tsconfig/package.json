@@ -1,0 +1,16 @@
+{
+  "name": "@taste-and-see/tsconfig",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Shared TypeScript configurations for the Taste & See monorepo. Apps and services extend these named configs instead of duplicating compiler options.",
+  "files": [
+    "base.json",
+    "node.json",
+    "nextjs.json",
+    "react-library.json"
+  ],
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

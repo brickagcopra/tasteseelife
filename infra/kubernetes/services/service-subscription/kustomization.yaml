@@ -1,0 +1,205 @@
+# Per-service base for service-subscription (TS-151-followup-1 rollout).
+# Mirrors the canonical service-identity base: consumes the reusable
+# nestjs-service component + overrides every placeholder for the
+# subscription service's specifics (port 3012, env-var contract from
+# apps/service-subscription/src/config/env.ts, Secret refs for the
+# secret-class envs).
+#
+# Note STRIPE_API_VERSION is intentionally absent from the ConfigMap:
+# the env schema types it `z.string().min(1).optional()`, so an empty
+# string would fail validation. Omitting it leaves it `undefined`
+# (SDK-baked default), which is the intended "unpinned" behaviour.
+#
+# Env overlays in infra/kubernetes/overlays/<env>/ patch image tag,
+# replica count, and a handful of ConfigMap values per env.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-services
+
+components:
+  - ../../components/nestjs-service
+
+resources:
+  - secret-placeholder.yaml
+  # TS-151-followup-12 — ArgoCD PreSync hook (wave -10) that applies this
+  # service's Prisma migrations before anything else in the sync. Listed ahead
+  # of any seed Job below because it must also run ahead of it at apply time.
+  - migrate-job.yaml
+  # TS-040-followup-3 — ArgoCD PreSync hook that loads the plan catalog before
+  # the Deployment rolls. Twin of service-identity's RBAC seed Job.
+  - plan-seed-job.yaml
+
+commonLabels:
+  app.kubernetes.io/name: service-subscription
+  app.kubernetes.io/instance: service-subscription
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-subscription
+
+  - target:
+      kind: ConfigMap
+      name: nestjs-service-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-subscription-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3012"
+          SERVICE_VERSION: dev
+          JWT_ISSUER: taste-and-see/service-identity
+          JWT_AUDIENCE: taste-and-see/api
+          INTERNAL_TRUST_MAX_AGE_SECONDS: "60"
+          IDEMPOTENCY_TTL_SECONDS: "86400"
+          IDEMPOTENCY_IN_FLIGHT_TTL_SECONDS: "60"
+          # TS-041b-followup-3a — outbox CONSUMER cluster
+          # (service-subscription's first; it consumes the relayed
+          # `stripe.*` billing events service-webhook produces so local
+          # rows track what Stripe actually did). OUTBOX_CONSUMER_NAME is
+          # deliberately ABSENT here — it comes from the downward API on
+          # the container env below, because it must differ per pod.
+          # OUTBOX_STREAM_PREFIX must match the relay's
+          # STREAM_NAME_PREFIX; a mismatch means this service reads an
+          # empty stream forever and subscription rows quietly stop
+          # tracking Stripe while every dashboard still renders
+          # confidently.
+          OUTBOX_STREAM_PREFIX: events
+          OUTBOX_CONSUMER_MAX_ATTEMPTS: "10"
+          OUTBOX_CONSUMER_POLL_BLOCK_MS: "5000"
+          OUTBOX_CONSUMER_RECLAIM_IDLE_MS: "60000"
+          OUTBOX_CONSUMER_POLL_INTERVAL_MS: "1000"
+          DUNNING_GRACE_DAYS: "21"
+          # TS-042-followup-2 — the dunning-exhaustion sweep. Hourly against a
+          # grace window measured in DAYS, so an hour of latency on a 21-day
+          # deadline is immaterial and a tighter cadence would only spend more
+          # index scans discovering the same empty result. Setting
+          # SUBSCRIPTION_DUNNING_SWEEP_ENABLED to "false" creates no queue and
+          # no worker at all — the operational lever, not a redeploy.
+          SUBSCRIPTION_DUNNING_SWEEP_ENABLED: "true"
+          SUBSCRIPTION_DUNNING_SWEEP_INTERVAL_MS: "3600000"
+          # TS-042-followup-3a3-followup-1 — where Stripe returns a family
+          # after they close the hosted Billing Portal. Server-side because
+          # a caller-supplied return_url would make the endpoint an open
+          # redirect wearing Stripe's branding.
+          #
+          # MUST MATCH service-notification's DUNNING_BILLING_URL — that is
+          # the link the dunning emails send them on, and this is where they
+          # land coming back. Move the two together.
+          BILLING_PORTAL_RETURN_URL: https://app.tasteseelife.com/billing
+          COUPON_RATE_LIMIT_IP_MAX_PER_WINDOW: "30"
+          COUPON_RATE_LIMIT_IP_WINDOW_SECONDS: "60"
+          COUPON_RATE_LIMIT_USER_MAX_PER_WINDOW: "10"
+          COUPON_RATE_LIMIT_USER_WINDOW_SECONDS: "60"
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          # TS-504-followup-2a — Sentry error reporting (CLAUDE.md §10).
+          # EMPTY = off, and the service logs that it is off rather than
+          # staying quiet. The real DSN is supplied per env by the overlay or
+          # the operator; it is not committed, and it is not a Secret
+          # placeholder because a REPLACE_WITH_ value is not a valid URL and
+          # would fail Zod boot on every workload that does not use Sentry.
+          SENTRY_DSN: ""
+
+  - target:
+      kind: Service
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-subscription
+      - op: replace
+        path: /spec/ports/0/port
+        value: 3012
+
+  - target:
+      kind: Deployment
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-subscription
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: service-subscription
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/service-subscription:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/ports/0/containerPort
+        value: 3012
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: service-subscription-config
+          - secretRef:
+              name: service-subscription-secrets
+      # TS-041b-followup-3a — the Redis Streams consumer identity MUST be
+      # unique per pod. Two replicas sharing a name corrupt each other's
+      # Pending Entries List, which on this surface means a Stripe billing
+      # change can be ACKed by a pod that never applied it — a subscription
+      # Stripe moved to `past_due` still reading `active` on the family's
+      # billing page, with nothing in any queue to show for it. Set on the
+      # container `env` (which wins over the ConfigMap envFrom) rather than
+      # the ConfigMap, which cannot reference the downward API. Same wiring
+      # as service-booking and service-accounting.
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: OUTBOX_CONSUMER_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe/httpGet/port
+        value: 3012
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe/httpGet/port
+        value: 3012
+      - op: replace
+        path: /spec/template/spec/containers/0/livenessProbe/httpGet/port
+        value: 3012
+      - op: replace
+        path: /spec/template/metadata/annotations/prometheus.io~1port
+        value: "3012"
+
+  - target:
+      kind: NetworkPolicy
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-subscription
+      - op: replace
+        path: /spec/ingress/0/ports/0/port
+        value: 3012
+
+  - target:
+      kind: PodDisruptionBudget
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-subscription
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-subscription
+      - op: replace
+        path: /spec/scaleTargetRef/name
+        value: service-subscription

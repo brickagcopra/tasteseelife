@@ -1,0 +1,164 @@
+# Per-service base for service-messaging (TS-151-followup-1 rollout,
+# Batch 4 — remaining Phase-2/support services). Mirrors the canonical
+# service-identity / service-household base: consumes the reusable
+# nestjs-service component + overrides every placeholder for the
+# messaging service's specifics (port 3017, env-var contract from
+# apps/service-messaging/src/config/env.ts, Secret refs for the
+# secret-class envs).
+#
+# Phase 1 the thread + participant metadata lives in Postgres
+# (`DATABASE_URL`); the Cassandra message-body store (PDD §8.3 /
+# TS-070-followup-1) is a later wiring. The Socket.IO real-time layer
+# (TS-071, PDD §13.1) uses Redis (`REDIS_URL`) as the multi-pod pub/sub
+# backplane — the Redis-adapter key prefix (`REDIS_KEY_NAMESPACE_PREFIX`,
+# CLAUDE.md §3.7) + the browser CORS allowlist (`WS_CORS_ORIGINS`) are
+# non-secret and ride the ConfigMap, patched per env in the overlays.
+#
+# NetworkPolicy: standard backend (component-default admit of
+# platform-services — the gateway / in-cluster callers). Browser-facing
+# WebSocket exposure (a dedicated Ingress, or the gateway-side WS proxy)
+# is deferred to TS-071 / TS-140-followup-1a; until then realtime is
+# reachable only in-cluster.
+#
+# Env overlays in infra/kubernetes/overlays/<env>/ patch image tag,
+# replica count, and a handful of ConfigMap values per env (including the
+# env-scoped Redis key prefix + WS CORS origin).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-services
+
+components:
+  - ../../components/nestjs-service
+
+resources:
+  - secret-placeholder.yaml
+  # TS-151-followup-12 — ArgoCD PreSync hook (wave -10) that applies this
+  # service's Prisma migrations before anything else in the sync. Listed ahead
+  # of any seed Job below because it must also run ahead of it at apply time.
+  - migrate-job.yaml
+
+commonLabels:
+  app.kubernetes.io/name: service-messaging
+  app.kubernetes.io/instance: service-messaging
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-messaging
+
+  - target:
+      kind: ConfigMap
+      name: nestjs-service-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-messaging-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3017"
+          SERVICE_VERSION: dev
+          JWT_ISSUER: taste-and-see/service-identity
+          JWT_AUDIENCE: taste-and-see/api
+          INTERNAL_TRUST_MAX_AGE_SECONDS: "60"
+          REDIS_KEY_NAMESPACE_PREFIX: "prod:service-messaging:socket:"
+          WS_PATH: /socket.io
+          WS_CORS_ORIGINS: https://app.tasteseelife.com
+          # TS-306-followup-1d — this workload now boots the OTel SDK
+          # (`src/observability/bootstrap.ts`, first import in main.ts). Both
+          # default to true in the Zod schema; stated here so the enabled
+          # posture is visible in the manifest rather than implied.
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          # TS-504-followup-2a — Sentry error reporting (CLAUDE.md §10).
+          # EMPTY = off, and the service logs that it is off rather than
+          # staying quiet. The real DSN is supplied per env by the overlay or
+          # the operator; it is not committed, and it is not a Secret
+          # placeholder because a REPLACE_WITH_ value is not a valid URL and
+          # would fail Zod boot on every workload that does not use Sentry.
+          SENTRY_DSN: ""
+
+  - target:
+      kind: Service
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-messaging
+      - op: replace
+        path: /spec/ports/0/port
+        value: 3017
+
+  - target:
+      kind: Deployment
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-messaging
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: service-messaging
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/service-messaging:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/ports/0/containerPort
+        value: 3017
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: service-messaging-config
+          - secretRef:
+              name: service-messaging-secrets
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe/httpGet/port
+        value: 3017
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe/httpGet/port
+        value: 3017
+      - op: replace
+        path: /spec/template/spec/containers/0/livenessProbe/httpGet/port
+        value: 3017
+      - op: replace
+        path: /spec/template/metadata/annotations/prometheus.io~1port
+        value: "3017"
+
+  - target:
+      kind: NetworkPolicy
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-messaging
+      - op: replace
+        path: /spec/ingress/0/ports/0/port
+        value: 3017
+
+  - target:
+      kind: PodDisruptionBudget
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-messaging
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-messaging
+      - op: replace
+        path: /spec/scaleTargetRef/name
+        value: service-messaging

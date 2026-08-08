@@ -1,0 +1,50 @@
+# ----------------------------------------------------------------------
+# infra/terraform/env/dev/terraform.tfvars.example
+#
+# Sample tfvars for the `dev` env root. Copy to `terraform.tfvars`
+# (gitignored) ONLY if you're running locally without Terraform Cloud;
+# the recommended path is to set every sensitive variable in the
+# Terraform Cloud workspace UI instead. See `backend.tf` operator
+# bootstrap step 3.
+#
+# CLAUDE.md §3.5 / §17.12 — never commit real values. The .gitignore
+# at the repo root excludes *.tfvars but allows *.tfvars.example so
+# this template stays committable.
+# ----------------------------------------------------------------------
+
+# ----- Contabo credentials (workspace-sensitive in TF Cloud) -----
+# Obtain by creating an API client in https://my.contabo.com/api/permissions
+# and a customer-API password under https://my.contabo.com/account/security.
+# Leave commented when using TF Cloud; uncomment ONLY for local-state mode.
+# contabo_oauth2_client_id     = "REDACTED"
+# contabo_oauth2_client_secret = "REDACTED"
+# contabo_oauth2_user          = "you@example.com"
+# contabo_oauth2_pass          = "REDACTED"
+
+# ----- Cloudflare scoped API token (workspace-sensitive in TF Cloud) -----
+# Token permissions: Zone:Read, DNS:Edit, scoped to the target zone only.
+# cloudflare_api_token = "REDACTED"
+
+# ----- Operator SSH public key -----
+# The OpenSSH-formatted public key authorised to log in as tastesee-ops
+# on every node. Generate locally with:
+#   ssh-keygen -t ed25519 -C "operator@tastesee" -f ~/.ssh/tastesee-ops
+# operator_ssh_public_key = "ssh-ed25519 AAAA... operator@tastesee"
+
+# ----- Cloudflare zone -----
+# Apex domain that hosts dev / staging / prod records. Must already exist
+# in your Cloudflare account.
+zone_name = "tasteseelife.com"
+
+# ----- Contabo image + product IDs -----
+# Look up Contabo image UUIDs with:
+#   curl -H "Authorization: Bearer $TOKEN" https://api.contabo.com/v1/compute/images \
+#     | jq '.data[] | select(.standardImage == true and (.name | test("Ubuntu 24"))) | {id, name}'
+ubuntu_image_id      = "<override-in-tfvars>"
+k3s_product_id       = "V47"
+data_node_product_id = "V47"
+
+# ----- Region + sizing -----
+region            = "US-central"
+k3s_node_count    = 3
+object_storage_tb = 1

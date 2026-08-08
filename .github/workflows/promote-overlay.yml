@@ -1,0 +1,340 @@
+# Operator-driven promotion of a built image SHA into the staging / prod
+# GitOps overlay (TS-009g-followup-2).
+#
+# WHY THIS EXISTS
+# ---------------
+# Per CLAUDE.md §11 + PDD §11 the lower → higher environment flow is
+# "soak then promote": dev auto-bumps on every push to main (the
+# `bump-dev-overlay` job in each per-service `*-build.yml`), but staging
+# and prod are NEVER auto-bumped — a human must deliberately promote a
+# soaked SHA. This workflow makes that gate an explicit, reviewable PR.
+#
+# WHAT IT DOES
+# ------------
+# Dispatched manually (`workflow_dispatch`) with:
+#   - environment:     staging | prod   (which overlay to rewrite)
+#   - source_sha_tag:  sha-<short-sha>   (the immutable image tag built by
+#                      build-push-image.yml for the commit being promoted)
+#
+# Steps:
+#   1. Resolve source_sha_tag's short SHA to a full commit SHA on main —
+#      this also validates the tag names a real, merged commit.
+#   2. For every `ghcr.io/brickagcopra/<image>` entry in the target overlay,
+#      probe the registry (`docker manifest inspect`) for a manifest at
+#      `:source_sha_tag`. A push to main only rebuilds the services its path
+#      filter matched, so the set of images that actually exist at that SHA
+#      IS "every service successfully built at that SHA" (the acceptance
+#      criterion). Only those entries get their `newTag` rewritten; services
+#      not rebuilt at that SHA keep whatever they were pinned to.
+#   3. Pre-flight render the rewritten overlay with
+#      `kubectl kustomize --enable-helm` so a malformed bump never opens a
+#      PR. (The full kubeconform + kube-linter gate in
+#      kubernetes-validate.yml still runs on the merge commit; see the
+#      GITHUB_TOKEN caveat below.)
+#   4. Open a PR against main carrying a verification checklist that ties the
+#      promoted SHA back to its build run, Trivy SARIF, and cosign/Rekor
+#      transparency entry. A human reviews + merges; ArgoCD's staging/prod
+#      Application then syncs the merged overlay (prod sync is itself manual,
+#      TS-152).
+#
+# GITHUB_TOKEN PR-CHECK CAVEAT
+# ----------------------------
+# GitHub deliberately does NOT fire workflow runs for events created by the
+# built-in GITHUB_TOKEN (recursion guard). So the PR this workflow opens will
+# NOT automatically run ci.yml / kubernetes-validate.yml. Two things cover
+# that gap: (a) step 3 above renders the overlay here, in-workflow, before the
+# PR is opened; (b) merging the PR is a push to main, which DOES fire
+# kubernetes-validate.yml's push trigger on the merge commit. Wiring a
+# dedicated bot PAT so the PR's own checks fire pre-merge is captured as
+# TS-009g-followup-2a.
+#
+# All third-party `uses:` lines are SHA-pinned (TS-009a); CLI tool versions
+# are pinned in the env block. References: PDD.md §11, §20.4; CLAUDE.md §11.
+name: Promote overlay
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target overlay to promote into
+        required: true
+        type: choice
+        options:
+          - staging
+          - prod
+      source_sha_tag:
+        description: Image tag to promote (e.g. sha-1a2b3c4)
+        required: true
+        type: string
+
+# workflow_dispatch is already gated to actors with write access to the repo;
+# that is the human authorisation for the promotion. The job needs to push a
+# branch + open a PR + read packages from ghcr.
+permissions:
+  contents: write
+  pull-requests: write
+  packages: read
+
+concurrency:
+  # One in-flight promotion per (env, tag) — re-dispatching the same promotion
+  # supersedes the previous attempt rather than racing two PRs to the same end.
+  group: promote-${{ github.event.inputs.environment }}-${{ github.event.inputs.source_sha_tag }}
+  cancel-in-progress: false
+
+env:
+  KUBECTL_VERSION: "v1.32.2"
+  HELM_VERSION: "v3.16.3"
+
+jobs:
+  promote:
+    name: Promote ${{ github.event.inputs.source_sha_tag }} → ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Validate inputs
+        id: validate
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          SRC_TAG: ${{ github.event.inputs.source_sha_tag }}
+        run: |
+          set -euo pipefail
+          case "${ENVIRONMENT}" in
+            staging|prod) ;;
+            *) echo "::error::environment must be 'staging' or 'prod', got '${ENVIRONMENT}'"; exit 1 ;;
+          esac
+          # The tag is the immutable artefact reference build-push-image.yml
+          # publishes: `sha-` + a 7-char git short SHA. Accept 7–40 hex so a
+          # full-length SHA tag also validates. Reject anything else up front —
+          # this string is interpolated into a registry reference + git rev-parse.
+          if ! [[ "${SRC_TAG}" =~ ^sha-[0-9a-f]{7,40}$ ]]; then
+            echo "::error::source_sha_tag must match '^sha-[0-9a-f]{7,40}$', got '${SRC_TAG}'"
+            exit 1
+          fi
+          echo "short_sha=${SRC_TAG#sha-}" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          # Full history so we can resolve the short SHA in source_sha_tag to a
+          # real commit on main (depth-1 would only contain the tip).
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Resolve source commit
+        id: commit
+        env:
+          SHORT_SHA: ${{ steps.validate.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          # Confirms the promoted tag names a commit that is actually on main —
+          # promoting a SHA that never merged would pin the cluster to an image
+          # whose source isn't in the deployed branch.
+          if ! full_sha="$(git rev-parse --verify "${SHORT_SHA}^{commit}" 2>/dev/null)"; then
+            echo "::error::${SHORT_SHA} does not resolve to a commit in this repo's history."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${full_sha}" HEAD; then
+            echo "::error::${SHORT_SHA} (${full_sha}) is not an ancestor of main — only soaked, merged commits can be promoted."
+            exit 1
+          fi
+          echo "full_sha=${full_sha}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved ${SHORT_SHA} → ${full_sha}"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rewrite overlay newTag for images built at this SHA
+        id: rewrite
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          SRC_TAG: ${{ github.event.inputs.source_sha_tag }}
+        run: |
+          set -euo pipefail
+          overlay="infra/kubernetes/overlays/${ENVIRONMENT}/kustomization.yaml"
+
+          # Surgical one-pass rewrite of a single image entry's newTag. Matches
+          # the `- name: <img>` line by EXACT string compare (not regex) so the
+          # `.` and `/` in the image reference need no escaping — sidesteps the
+          # awk-regex-escaping footgun, and stays anchored to exactly one entry.
+          rewrite_tag() {
+            local file="$1" img="$2" new_tag="$3"
+            awk -v img="$img" -v new_tag="$new_tag" '
+              BEGIN { pending = 0 }
+              {
+                line = $0
+                key = line
+                sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", key)
+                sub(/[[:space:]]*$/, "", key)
+                if (line ~ /^[[:space:]]*-[[:space:]]*name:[[:space:]]*/ && key == img) {
+                  pending = 1
+                  print
+                  next
+                }
+                if (pending == 1 && line ~ /^[[:space:]]*newTag:[[:space:]]*/) {
+                  sub(/newTag:[[:space:]]*.*/, "newTag: " new_tag, line)
+                  pending = 0
+                  print line
+                  next
+                }
+                print
+              }
+            ' "$file" > "$file.next"
+            mv "$file.next" "$file"
+          }
+
+          # Every distinct image reference declared in the target overlay.
+          mapfile -t images < <(grep -oE 'ghcr\.io/brickagcopra/[a-z0-9-]+' "$overlay" | sort -u)
+          echo "Overlay ${overlay} declares ${#images[@]} image(s)."
+
+          promoted=()
+          skipped=()
+          for img in "${images[@]}"; do
+            if docker manifest inspect "${img}:${SRC_TAG}" >/dev/null 2>&1; then
+              rewrite_tag "$overlay" "$img" "$SRC_TAG"
+              promoted+=("$img")
+              echo "  promote  ${img} -> ${SRC_TAG}"
+            else
+              skipped+=("$img")
+              echo "  skip     ${img} (no manifest at ${SRC_TAG})"
+            fi
+          done
+
+          if [[ ${#promoted[@]} -eq 0 ]]; then
+            echo "::error::No image in the ${ENVIRONMENT} overlay has a manifest at ${SRC_TAG}. Nothing to promote — check the tag and that its build run pushed successfully."
+            exit 1
+          fi
+
+          if git diff --quiet -- "$overlay"; then
+            echo "::error::${ENVIRONMENT} overlay already pins every built image at ${SRC_TAG}; no change to promote."
+            exit 1
+          fi
+
+          # Markdown bullet lists for the PR body (newline-safe via GITHUB_OUTPUT
+          # heredoc delimiters).
+          {
+            echo "promoted_count=${#promoted[@]}"
+            echo "skipped_count=${#skipped[@]}"
+          } >> "${GITHUB_OUTPUT}"
+          {
+            echo "promoted_md<<EOF_PROMOTED"
+            for i in "${promoted[@]}"; do echo "- \`${i}\` → \`${SRC_TAG}\`"; done
+            echo "EOF_PROMOTED"
+          } >> "${GITHUB_OUTPUT}"
+          {
+            echo "skipped_md<<EOF_SKIPPED"
+            if [[ ${#skipped[@]} -eq 0 ]]; then
+              echo "- _(none — every declared image was rebuilt at this SHA)_"
+            else
+              for i in "${skipped[@]}"; do echo "- \`${i}\` (unchanged — not rebuilt at this SHA)"; done
+            fi
+            echo "EOF_SKIPPED"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Install kubectl + helm (pre-flight render)
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          curl -fsSL -o "$tmp/kubectl" \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          install -m 0755 "$tmp/kubectl" /usr/local/bin/kubectl
+          curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+            | tar -xz -C "$tmp"
+          install -m 0755 "$tmp/linux-amd64/helm" /usr/local/bin/helm
+          kubectl version --client
+          helm version --short
+
+      - name: Pre-flight render rewritten overlay
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+        run: |
+          set -euo pipefail
+          # If the rewritten overlay can't render, the promotion is broken —
+          # fail here so we never open a PR that would only fail kubeconform on
+          # the merge commit (the GITHUB_TOKEN PR-check caveat in the header).
+          kubectl kustomize --enable-helm "infra/kubernetes/overlays/${ENVIRONMENT}" > /dev/null
+          echo "Rewritten ${ENVIRONMENT} overlay renders cleanly."
+
+      - name: Open promotion PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          SRC_TAG: ${{ github.event.inputs.source_sha_tag }}
+          FULL_SHA: ${{ steps.commit.outputs.full_sha }}
+          PROMOTED_MD: ${{ steps.rewrite.outputs.promoted_md }}
+          SKIPPED_MD: ${{ steps.rewrite.outputs.skipped_md }}
+          PROMOTED_COUNT: ${{ steps.rewrite.outputs.promoted_count }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          overlay="infra/kubernetes/overlays/${ENVIRONMENT}/kustomization.yaml"
+          branch="promote/${ENVIRONMENT}/${SRC_TAG}-${GITHUB_RUN_ID}"
+          repo_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+
+          git config user.name "${GIT_AUTHOR_NAME}"
+          git config user.email "${GIT_AUTHOR_EMAIL}"
+          git switch -c "${branch}"
+          git add "${overlay}"
+          git commit -m "chore(deploy): promote ${SRC_TAG} to ${ENVIRONMENT}" \
+                     -m "Promotes ${PROMOTED_COUNT} image(s) built at ${FULL_SHA}." \
+                     -m "Source commit: ${FULL_SHA}"
+          git push origin "${branch}"
+
+          # PR body written to a file (--body-file). Every line below sits at
+          # this run-block's base indentation so YAML's block-scalar dedent
+          # leaves the markdown flush-left — a deeper indent here would survive
+          # as 4+ leading spaces and render as an accidental code block.
+          cat > pr-body.md <<EOF
+          ## Promote \`${SRC_TAG}\` → \`${ENVIRONMENT}\`
+
+          Operator-dispatched promotion (TS-009g-followup-2). Rewrites the \`${ENVIRONMENT}\` overlay's \`newTag\` to the immutable image SHA for every service that was built at this commit.
+
+          **Source commit:** [\`${FULL_SHA}\`](${repo_url}/commit/${FULL_SHA})
+          **Build checks for this SHA:** ${repo_url}/commit/${FULL_SHA}/checks
+
+          ### Promoted (${PROMOTED_COUNT})
+          ${PROMOTED_MD}
+
+          ### Unchanged
+          ${SKIPPED_MD}
+
+          ### Reviewer verification checklist
+          - [ ] The source commit soaked in the lower environment (dev, and for a prod promotion also staging) with no rollback / alert.
+          - [ ] The build run linked above is green (image pushed; **Trivy** image scan passed — see the repo **Security → Code scanning** tab, category \`trivy-image-<service>\`).
+          - [ ] Image signature + provenance verify against this digest (cosign keyless / Rekor). Recipe in \`infra/docker/README.md\`:
+
+          \`\`\`
+          cosign verify \\
+            --certificate-identity-regexp \\
+              '^https://github\.com/${GITHUB_REPOSITORY_OWNER}/.+/\.github/workflows/build-push-image\.yml@refs/heads/main\$' \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
+            ghcr.io/brickagcopra/<service>:${SRC_TAG}
+          \`\`\`
+          - [ ] Rendered diff (the \`Kubernetes manifests\` checks, once triggered) is limited to \`newTag\` lines in this overlay.
+
+          > **Note — checks may not auto-run on this PR.** PRs opened by the built-in \`GITHUB_TOKEN\` do not fire workflow runs (GitHub recursion guard). The rewritten overlay was already render-validated (\`kubectl kustomize --enable-helm\`) inside the promotion run before this PR was opened, and the full \`kubernetes-validate\` gate fires on the merge commit. To force the PR's own checks pre-merge, push an empty commit or close/reopen. Wiring a bot PAT is TS-009g-followup-2a.
+
+          ---
+          🤖 Opened by the \`promote-overlay\` workflow · run ${repo_url}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+
+          # Idempotently ensure the label exists so --label can't hard-fail a
+          # fresh repo (gh errors if the label is missing).
+          gh label create deployment \
+            --color 0E8A16 \
+            --description "Deployment / overlay promotion PRs" 2>/dev/null || true
+
+          gh pr create \
+            --base main \
+            --head "${branch}" \
+            --title "chore(deploy): promote ${SRC_TAG} to ${ENVIRONMENT}" \
+            --body-file pr-body.md \
+            --label deployment
+
+          echo "Opened promotion PR for ${SRC_TAG} → ${ENVIRONMENT}."

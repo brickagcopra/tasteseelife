@@ -1,0 +1,484 @@
+// Trust & Safety bounded context — see PDD §7.2 (service inventory,
+// trust-safety-svc) and §16 (Trust & Safety Workflows). PRD §10.14 (incident
+// queue, welfare escalation, mandated-reporter pathway) + §11.4 (mandated
+// reporter compliance for elder abuse).
+//
+// Scope so far:
+//   - TS-300 ships the skeleton: the `trust_safety` Postgres schema, the
+//     `incidents` table (severity-triaged reports with SLA timers computed at
+//     insert), and the canonical `outbox_events` table (this service is the
+//     designated publisher of `welfare.flagged` — PDD §7.4 event catalog —
+//     which lands with TS-302). No HTTP surface beyond `/healthz` + `/readyz`
+//     yet; the intake endpoints (TS-301), escalation consumers (TS-302),
+//     mandated-reporter workflow (TS-303), booking holds (TS-304), and
+//     SLA-breach paging (TS-306) land in subsequent TS-30x slices.
+//
+// Severity → SLA model: `severity` is triaged at intake (PDD §16.1 "severity
+// triage (low / medium / high / critical) with SLA timers"); `sla_due_at` is
+// computed ONCE at insert (`opened_at` + the severity's budget — see
+// `src/modules/incidents/sla.ts`) and persisted so the future breach sweep
+// (TS-306) is a pure indexed scan, not a per-row recomputation. Re-triage
+// (severity change after open) is a TS-301+ concern and will recompute the
+// due date under audit.
+//
+// Each addition is a forward-compatible expand → migrate → contract migration
+// per CLAUDE.md §4.1; enum value sets evolve additively (`ALTER TYPE … ADD
+// VALUE`) per the TS-205 / TS-220 convention.
+//
+// Cross-service references are by id only — never a foreign key into another
+// service schema (CLAUDE.md §2.3, §4.1). `incidents.household_id` /
+// `senior_id` / `provider_id` are soft references into service-household /
+// service-provider; all nullable because an incident may concern any subset
+// of subjects (a provider-conduct report has no household; a billing report
+// has no provider).
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. The feature has been
+  // production-stable since Prisma 5.0 even though it remains under the
+  // `previewFeatures` umbrella in 5.x — see Prisma migration notes.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `trust_safety` Postgres schema. Every other service
+  // gets its own schema in the same database (Phase 1) or its own database
+  // entirely (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["trust_safety"]
+}
+
+/// Incident severity (PDD §16.1). Drives the SLA budget applied at insert —
+/// see `SLA_BUDGET_MINUTES` in `src/modules/incidents/sla.ts`.
+///
+/// Additive only — new levels arrive via `ALTER TYPE … ADD VALUE`.
+enum IncidentSeverity {
+  low
+  medium
+  high
+  critical
+
+  @@map("incident_severity")
+  @@schema("trust_safety")
+}
+
+/// Incident lifecycle (modeled on the concierge-ticket lifecycle, kept
+/// minimal for the skeleton):
+///
+///   `open`            = reported; in the untriaged queue.
+///   `triaging`        = a trust_safety operator owns it; severity/facts
+///                       under review.
+///   `awaiting_review` = escalated to the review committee / mandated-reporter
+///                       pathway (TS-303); paused on an external decision.
+///   `resolved`        = terminal; `resolved_at` + `resolution_notes` set.
+///
+/// Additive only — later slices may add states (e.g. a dismissed/duplicate
+/// terminal) via `ALTER TYPE … ADD VALUE`; they never repurpose these.
+enum IncidentStatus {
+  open
+  triaging
+  awaiting_review
+  resolved
+
+  @@map("incident_status")
+  @@schema("trust_safety")
+}
+
+/// Who filed the incident (TS-301 intake actors + TS-302 system ingestion).
+/// `system` covers event-driven incidents (welfare visit-flags, moderation
+/// webhooks, coupon-abuse sweeps) with no human filer.
+enum IncidentSource {
+  family
+  senior
+  provider
+  concierge
+  system
+
+  @@map("incident_source")
+  @@schema("trust_safety")
+}
+
+/// Incident category (TS-301 intake taxonomy — added in the TS-300 skeleton
+/// so the intake slice needs no expand migration).
+enum IncidentCategory {
+  welfare
+  safety
+  billing
+  conduct
+
+  @@map("incident_category")
+  @@schema("trust_safety")
+}
+
+/// A trust & safety incident (PRD §10.14; PDD §16.1). The severity-triaged
+/// unit of work for the trust_safety operator queue.
+model Incident {
+  id              String           @id @default(cuid())
+  /// Soft reference into service-household. Nullable — not every incident
+  /// concerns a household (e.g. provider-conduct reports).
+  householdId     String?          @map("household_id")
+  /// Soft reference to the senior the concern is about (service-household's
+  /// seniors directory). Nullable.
+  seniorId        String?          @map("senior_id")
+  /// Soft reference into service-provider. Nullable.
+  providerId      String?          @map("provider_id")
+  /// The verified `userId` of the actor who filed the report, stamped from the
+  /// access token — NEVER the request body (TS-301b). Nullable: system-sourced
+  /// incidents (TS-302) have no human filer.
+  ///
+  /// This is the only attribution a provider-filed incident carries: a
+  /// provider token is `tenantScope: global` with no `providerId` claim, so
+  /// `provider_id` stays NULL on that path and is resolved by async linkage at
+  /// triage (TS-301b-followup-1). Self-asserting `providerId` in the body was
+  /// rejected — it would let a provider pin a concern on another provider.
+  reporterUserId  String?          @map("reporter_user_id")
+  source          IncidentSource
+  category        IncidentCategory
+  severity        IncidentSeverity
+  status          IncidentStatus   @default(open)
+  /// The filer's free-text report (TS-301a intake; bounded at the contract
+  /// boundary — TRUST_SAFETY_REPORT_DESCRIPTION_MAX_LENGTH). Nullable:
+  /// system-sourced incidents (TS-302 event ingestion) carry no free text.
+  /// PII/PHI discipline: stored here, surfaced only through authorised ops
+  /// reads, NEVER carried on outbox events or logs (CLAUDE.md §3.9, §10).
+  description     String?
+  /// When the incident was reported (intake wall-clock, not row insert time —
+  /// a backfilled system event may open earlier than it lands).
+  openedAt        DateTime         @map("opened_at") @db.Timestamptz(6)
+  /// SLA deadline = `opened_at` + the severity's budget, computed at insert
+  /// (see sla.ts). The TS-306 breach sweep scans `sla_due_at < now()` over
+  /// unresolved rows via the partial index materialised in the migration.
+  slaDueAt        DateTime         @map("sla_due_at") @db.Timestamptz(6)
+  /// Terminal timestamp; NULL while the incident is live. Set together with
+  /// `status = resolved` by the resolution flow (TS-301+).
+  resolvedAt      DateTime?        @map("resolved_at") @db.Timestamptz(6)
+  resolutionNotes String?          @map("resolution_notes")
+  /// TS-307a — the outbox `event_id` that produced this incident, for
+  /// event-sourced intake only. NULL for every human-filed report (TS-301a /
+  /// TS-301b / the concierge on-behalf path), which arrives over HTTP with
+  /// nothing to key on.
+  ///
+  /// This is the DOMAIN-level idempotency guard, and it is deliberately not
+  /// the same thing as the consumer SDK's `outbox_consumer_dedup` table. That
+  /// table is a cache of processing decisions; truncate it, restore an older
+  /// snapshot, or rename the consumer group, and every event replays. For
+  /// this consumer a replay means a duplicate incident — a second SLA clock,
+  /// a second queue row, and for a high/critical grade a second booking hold
+  /// and a second page to on-call. The partial UNIQUE below is what is still
+  /// true after that kind of operational accident.
+  sourceEventId   String?          @map("source_event_id")
+  /// TS-308c-followup-2 — which detector opened this incident. NULL for
+  /// every human-filed report. Validated against
+  /// `TrustSafetySystemEvidenceSchema`'s discriminator at the service layer;
+  /// TEXT in DB so adding a fourth detector needs no `CREATE TYPE`
+  /// migration, same convention as `bookings.cancellation_reason`.
+  ///
+  /// Stored SEPARATELY from `system_facts` on purpose: if a stored blob ever
+  /// fails to parse (schema evolved, row written by an older build), the
+  /// console must still be able to name the detector rather than render an
+  /// incident with no explanation at all — which is the exact failure this
+  /// pair exists to fix.
+  detector        String?
+  /// The evidence the detector recorded — the numbers that justified the
+  /// incident. NULL for human-filed reports, whose account lives in
+  /// `description`.
+  ///
+  /// **This is NOT a free-text channel and must never become one.** It is
+  /// written only after validating against a DISCRIMINATED UNION of
+  /// explicitly-typed variants (`TrustSafetySystemEvidenceSchema`), every
+  /// field of which is a scalar, an opaque id, or a timestamp. Free text is
+  /// precisely what the source events refuse to carry — a check-in location
+  /// is a senior's home address, a cancellation reason says something about a
+  /// named senior's circumstances — and an untyped bag here would become the
+  /// channel for it the first time someone wanted "a bit more context".
+  /// Anything added to it goes through the contract first (CLAUDE.md §3.9,
+  /// §5.3).
+  systemFacts     Json?            @map("system_facts")
+  createdAt       DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The mandated-reporter case opened against this incident, if triage
+  /// routed it into the statutory pathway (TS-303a). At most one; its
+  /// presence in a non-`signed_off` state blocks resolution.
+  mandatedReporterCase MandatedReporterCase?
+
+  /// Subject-id scrolls: "incidents for household X / senior Y / provider Z"
+  /// are the operator queue's dominant filters (PDD §16.1 360-view) and the
+  /// row-level scoping predicates (CLAUDE.md §3.2).
+  @@index([householdId], map: "trust_safety_incidents_household_id_idx")
+  @@index([seniorId], map: "trust_safety_incidents_senior_id_idx")
+  @@index([providerId], map: "trust_safety_incidents_provider_id_idx")
+  /// "Incidents filed by actor X" — the abuse-pattern predicate for the
+  /// operator queue (one actor flooding reports is itself a trust signal) and
+  /// the row-level scoping predicate for "my reports" reads.
+  @@index([reporterUserId], map: "trust_safety_incidents_reporter_user_id_idx")
+  /// TS-307a — "at most one incident per source event". PARTIAL (`WHERE
+  /// source_event_id IS NOT NULL`), materialised in the migration: the
+  /// invariant is not "every incident has a source event", and a non-partial
+  /// UNIQUE would say the wrong thing about the human-filed majority.
+  /// Prisma cannot express the partial predicate, so this attribute is
+  /// declared for client typing and the migration owns the real DDL.
+  @@unique([sourceEventId], map: "trust_safety_incidents_source_event_id_key")
+  @@map("incidents")
+  @@schema("trust_safety")
+}
+
+/// Whether the platform is a *mandated* reporter of suspected elder abuse in
+/// a given state, a *permissive* reporter (may report, no legal duty), or
+/// not yet determined. Drives whether the workflow's filing step is a legal
+/// obligation or a discretionary act (TS-303a).
+///
+/// `undetermined` is the DEFAULT and the honest initial state: the duty turns
+/// on facts about the platform's role (are our providers "caregivers" under
+/// the statute?) that only counsel can settle, per state. A jurisdiction row
+/// sitting at `undetermined` is a to-do for the compliance team, not a
+/// finding that no duty exists.
+enum MandatedReporterPlatformRole {
+  mandated
+  permissive
+  undetermined
+
+  @@map("mandated_reporter_platform_role")
+  @@schema("trust_safety")
+}
+
+/// Lifecycle of a mandated-reporter case (PDD §16.1 "mandated reporter
+/// pathway for suspected elder abuse with clear documentation"; CLAUDE.md §12
+/// "Never auto-close").
+///
+///   `screening`      = opened at triage; reportability under assessment.
+///   `filing_prep`    = determined reportable; documentation being assembled
+///                      for the state agency.
+///   `filed`          = report filed; `filed_at` + `filing_reference` set.
+///   `not_reportable` = assessed and determined NOT reportable. NOT terminal —
+///                      a negative determination still needs a second pair of
+///                      eyes, which is the whole point of the signoff gate.
+///   `signed_off`     = a reviewer other than the case owner has signed off.
+///                      The ONLY terminal state, and the only one that lets
+///                      the parent incident resolve.
+///
+/// Additive only — new states arrive via `ALTER TYPE … ADD VALUE`.
+enum MandatedReporterCaseStatus {
+  screening
+  filing_prep
+  filed
+  not_reportable
+  signed_off
+
+  @@map("mandated_reporter_case_status")
+  @@schema("trust_safety")
+}
+
+/// Per-state mandated-reporter workflow kit (PDD §16.4 "Mandated reporter
+/// laws by state — workflow kit per state").
+///
+/// **This is legal reference data and the platform does not author it.**
+/// Every row ships `verified = false` and MUST be populated from
+/// counsel-reviewed sources before the workflow relies on it; the service
+/// layer refuses to advance a case to `filing_prep` against an unverified
+/// jurisdiction (see `mandated-reporter.service.ts`). Reporting duties,
+/// recipient agencies, and statutory deadlines vary materially by state and
+/// change by legislative session — a wrong number here is a missed elder-abuse
+/// report, so the code's job is to make "we have not checked this state yet"
+/// loud rather than to guess. Same posture as TS-300's placeholder SLA
+/// budgets, one severity level up.
+///
+/// Platform-wide reference data — NOT tenant-scoped (the only such model in
+/// this schema; registered in `unscopedModels`).
+model MandatedReporterJurisdiction {
+  /// USPS two-letter state / territory code, uppercase. Natural PK: there is
+  /// exactly one row per jurisdiction and the code is the lookup key from an
+  /// incident's state of residence.
+  stateCode              String                       @id @map("state_code") @db.Char(2)
+  /// Adult Protective Services (or equivalent) agency that receives reports.
+  agencyName             String?                      @map("agency_name")
+  /// Statewide reporting hotline. Not PII — a published agency number.
+  reportingPhone         String?                      @map("reporting_phone")
+  /// Online reporting portal, where the state offers one.
+  reportingUrl           String?                      @map("reporting_url")
+  /// Statutory window from suspicion to filing, in hours. NULL = not yet
+  /// established for this state. Drives `mandated_reporter_cases.statutory_due_at`.
+  statutoryDeadlineHours Int?                         @map("statutory_deadline_hours")
+  platformRole           MandatedReporterPlatformRole @default(undetermined) @map("platform_role")
+  /// Statute citation the determination rests on (e.g. a code section).
+  /// Free text — the point is traceability to a source, not parseability.
+  statuteCitation        String?                      @map("statute_citation")
+  /// FALSE until compliance has reviewed this row against primary sources.
+  /// The gate the service layer enforces.
+  verified               Boolean                      @default(false)
+  verifiedAt             DateTime?                    @map("verified_at") @db.Timestamptz(6)
+  /// The `userId` who recorded the verification — accountability for a legal
+  /// determination (CLAUDE.md §3.6).
+  verifiedByUserId       String?                      @map("verified_by_user_id")
+  /// Compliance working notes (e.g. "duty applies only to facility staff —
+  /// confirm whether our providers qualify").
+  notes                  String?
+  createdAt              DateTime                     @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime                     @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  cases MandatedReporterCase[]
+
+  /// "Which states are still unverified" — the compliance backlog scroll.
+  /// Materialised as a PARTIAL index on `verified = false` in the migration.
+  @@map("mandated_reporter_jurisdictions")
+  @@schema("trust_safety")
+}
+
+/// A mandated-reporter case opened against an incident (PRD §10.14
+/// "mandatory reporter workflow integration"; §11.4).
+///
+/// **The row's existence IS the "suspected elder abuse" tag.** There is no
+/// separate flag and no derivation from category/severity: routing an
+/// incident into a statutory filing pathway is a legal judgement a trained
+/// operator makes, and auto-deriving it from `category = welfare AND severity
+/// >= high` would manufacture filings against families who reported a missed
+/// meal. The filer-facing category taxonomy is deliberately left alone
+/// (welfare / safety / billing / conduct) — a family should not be asked to
+/// pick "abuse" out of a dropdown (CLAUDE.md §12, hospitality not clinical);
+/// triage does the classification.
+///
+/// **Never auto-close (CLAUDE.md §12).** A live case blocks its incident from
+/// resolving — enforced in `MandatedReporterService.assertIncidentResolvable`,
+/// which every resolution path must call. Only `signed_off` releases the
+/// block, and signoff requires a reviewer who is not the case owner.
+model MandatedReporterCase {
+  id                 String                     @id @default(cuid())
+  /// The incident this case documents. UNIQUE — one case per incident, which
+  /// also makes `openCase` naturally idempotent under retry.
+  incidentId         String                     @unique @map("incident_id")
+  incident           Incident                   @relation(fields: [incidentId], references: [id], onDelete: Restrict)
+  /// Jurisdiction whose law governs — the senior's state of residence,
+  /// recorded by the operator at open time. NOT derived cross-service:
+  /// trust-safety cannot read service-household's tables (CLAUDE.md §2.3),
+  /// and the applicable-law question is a human determination regardless.
+  stateCode          String                     @map("state_code") @db.Char(2)
+  jurisdiction       MandatedReporterJurisdiction @relation(fields: [stateCode], references: [stateCode], onDelete: Restrict)
+  status             MandatedReporterCaseStatus @default(screening)
+  /// The operator who opened the case (verified `userId` from the token).
+  openedByUserId     String                     @map("opened_by_user_id")
+  openedAt           DateTime                   @map("opened_at") @db.Timestamptz(6)
+  /// `opened_at` + the jurisdiction's statutory window, stamped at open time
+  /// when the window is known. NULL when the state's deadline is not yet
+  /// established — which is itself the signal that the jurisdiction row needs
+  /// compliance attention.
+  statutoryDueAt     DateTime?                  @map("statutory_due_at") @db.Timestamptz(6)
+  filedAt            DateTime?                  @map("filed_at") @db.Timestamptz(6)
+  /// The agency's confirmation / case number for the filing. Operational
+  /// identifier, not PII.
+  filingReference    String?                    @map("filing_reference")
+  /// The operator's reportability assessment and filing narrative. Carries
+  /// PHI/PII by nature — surfaced only through authorised ops reads, NEVER on
+  /// outbox events or logs (CLAUDE.md §3.9, §10).
+  determinationNotes String?                    @map("determination_notes")
+  /// Reviewer signoff (CLAUDE.md §12 "Never auto-close"). Set together with
+  /// `status = signed_off`; the service layer rejects a reviewer equal to
+  /// `opened_by_user_id`.
+  reviewerUserId     String?                    @map("reviewer_user_id")
+  reviewedAt         DateTime?                  @map("reviewed_at") @db.Timestamptz(6)
+  reviewerNotes      String?                    @map("reviewer_notes")
+  createdAt          DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The operator queue's dominant scroll: open cases by status.
+  @@index([status], map: "trust_safety_mandated_reporter_cases_status_idx")
+  /// "What is about to blow its statutory deadline" — the sweep predicate.
+  /// Materialised as a PARTIAL index over non-terminal cases in the migration.
+  @@index([stateCode], map: "trust_safety_mandated_reporter_cases_state_code_idx")
+  @@map("mandated_reporter_cases")
+  @@schema("trust_safety")
+}
+
+model OutboxEvent {
+  /// Dedup key — consumers idempotency-check on this. UUID v4 from the SDK by
+  /// default; the producer passes an explicit id for exactly-once-effective
+  /// cross-boundary delivery.
+  eventId         String    @id @map("event_id")
+  /// Dot-notation event name from `packages/contracts/events`. Validated by the
+  /// SDK against the registry before insert — unknown names are rejected at the
+  /// producer boundary.
+  eventName       String    @map("event_name")
+  /// Validated domain payload (validated by the SDK against the matching
+  /// `eventRegistry` schema before insert).
+  payload         Json
+  /// Producer wall-clock time the event semantically happened.
+  occurredAt      DateTime  @map("occurred_at") @db.Timestamptz(6)
+  /// Service name that produced the row (`service-trust-safety`).
+  producerService String    @map("producer_service")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Stamped by the relay once forwarded onto the bus. Null = undispatched +
+  /// eligible for the next poll cycle.
+  dispatchedAt    DateTime? @map("dispatched_at") @db.Timestamptz(6)
+  /// Failed-dispatch counter. The relay dead-letters once it reaches MAX_ATTEMPTS.
+  attempts        Int       @default(0)
+  /// Stamped by the relay on the most recent failed attempt.
+  lastAttemptAt   DateTime? @map("last_attempt_at") @db.Timestamptz(6)
+  /// Most recent failure message — capped at 2000 chars at the relay.
+  lastError       String?   @map("last_error")
+
+  /// Secondary scroll by event_name (admin filters / metrics). The relay's
+  /// dominant "next batch of undispatched rows ordered by created_at" read is
+  /// served by a PARTIAL index on `dispatched_at IS NULL` that Prisma's
+  /// `@@index` cannot express — materialised in the migration SQL (CLAUDE.md §7.3).
+  @@index([eventName], map: "trust_safety_outbox_events_event_name_idx")
+  @@map("outbox_events")
+  @@schema("trust_safety")
+}
+
+/// Consumer-side redelivery guard for events this service CONSUMES
+/// (TS-302a; PDD §7.3; CLAUDE.md §5.3).
+///
+/// Canonical shape shared by every consuming service (service-accounting,
+/// service-analytics, service-audit) — the
+/// `@taste-and-see/nest-outbox-consumer` SDK is schema-agnostic and owns
+/// every write to this table via `PgConsumerDedupStore`. Service code
+/// should never read or write it directly.
+///
+/// This is the SDK's SECONDARY line of defence. The primary is a
+/// domain-level UNIQUE on the side effect itself (TS-302d adds
+/// `incidents.source_event_id`), so a truncated dedup table still cannot
+/// double-open a welfare incident — which on this surface would mean a
+/// duplicate SLA timer and a duplicate page to on-call.
+model OutboxConsumerDedup {
+  /// Consumer group name — the consuming service's name by convention
+  /// (`service-trust-safety`). Part of the composite PK.
+  consumerGroup  String    @map("consumer_group")
+  /// Event id stamped by the producer at outbox-append time. Part of the
+  /// composite PK; the dedup invariant is enforced at the PK layer.
+  eventId        String    @map("event_id")
+  /// Dot-notation event name. Captured so the row is self-describing
+  /// without joining back to the consumer-side handler registry.
+  eventName      String    @map("event_name")
+  /// Three-valued lifecycle: `in_flight` | `processed` | `dead_lettered`.
+  /// The CHECK constraint lives in the migration.
+  state          String
+  /// Monotonic attempt counter, incremented by the SDK's `recordAttempt`.
+  attempts       Int       @default(1)
+  /// Truncated to 2000 chars by the SDK's `recordFailure` path.
+  lastError      String?   @map("last_error")
+  /// Wall-clock time the consumer first saw the event — SLA + lag dashboards.
+  firstSeenAt    DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  /// Stamped on every attempt.
+  lastAttemptAt  DateTime  @default(now()) @map("last_attempt_at") @db.Timestamptz(6)
+  /// Stamped on success; NULL until then.
+  processedAt    DateTime? @map("processed_at") @db.Timestamptz(6)
+  /// Stamped when state flips to `dead_lettered`.
+  deadLetteredAt DateTime? @map("dead_lettered_at") @db.Timestamptz(6)
+
+  @@id([consumerGroup, eventId])
+  @@map("outbox_consumer_dedup")
+  @@schema("trust_safety")
+}

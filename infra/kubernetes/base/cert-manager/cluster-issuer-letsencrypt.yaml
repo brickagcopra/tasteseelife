@@ -1,0 +1,48 @@
+# ClusterIssuer for Let's Encrypt via HTTP-01 against the NGINX
+# Ingress class.
+#
+# Two issuers ship from the base: `letsencrypt-staging` (rate-limit
+# friendly, untrusted certs — used by dev/staging overlays) and
+# `letsencrypt-prod` (real trusted certs — used only by the prod
+# overlay).
+#
+# `email` is intentionally a placeholder value. Each env overlay
+# patches it to the operator's real address — Let's Encrypt sends
+# expiry warnings + policy updates to this address. Per CLAUDE.md
+# §17.11, the address is not hardcoded in the shared base.
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: ops-placeholder@invalid.local
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ops-placeholder@invalid.local
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+      - http01:
+          ingress:
+            class: nginx

@@ -1,0 +1,49 @@
+{
+  "name": "@taste-and-see/nest-internal-trust",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Shared trust-header signing + verification for the Taste & See platform. The api-gateway (producer) mints an HMAC-SHA256-signed envelope from the verified RequestContext; every downstream service (verifier) recomputes the signature, checks the timestamp window, and rebuilds the RequestContext from the envelope. See CLAUDE.md §3.2, PDD §7.2. Lands TS-140-followup-1 + TS-140-followup-8.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@taste-and-see/auth-sdk": "workspace:*",
+    "zod": "3.23.8"
+  },
+  "peerDependencies": {
+    "@nestjs/common": "^11.0.0",
+    "reflect-metadata": "^0.2.0"
+  },
+  "devDependencies": {
+    "@nestjs/common": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/express": "5.0.0",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "reflect-metadata": "0.2.2",
+    "rimraf": "6.0.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

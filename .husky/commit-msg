@@ -1,0 +1,4 @@
+# commit-msg hook — enforces Conventional Commits via commitlint.
+# See `commitlint.config.cjs` and CLAUDE.md §2.4.
+
+pnpm exec commitlint --edit "$1"

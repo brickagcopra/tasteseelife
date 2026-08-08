@@ -1,0 +1,38 @@
+{
+  "name": "@taste-and-see/web-provider",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Taste & See provider portal (Next.js 15 + React 19, App Router). TS-122 skeleton: login + tiered provider signup + provider dashboard placeholder. Server actions front the api-gateway BFF (apps/api-gateway) so the browser never contacts service-identity / service-subscription / service-provider directly.",
+  "scripts": {
+    "dev": "next dev -p 3200",
+    "build": "next build",
+    "start": "next start -p 3200",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "next lint --max-warnings=0",
+    "clean": "rimraf .next tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@hookform/resolvers": "3.10.0",
+    "@sentry/nextjs": "10.69.0",
+    "@taste-and-see/contracts": "workspace:*",
+    "@taste-and-see/design-tokens": "workspace:*",
+    "@taste-and-see/sentry": "workspace:*",
+    "next": "15.1.0",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "react-hook-form": "7.54.2",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/node": "22.10.1",
+    "@types/react": "19.0.0",
+    "@types/react-dom": "19.0.0",
+    "eslint": "8.57.0",
+    "eslint-config-next": "15.1.0",
+    "rimraf": "6.0.1",
+    "typescript": "5.5.4"
+  }
+}

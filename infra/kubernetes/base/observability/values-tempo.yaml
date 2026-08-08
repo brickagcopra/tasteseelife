@@ -1,0 +1,50 @@
+# Tempo Helm values — monolithic single-binary chart (grafana/tempo)
+# with local (on-disk) trace storage and OTLP receivers enabled. The
+# distributed topology (tempo-distributed) + object-storage backend is
+# a Phase-2/3 follow-up when trace volume warrants it.
+#
+# Services emit OTLP via @taste-and-see/tracing's OTEL SDK
+# (OTEL_EXPORTER_OTLP_ENDPOINT). Point them at
+# http://tempo.observability.svc.cluster.local:4318 (HTTP) or :4317
+# (gRPC) — wiring that env var per service is a follow-up; this slice
+# stands up the receiver.
+#
+# Author-blind (no local helm) — CI's kubeconform --enable-helm render
+# is the gate. chart grafana/tempo 1.14.0.
+tempo:
+  retention: 168h # 7 days
+  storage:
+    trace:
+      backend: local
+      local:
+        path: /var/tempo/traces
+      wal:
+        path: /var/tempo/wal
+  # OTLP is the platform's only span ingest protocol (CLAUDE.md §10 /
+  # PDD §7.2 OpenTelemetry SDK). Enable both transports.
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  # Don't phone home to grafana.com from a closed cluster.
+  reportingEnabled: false
+
+persistence:
+  enabled: true
+  size: 10Gi
+
+# Tempo exposes its own /metrics; let Prometheus pick it up via the
+# annotation-discovery job rather than a chart ServiceMonitor (we keep
+# one scrape mechanism for app-adjacent targets in Phase 1).
+serviceMonitor:
+  enabled: false

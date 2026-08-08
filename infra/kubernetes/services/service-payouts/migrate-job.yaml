@@ -1,0 +1,101 @@
+# Database migrations for service-payouts (TS-151-followup-12).
+#
+# **Why this Job exists.** Nothing on this platform applied Prisma migrations.
+# CLAUDE.md §4.4 says "run migrations through CI before deployment", but no such
+# CI step was ever built, and on the Phase-1 topology there is no route from a
+# GitHub runner to a Postgres that lives on a private Contabo VLAN. So the
+# migration runs inside the cluster, from the dedicated `service-payouts-migrator`
+# image (`infra/docker/nestjs.Dockerfile`, `migrator` stage) — the service
+# image carries the generated client but no schema, no migration history, and
+# no Prisma CLI.
+#
+# **PreSync at wave -10.** The schema must be ahead of the pods that query it,
+# and ahead of the seed Jobs that write rows into the tables it creates (those
+# run at the default wave 0). A failed migration aborts the sync, which is the
+# correct outcome: pods rolling onto a schema that did not land is the failure
+# this Job exists to prevent.
+#
+# **Safe on every sync.** `prisma migrate deploy` applies only migrations
+# absent from `_prisma_migrations` and takes an advisory lock, so a sync that
+# changes no schema does nothing, and two concurrent runs cannot interleave.
+# It never generates, never resets, and never prompts.
+#
+# **Only `DATABASE_URL` is injected** — not the service's whole Secret via
+# `envFrom`, which is what the seed Jobs do. A migration needs one credential,
+# and this pod has no reason to hold Stripe keys or signing secrets.
+#
+# The image carries no tag pin of its own: the overlays' `images:` directive
+# is keyed on the image NAME, so this Job inherits the same per-environment tag
+# as the Deployment, and the promotion workflow moves both to one SHA together.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: service-payouts-migrate
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # BeforeHookCreation, NOT HookSucceeded: the pod logs are the only record of
+    # which migrations were applied. Keep the last run until the next replaces it.
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    # Ahead of every other PreSync hook. The seed Jobs (wave 0) write rows into
+    # tables these migrations create.
+    argocd.argoproj.io/sync-wave: "-10"
+    ignore-check.kube-linter.io/no-readiness-probe: "A one-shot Job serves no traffic and has nothing to be ready for."
+    ignore-check.kube-linter.io/no-liveness-probe: "A one-shot Job is bounded by backoffLimit + activeDeadlineSeconds, not by a probe."
+spec:
+  # A partially-applied migration is not retried into correctness — Prisma marks
+  # it failed and `migrate deploy` refuses to continue until an operator
+  # resolves it. The retries are here for the transient case (database not yet
+  # accepting connections), not the logical one.
+  backoffLimit: 2
+  # Longer than the seed Jobs' 300s: a migration on a table with real rows is
+  # legitimately slower than an upsert of a fixed catalog. Still bounded, so a
+  # migration blocked on a lock fails the sync instead of holding it open.
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: db-migrate
+    spec:
+      restartPolicy: Never
+      serviceAccountName: service-payouts
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ghcr.io/brickagcopra/service-payouts-migrator:replace-me
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: service-payouts-secrets
+                  key: DATABASE_URL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            # The image sets HOME=/tmp; the Prisma CLI wants a writable home
+            # even with CHECKPOINT_DISABLE set. readOnlyRootFilesystem makes
+            # this mount load-bearing, not decorative.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

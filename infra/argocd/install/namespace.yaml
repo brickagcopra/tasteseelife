@@ -1,0 +1,26 @@
+# ArgoCD's home namespace.
+#
+# Kept separate from `platform-system` so an operator can `kubectl delete ns
+# argocd` for a hard reset without disturbing cert-manager / NGINX Ingress /
+# other system-tier workloads. The Argo Helm chart installs every controller
+# (server, application-controller, repo-server, redis, applicationset-controller,
+# notifications-controller, dex) into this single namespace.
+#
+# PSS labelled `baseline` to match the rest of the system tier. The upstream
+# ArgoCD chart is not restricted-PSS-clean out of the box (the repo-server
+# pods need `git`/`helm` binaries and a writable working directory); tightening
+# to `restricted` is captured as TS-152-followup-3 once the upstream chart
+# catches up or we ship a sidecar pattern that satisfies the bar.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argocd
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest

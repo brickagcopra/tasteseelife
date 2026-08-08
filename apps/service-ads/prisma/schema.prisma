@@ -1,0 +1,448 @@
+// Ads & promotions bounded context — see PDD §7.2 (service inventory entry
+// #14, ads-svc) and §18 (Ads & Promotions Subsystem: inventory model,
+// delivery, compliance & approval). PRD §10.9 Systemwide Ads Management
+// System.
+//
+// Scope so far:
+//   - TS-270 ships the skeleton: the `ads` Postgres schema and the four
+//     core tables — `ad_campaigns`, `ad_creatives`, `ad_placements`,
+//     `ad_targeting_rules` (PDD §8.2). No HTTP surface beyond `/healthz` +
+//     `/readyz` yet, and no delivery / capture endpoints (those land across
+//     TS-271..TS-279).
+//
+// Each addition is a forward-compatible expand → migrate → contract migration
+// per CLAUDE.md §4.1; enum value sets evolve additively (`ALTER TYPE … ADD
+// VALUE`) per the TS-205 / TS-220 convention.
+//
+// Cross-service references are by id only — never a foreign key into another
+// service schema (CLAUDE.md §2.3, §4.1). `ad_campaigns.advertiser_id` is a
+// soft FK (into service-partner / service-provider, or null for an internal
+// house ad); the impression / click capture stream (TS-275) lands in the
+// Cassandra `ads.impressions` keyspace (PDD §8.3), not here. In-schema
+// relations (`ad_creatives.campaign_id`, `ad_targeting_rules.campaign_id` →
+// `ad_campaigns.id`) are declared FKs because they live inside this service's
+// own `ads` schema.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. The feature has been
+  // production-stable since Prisma 5.0 even though it remains under the
+  // `previewFeatures` umbrella in 5.x — see Prisma migration notes.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `ads` Postgres schema. Every other service gets its
+  // own schema in the same database (Phase 1) or its own database entirely
+  // (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["ads"]
+}
+
+/// Who an ad campaign belongs to (PDD §8.2 `advertiser_kind`).
+///
+///   `partner`  = a partner organisation's co-marketing slot (PDD §18.1
+///                "partner co-marketing card"). `advertiser_id` → service-partner.
+///   `provider` = a sponsored provider listing (PRD §10.9; the search-results
+///                sponsored slot of TS-218). `advertiser_id` → service-provider.
+///   `internal` = a Taste & See house ad (e.g. an upgrade nudge). `advertiser_id`
+///                is null — there is no external advertiser entity.
+///
+/// Additive only — new kinds arrive via `ALTER TYPE … ADD VALUE`.
+enum AdvertiserKind {
+  partner
+  provider
+  internal
+
+  @@map("advertiser_kind")
+  @@schema("ads")
+}
+
+/// Lifecycle of a campaign (PDD §18.1 — budget-bound, start/end-dated).
+///
+///   `draft`     = being built in the admin UI; not eligible for delivery.
+///   `scheduled` = approved + dated, awaiting its `start_at`.
+///   `active`    = currently eligible for delivery.
+///   `paused`    = temporarily suspended (budget hold / manual pause).
+///   `completed` = ran to its `end_at` or exhausted budget.
+///   `archived`  = retired; retained for reporting, never delivered.
+///
+/// Additive only — new states arrive via `ALTER TYPE … ADD VALUE`.
+enum AdCampaignStatus {
+  draft
+  scheduled
+  active
+  paused
+  completed
+  archived
+
+  @@map("ad_campaign_status")
+  @@schema("ads")
+}
+
+/// The rendered form of a creative + the creative kinds a slot supports (PDD
+/// §18.1 inventory model — banner placements, sponsored provider listings,
+/// sponsored content, partner co-marketing slots).
+///
+/// Additive only — new kinds arrive via `ALTER TYPE … ADD VALUE`.
+enum AdCreativeKind {
+  banner
+  sponsored_listing
+  sponsored_content
+  partner_card
+
+  @@map("ad_creative_kind")
+  @@schema("ads")
+}
+
+/// Review lifecycle of a creative (PDD §18.3 — creative approval workflow on
+/// `marketing:approve_creative`, accessibility + disclosure compliance).
+///
+///   `draft`          = being authored; not submitted.
+///   `pending_review` = submitted, awaiting `marketing:approve_creative`.
+///   `approved`       = cleared compliance + accessibility; deliverable.
+///   `rejected`       = failed review; carries no deliverability.
+///   `archived`       = retired.
+///
+/// Additive only — new states arrive via `ALTER TYPE … ADD VALUE`.
+enum AdCreativeStatus {
+  draft
+  pending_review
+  approved
+  rejected
+  archived
+
+  @@map("ad_creative_status")
+  @@schema("ads")
+}
+
+/// Targeting-rule dimension (PDD §18.1 — geography, persona, tier, behaviour
+/// cohort, household composition). The rule's `value` carries the dimension's
+/// payload (a JSON AST in TS-273; see `AdTargetingRule.value`).
+///
+/// Additive only — new kinds arrive via `ALTER TYPE … ADD VALUE`.
+enum AdTargetingRuleKind {
+  geography
+  persona
+  tier
+  behavior_cohort
+  household_composition
+
+  @@map("ad_targeting_rule_kind")
+  @@schema("ads")
+}
+
+/// Lifecycle of a slot schedule — a binding of a campaign to a placement over
+/// a delivery window (TS-272). Mirrors the campaign lifecycle but is its own
+/// axis: a schedule can be paused without pausing the campaign it serves.
+///
+///   `scheduled` = booked into the slot, awaiting its `start_at`.
+///   `active`    = currently eligible to fill the slot.
+///   `paused`    = temporarily suspended (manual hold) — not delivering.
+///   `completed` = ran to its `end_at`.
+///   `archived`  = retired; retained for reporting, never delivered.
+///
+/// Additive only — new states arrive via `ALTER TYPE … ADD VALUE`.
+enum AdSlotScheduleStatus {
+  scheduled
+  active
+  paused
+  completed
+  archived
+
+  @@map("ad_slot_schedule_status")
+  @@schema("ads")
+}
+
+/// An advertiser-bound, budget-bound campaign (PDD §8.2, §18.1). Carries the
+/// creatives delivered for it + the targeting rules evaluated at delivery
+/// time. Platform-wide marketing-admin inventory — NO per-household tenant
+/// axis (declared in `unscopedModels`; see `app.module.ts`).
+///
+/// `advertiserId` is a soft FK (CLAUDE.md §2.3 — id only, never a cross-service
+/// FK): service-partner for `partner`, service-provider for `provider`, NULL
+/// for an `internal` house ad. `budget` is the optional spend cap (NULL =
+/// uncapped); money is `Decimal(12,2)` + an explicit `currency` column
+/// (CLAUDE.md §4.1 — no floats for money, ever). Phase 1 is USD-only.
+model AdCampaign {
+  id            String           @id @default(cuid())
+  /// Operator-facing campaign name (admin UI / reporting label).
+  name          String
+  advertiserKind AdvertiserKind  @map("advertiser_kind")
+  /// Soft FK to the advertiser entity; NULL for an internal house ad.
+  advertiserId  String?          @map("advertiser_id")
+  status        AdCampaignStatus @default(draft)
+  /// Optional total spend cap. NULL = uncapped. `Decimal(12,2)` (CLAUDE.md §4.1).
+  budget        Decimal?         @db.Decimal(12, 2)
+  /// ISO-4217 currency for `budget`. Phase 1: always `USD`.
+  currency      String           @default("USD")
+  /// Delivery window start; NULL until scheduled.
+  startAt       DateTime?        @map("start_at") @db.Timestamptz(6)
+  /// Delivery window end; NULL for open-ended.
+  endAt         DateTime?        @map("end_at") @db.Timestamptz(6)
+  createdAt     DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  creatives      AdCreative[]
+  targetingRules AdTargetingRule[]
+  slotSchedules  AdSlotSchedule[]
+
+  /// Status-filtered admin view ("which campaigns are active / paused").
+  @@index([status], map: "ad_campaigns_status_idx")
+  /// "Campaigns for this advertiser" — the partner / provider reporting read.
+  @@index([advertiserKind, advertiserId], map: "ad_campaigns_advertiser_idx")
+  @@map("ad_campaigns")
+  @@schema("ads")
+}
+
+/// A renderable creative asset bound to a campaign (PDD §8.2, §18.1). One
+/// campaign carries one or more creatives (e.g. A/B variants — TS-279).
+/// Platform-wide inventory, NO tenant axis (`unscopedModels`).
+///
+/// `assetKeys` are S3 object keys issued + processed through the mandatory
+/// media pipeline (`media-svc`; CLAUDE.md §3.4 — magic-byte validation, virus
+/// scan, resize). `ctaUrl` is the click-through destination; `body` is
+/// optional supporting copy.
+model AdCreative {
+  id          String           @id @default(cuid())
+  campaignId  String           @map("campaign_id")
+  kind        AdCreativeKind
+  /// S3 object keys for the creative's processed assets (media-svc).
+  assetKeys   String[]         @map("asset_keys")
+  headline    String
+  /// Optional supporting copy.
+  body        String?
+  /// Click-through destination URL. Optional (a non-clickable house banner).
+  ctaUrl      String?          @map("cta_url")
+  status      AdCreativeStatus @default(draft)
+  /// ── Accessibility metadata (TS-277; PDD §18.3). The declared inputs the
+  ///    approval-queue accessibility checks evaluate (alt-text presence, WCAG
+  ///    contrast, motion sensitivity, mandatory-disclosure acknowledgement).
+  ///    All nullable / defaulted — a creative starts without them and the
+  ///    author fills them in before submitting for review.
+  /// Screen-reader alt text for the primary asset (image-bearing kinds).
+  altText                String?  @map("alt_text")
+  /// Declared dominant text colour (hex) — input to the WCAG contrast check.
+  textColor              String?  @map("text_color")
+  /// Declared background colour (hex) — input to the WCAG contrast check.
+  backgroundColor        String?  @map("background_color")
+  /// Author affirms the creative respects reduced-motion (no autoplay / flash).
+  motionSafe             Boolean  @default(true) @map("motion_safe")
+  /// Author acknowledges the mandatory "Sponsored" disclosure (PDD §18.3).
+  disclosureAcknowledged Boolean  @default(false) @map("disclosure_acknowledged")
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  campaign    AdCampaign         @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  reviews     AdCreativeReview[]
+
+  /// "Creatives for this campaign" — the dominant admin read.
+  @@index([campaignId], map: "ad_creatives_campaign_id_idx")
+  /// Approval-queue view ("creatives pending review").
+  @@index([status], map: "ad_creatives_status_idx")
+  @@map("ad_creatives")
+  @@schema("ads")
+}
+
+/// The outcome a reviewer recorded on a creative (TS-277; PDD §18.3 creative
+/// approval workflow). `approved` / `rejected` / `changes_requested`.
+///
+/// Additive only — new outcomes arrive via `ALTER TYPE … ADD VALUE`.
+enum AdCreativeReviewDecision {
+  approved
+  rejected
+  changes_requested
+
+  @@map("ad_creative_review_decision")
+  @@schema("ads")
+}
+
+/// An immutable, append-only creative review-decision record (TS-277; PDD §18.3;
+/// CLAUDE.md §3.6 — review actions are never updated / deleted). One row per
+/// approve / reject / request-changes action, snapshotting the accessibility
+/// report as it stood at decision time + whether the reviewer overrode a failing
+/// report. Platform-wide marketing-admin inventory, NO tenant axis
+/// (`unscopedModels`).
+///
+/// `reviewerUserId` is the acting admin's id (the authoritative `userId` from the
+/// verified token — never the request body). There is NO `updatedAt`: the row is
+/// write-once. `accessibilityReport` snapshots the structured report (JSONB).
+model AdCreativeReview {
+  id                    String                   @id @default(cuid())
+  creativeId            String                   @map("creative_id")
+  decision              AdCreativeReviewDecision
+  /// Acting reviewer's user id (from the verified token).
+  reviewerUserId        String                   @map("reviewer_user_id")
+  /// Reviewer notes / rejection reason. Required for reject + request-changes.
+  notes                 String?
+  /// Whether the snapshotted accessibility report passed every check.
+  accessibilityPassed   Boolean                  @map("accessibility_passed")
+  /// The accessibility report snapshot at decision time (structured JSON).
+  accessibilityReport   Json                     @map("accessibility_report")
+  /// `true` when the reviewer approved despite a failing accessibility report.
+  overrodeAccessibility Boolean                  @default(false) @map("overrode_accessibility")
+  createdAt             DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  creative AdCreative @relation(fields: [creativeId], references: [id], onDelete: Cascade)
+
+  /// "Review history for this creative" — the dominant read (newest first).
+  @@index([creativeId], map: "ad_creative_reviews_creative_id_idx")
+  @@map("ad_creative_reviews")
+  @@schema("ads")
+}
+
+/// A predefined slot in the product UI (PDD §18.1 — home banner, search
+/// top-tile, dashboard sidebar, blog footer, partner co-marketing card).
+/// Slot inventory is seeded + scheduled in TS-272. Platform-wide inventory,
+/// NO tenant axis (`unscopedModels`).
+///
+/// `slotCode` is the stable UI-position identifier (e.g. `home_banner`,
+/// `search_top_tile`) — UNIQUE so a slot is addressed by code, not id.
+/// `supportedCreativeKinds` constrains which creative kinds may fill the slot.
+model AdPlacement {
+  id                     String           @id @default(cuid())
+  /// Stable UI-position identifier (UNIQUE). Seeded in TS-272.
+  slotCode               String           @unique @map("slot_code")
+  /// Creative kinds this slot accepts.
+  supportedCreativeKinds AdCreativeKind[] @map("supported_creative_kinds")
+  createdAt              DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  slotSchedules AdSlotSchedule[]
+
+  @@map("ad_placements")
+  @@schema("ads")
+}
+
+/// A scheduled booking of a campaign into a placement over a delivery window
+/// (TS-272; PRD §10.9 "Inventory management (slot scheduling)"; PDD §18.1).
+/// Platform-wide marketing-admin inventory, NO tenant axis (`unscopedModels`).
+///
+/// Both `placement_id` and `campaign_id` are in-schema FKs (`onDelete: Cascade`)
+/// — a schedule is meaningless once either its slot or its campaign is gone.
+/// `priority` orders overlapping schedules on the same slot (higher served
+/// first); `start_at` is required (a schedule has a beginning), `end_at` is
+/// nullable (open-ended, run until paused/archived). The window order
+/// (`end_at` > `start_at` when both present) is enforced at the service layer.
+///
+/// This is the inventory binding ONLY — it does not duplicate the campaign's
+/// own budget / targeting (those live on `ad_campaigns`); the delivery path
+/// (TS-275+) reads a slot's active schedules to decide what fills it.
+model AdSlotSchedule {
+  id          String               @id @default(cuid())
+  placementId String               @map("placement_id")
+  campaignId  String               @map("campaign_id")
+  status      AdSlotScheduleStatus  @default(scheduled)
+  /// Tie-break order when multiple schedules overlap a slot (higher first).
+  priority    Int                  @default(0)
+  /// Delivery-window start (required — a schedule has a beginning).
+  startAt     DateTime             @map("start_at") @db.Timestamptz(6)
+  /// Delivery-window end; NULL = open-ended (run until paused / archived).
+  endAt       DateTime?            @map("end_at") @db.Timestamptz(6)
+  createdAt   DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime             @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  placement AdPlacement @relation(fields: [placementId], references: [id], onDelete: Cascade)
+  campaign  AdCampaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  /// "Schedules booked into this slot" — the dominant delivery + admin read.
+  @@index([placementId], map: "ad_slot_schedules_placement_id_idx")
+  /// "Schedules for this campaign" — the campaign-editor reverse view.
+  @@index([campaignId], map: "ad_slot_schedules_campaign_id_idx")
+  /// Status-filtered admin view ("which schedules are active / paused").
+  @@index([status], map: "ad_slot_schedules_status_idx")
+  @@map("ad_slot_schedules")
+  @@schema("ads")
+}
+
+/// A single targeting predicate on a campaign (PDD §8.2, §18.1). The delivery
+/// evaluator (TS-273) AND-combines a campaign's rules server-side at delivery
+/// time. Platform-wide inventory, NO tenant axis (`unscopedModels`).
+///
+/// `kind` names the dimension; `value` carries its payload. TS-273 persists a
+/// JSON AST here (stored as TEXT so the schema never constrains the evolving
+/// rule grammar); the skeleton treats `value` as an opaque string.
+model AdTargetingRule {
+  id          String              @id @default(cuid())
+  campaignId  String              @map("campaign_id")
+  kind        AdTargetingRuleKind
+  /// The rule payload — a JSON AST (TS-273) stored as TEXT for forward-compat.
+  value       String
+  createdAt   DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  campaign    AdCampaign          @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  /// "Targeting rules for this campaign" — read at delivery + admin-edit time.
+  @@index([campaignId], map: "ad_targeting_rules_campaign_id_idx")
+  @@map("ad_targeting_rules")
+  @@schema("ads")
+}
+
+/// Transactional outbox (TS-271a-followup-1 / TS-272a-followup-1 /
+/// TS-277a-followup-1; PDD §7.3, CLAUDE.md §5.3). The canonical shape every
+/// producer service ships — identical to service-booking / service-search /
+/// service-subscription's `outbox_events` table so the schema-agnostic
+/// `@taste-and-see/nest-outbox` SDK + the `worker-outbox-relay` drain it
+/// unchanged. service-ads appends `audit.action_recorded` rows here INSIDE the
+/// same `$transaction` as each admin mutation, so the audit record commits
+/// atomically with the state change (it can never be lost to a transient
+/// service-audit outage). The relay forwards undispatched rows onto Redis
+/// Streams; `service-audit`'s outbox consumer persists them append-only +
+/// hash-chained, idempotent on `event_id`.
+model OutboxEvent {
+  /// Dedup key — consumers must idempotency-check on this. UUID v4
+  /// generated by the SDK by default; producers may pass an explicit
+  /// id for cross-boundary exactly-once-effective delivery.
+  eventId         String    @id @map("event_id")
+  /// Dot-notation event name from `packages/contracts/events`. The
+  /// SDK validates the name against the registry before inserting
+  /// — unknown names are rejected at the producer boundary.
+  eventName       String    @map("event_name")
+  /// Validated domain payload (validated by the SDK against the
+  /// matching `eventRegistry` schema before insert).
+  payload         Json
+  /// Producer wall-clock time the event semantically happened. May
+  /// differ from `created_at` for backfilled events.
+  occurredAt      DateTime  @map("occurred_at") @db.Timestamptz(6)
+  /// Service name that produced the row (`service-ads`). Useful for
+  /// relay observability + per-service throughput metrics.
+  producerService String    @map("producer_service")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Stamped by the relay when the row has been successfully
+  /// forwarded onto the bus. Null means undispatched + eligible for
+  /// the next poll cycle.
+  dispatchedAt    DateTime? @map("dispatched_at") @db.Timestamptz(6)
+  /// Failed dispatch counter. The relay stops retrying once this
+  /// reaches `MAX_ATTEMPTS` — those rows are dead-lettered for ops
+  /// attention (surfaced via metrics + an admin endpoint).
+  attempts        Int       @default(0)
+  /// Stamped by the relay on the most recent failed attempt.
+  lastAttemptAt   DateTime? @map("last_attempt_at") @db.Timestamptz(6)
+  /// Most recent failure message — capped at 2000 chars at the
+  /// relay's record-failure path.
+  lastError       String?   @map("last_error")
+
+  /// Secondary scroll by event_name (admin filters / metrics). The
+  /// relay's dominant "next batch of undispatched rows ordered by
+  /// created_at" read is served by a PARTIAL index on
+  /// `dispatched_at IS NULL` that Prisma's `@@index` cannot express —
+  /// it is materialised in the migration SQL (CLAUDE.md §7.3).
+  @@index([eventName], map: "outbox_events_event_name_idx")
+  @@map("outbox_events")
+  @@schema("ads")
+}

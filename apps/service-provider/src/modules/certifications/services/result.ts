@@ -1,0 +1,16 @@
+/**
+ * Minimal `Result<T, E>` helper — duplicated locally per the
+ * convention in `apps/service-provider/src/modules/applications/services/result.ts`.
+ * Lift to `packages/result` when a fifth consumer arrives.
+ */
+export type Result<T, E> =
+  | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly error: E };
+
+export function ok<T>(value: T): { readonly ok: true; readonly value: T } {
+  return { ok: true, value };
+}
+
+export function err<E>(error: E): { readonly ok: false; readonly error: E } {
+  return { ok: false, error };
+}

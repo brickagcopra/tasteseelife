@@ -1,0 +1,53 @@
+{
+  "name": "@taste-and-see/nest-outbox",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Shared NestJS outbox-pattern SDK for the Taste & See platform (TS-142). Producer side: services call OutboxService.append(tx, {eventName, payload}) inside a Prisma transaction to write a row into their per-service `outbox_events` table atomically with the state change. The relay process (apps/worker-outbox-relay) reads undispatched rows and publishes them to Redis Streams. Consumers are idempotent on event_id (CLAUDE.md §5.3).",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@taste-and-see/contracts": "workspace:*",
+    "zod": "3.23.8"
+  },
+  "peerDependencies": {
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/core": "^11.0.0",
+    "reflect-metadata": "^0.2.0",
+    "rxjs": "^7.8.0"
+  },
+  "devDependencies": {
+    "@nestjs/common": "11.0.0",
+    "@nestjs/core": "11.0.0",
+    "@nestjs/testing": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "reflect-metadata": "0.2.2",
+    "rimraf": "6.0.1",
+    "rxjs": "7.8.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

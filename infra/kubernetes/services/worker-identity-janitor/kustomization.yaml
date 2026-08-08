@@ -1,0 +1,119 @@
+# Per-worker base for worker-identity-janitor (TS-151-followup-1 rollout,
+# Batch 5 — final web/worker fleet; also closes TS-022-followup-3c).
+# Consumes the reusable bullmq-worker component.
+#
+# The janitor periodically DELETEs retention-aged rows from two
+# append-mostly `identity`-schema tables (`refresh_tokens`,
+# `mfa_challenges`) so they don't grow unbounded
+# (apps/workers/identity-janitor/src/config/env.ts). It connects to
+# Postgres with the raw `pg` driver — it NEVER imports service-identity's
+# Prisma client (CLAUDE.md §2.3) — and has no other dependency.
+#
+# Lives in `platform-workers`. Headless: the bullmq-worker component ships
+# NO Service / Ingress / HPA — only /healthz + /readyz for the k8s probes.
+# PORT is pinned to the component default 3000 (the probe port) rather than
+# the env schema's 3051 default — purely a healthz listener, so matching
+# the component avoids per-port patching.
+#
+# Egress: Postgres lives on the external data node, already permitted by
+# the base data-access egress policy — so this worker needs NO per-worker
+# egress NetworkPolicy (unlike the cross-service workers). The component's
+# ingress-deny is the only NetworkPolicy override.
+#
+# The only secret is DATABASE_URL (the identity DB connection string,
+# carrying the role password). Retention windows + enable flags are
+# operator-tunable non-secrets in the ConfigMap; the table/schema/column
+# identifiers are CODE CONSTANTS, never sourced from env.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-workers
+
+components:
+  - ../../components/bullmq-worker
+
+resources:
+  - secret-placeholder.yaml
+
+commonLabels:
+  app.kubernetes.io/name: worker-identity-janitor
+  app.kubernetes.io/instance: worker-identity-janitor
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-identity-janitor
+
+  - target:
+      kind: ConfigMap
+      name: bullmq-worker-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-identity-janitor-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3000"
+          SERVICE_VERSION: dev
+          JANITOR_ENABLED: "true"
+          JANITOR_INTERVAL_MS: "3600000"
+          JANITOR_BATCH_SIZE: "5000"
+          JANITOR_MAX_BATCHES_PER_SWEEP: "1000"
+          REFRESH_TOKEN_RETENTION_DAYS: "30"
+          REFRESH_TOKEN_PRUNE_ENABLED: "true"
+          MFA_CHALLENGE_RETENTION_DAYS: "30"
+          MFA_CHALLENGE_PRUNE_ENABLED: "true"
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          # TS-504-followup-2a — Sentry error reporting (CLAUDE.md §10).
+          # EMPTY = off, and the service logs that it is off rather than
+          # staying quiet. The real DSN is supplied per env by the overlay or
+          # the operator; it is not committed, and it is not a Secret
+          # placeholder because a REPLACE_WITH_ value is not a valid URL and
+          # would fail Zod boot on every workload that does not use Sentry.
+          SENTRY_DSN: ""
+
+  - target:
+      kind: Deployment
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-identity-janitor
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: worker-identity-janitor
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/worker-identity-janitor:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: worker-identity-janitor-config
+          - secretRef:
+              name: worker-identity-janitor-secrets
+
+  - target:
+      kind: NetworkPolicy
+      name: bullmq-worker-ingress-deny
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-identity-janitor-ingress-deny
+
+  - target:
+      kind: PodDisruptionBudget
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-identity-janitor

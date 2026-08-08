@@ -1,0 +1,41 @@
+-- TS-204 — Provider pricing-band editor.
+--
+-- Adds two nullable columns to the existing `providers` table:
+--
+--   - `hourly_rate`          NUMERIC(12,2)  — the provider's self-set
+--                                            hourly rate (money;
+--                                            Decimal(12,2) per CLAUDE.md
+--                                            §4.1 — never a float).
+--   - `hourly_rate_currency` CHAR(3)        — ISO-4217 code for the rate.
+--
+-- Both are nullable: a freshly-onboarded provider carries no rate until
+-- they set one via `PUT /api/v1/providers/:providerId/pricing`. The two
+-- columns are set / cleared in lockstep (the service never writes a
+-- half-populated pair). The write path enforces the rate sits inside the
+-- platform-set band for the provider's `tier` (PRD §5.2 / §7.2); the band
+-- lives in the contract layer's `PROVIDER_PRICING_BANDS` until TS-204-
+-- followup-2 moves it into a configurable `service_catalog` row.
+--
+-- Forward-compatible expand-only migration (CLAUDE.md §4.1):
+--
+--   - Two ADD COLUMN ... NULL statements. No DEFAULT, no NOT NULL, no
+--     backfill — existing provider rows read `NULL` on both columns
+--     (correct: "no rate set yet"), so the migration is a metadata-only
+--     change that does not rewrite the table.
+--   - No new index: the rate is never a `WHERE` predicate (reads are
+--     always by `providers.id` / `user_id`, both already indexed /
+--     unique). The (future) booking-quote read fetches the whole row by
+--     id (TS-204-followup-1), so no covering index is warranted.
+--
+-- Reversal plan:
+--
+--   ALTER TABLE "provider"."providers" DROP COLUMN "hourly_rate_currency";
+--   ALTER TABLE "provider"."providers" DROP COLUMN "hourly_rate";
+--
+-- Safe in isolation — dropping the columns removes the TS-204 surface but
+-- leaves every existing provider row intact (no other column or index
+-- references them).
+
+ALTER TABLE "provider"."providers"
+    ADD COLUMN "hourly_rate"          DECIMAL(12,2),
+    ADD COLUMN "hourly_rate_currency" CHAR(3);

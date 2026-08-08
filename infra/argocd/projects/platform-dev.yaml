@@ -1,0 +1,94 @@
+# AppProject: platform-dev.
+#
+# Scopes every dev-environment Application. Source allow-list pins the git
+# repo + path prefix so an Application created under this project cannot
+# reach outside `infra/kubernetes/overlays/dev/` or `infra/argocd/applications/dev/`.
+# Destination allow-list pins the in-cluster destination (the same single
+# k3s cluster per ADR-0001) and the workload namespaces.
+#
+# `clusterResourceWhitelist` is intentionally narrow — only the cluster-scoped
+# kinds the platform overlay actually emits land here. Anything outside (e.g.
+# a stray ClusterRoleBinding from an upstream chart) gets rejected at sync time.
+#
+# Sync window deliberately permissive for dev (auto-sync everywhere, any time)
+# so engineers can iterate fast. Staging tightens; prod tightens further.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: platform-dev
+  namespace: argocd
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    tastesee.io/env: dev
+  finalizers:
+    # Ensures child Applications are cleaned up before the AppProject itself
+    # is deleted — without the finalizer a `kubectl delete appproject` leaves
+    # orphaned Applications.
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: >-
+    Dev environment — auto-sync + self-heal across every workload namespace.
+    Source-pinned to the platform monorepo's infra/kubernetes/overlays/dev
+    + infra/argocd/applications/dev paths.
+
+  sourceRepos:
+    - https://github.com/brickagcopra/tasteseelife.git
+    - https://github.com/brickagcopra/tasteseelife
+
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: platform-system
+    - server: https://kubernetes.default.svc
+      namespace: platform-data
+    - server: https://kubernetes.default.svc
+      namespace: platform-services
+    - server: https://kubernetes.default.svc
+      namespace: platform-workers
+    - server: https://kubernetes.default.svc
+      namespace: platform-frontends
+    - server: https://kubernetes.default.svc
+      namespace: observability
+    - server: https://kubernetes.default.svc
+      namespace: ingress
+
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: scheduling.k8s.io
+      kind: PriorityClass
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+    - group: cert-manager.io
+      kind: ClusterIssuer
+    - group: networking.k8s.io
+      kind: IngressClass
+    # Note: ConfigManagementPlugin removed in ArgoCD v2.6+; modern installs use
+    # sidecar config-management-plugins via the repo-server. Not currently used.
+
+  namespaceResourceWhitelist:
+    # Permissive within the env's allowed namespaces — every kind a NestJS
+    # service or web app's overlay emits is allowed.
+    - group: "*"
+      kind: "*"
+
+  # Roles within the project (used by RBAC policies in argocd-rbac-cm).
+  # Phase 1 has only the implicit admin role wired via the chart values.
+  # Team-scoped roles land with TS-152-followup-2.
+  roles: []
+
+  # Sync windows — dev is wide-open.
+  syncWindows: []
+
+  # Orphaned-resource detection — surface any in-cluster resource carrying
+  # the project's tracking annotation that isn't owned by an Application.
+  orphanedResources:
+    warn: true

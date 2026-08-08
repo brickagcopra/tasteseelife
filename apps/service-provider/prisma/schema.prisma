@@ -1,0 +1,1331 @@
+// Provider bounded context — see PDD §7.2 (service inventory entry #4)
+// and §8.2 (`provider` schema column inventory).
+//
+// Scope so far:
+//   - TS-050 added the `provider` Postgres schema and the core
+//     `providers` profile table — the row that backs every chef /
+//     culinary-companion / caregiver listing on the platform. Two
+//     enums (`provider_status`, `provider_tier`) bound the state
+//     machine and the marketplace pricing band (PRD §5.2: Basic /
+//     Certified / Elite). Indexes cover the four hot read paths.
+//
+//   - TS-051 adds the application + background-check tables.
+//     `provider_applications` records every formal application a
+//     provider submits (PRD §7.1) — once submitted the row sits in
+//     `submitted` until ops review (TS-052) closes it. The
+//     `provider_background_checks` row pairs with each application;
+//     it holds the Checkr candidate + report identifiers, the rolled-
+//     up Checkr status, and an at-rest-encrypted copy of the raw
+//     Checkr event payload (PDD §16.2). New enums:
+//     `application_status` (submitted | in_review | approved |
+//     rejected | withdrawn) and `background_check_status` (pending |
+//     processing | clear | consider | suspended | engaged | dispute |
+//     canceled | failed). The applicant PII (legal name, DOB, SSN,
+//     address) is NEVER persisted on our side — Checkr receives it
+//     directly via the candidate-create call and we keep only the
+//     opaque `checkr_candidate_id`. CLAUDE.md §17.1 / §3.5.
+//
+// Deliberately deferred — each follow-up arrives as an *additive*
+// expand → migrate → contract migration (CLAUDE.md §4.1) so existing
+// rows stay readable:
+//
+//   - TS-052 lands the **certifications + tier-promotion** machinery
+//     additively. New tables `certifications` (catalog),
+//     `provider_certifications` (per-provider issuance log with
+//     issued/expires/revoked timestamps), and `provider_tier_history`
+//     (append-only audit of tier transitions). New enum
+//     `tier_transition_reason` (`auto_evaluation` | `admin_override`).
+//     The pre-existing `providers.tier` column is the live source of
+//     truth; the tier-history table records each transition. Tier
+//     promotion rules: `basic` (default), `certified` (requires the
+//     Certified Culinary Companion cert), `elite` (requires CCC + the
+//     Elite Concierge Provider cert). `provider_specialties` /
+//     `provider_documents` (food-handler cert, insurance proof) stay
+//     deferred until `media-svc` (TS-110) is online for signed-URL
+//     issuance + scan-status tracking.
+//   - TS-200 lands the self-service **profile editor** machinery.
+//     Adds the `provider_profile_tags(provider_id, kind, tag)`
+//     polymorphic table (one row per (provider, kind, tag) triple;
+//     kinds: `language` / `cuisine` / `dietary_expertise`), the
+//     matching `provider_profile_tag_kind` enum, and the
+//     `providers.dementia_sensitive` boolean column. The polymorphic
+//     shape collapses what PDD §8.2 originally framed as three
+//     sibling tables (`provider_languages` /
+//     `provider_cuisines` / `provider_dietary_expertise`) into one
+//     table per CLAUDE.md §2.3 scope-discipline (one migration / one
+//     repository / one outbox composition). The
+//     `provider.profile_updated` event fires inside the profile-
+//     update transaction; the search-indexer (TS-053) treats it as a
+//     "re-fetch + re-project" trigger.
+//   - TS-202 — provider service-area self-service editor. Lands the
+//     `provider_service_areas` table (one row per declared coverage
+//     polygon; geo stored as GeoJSON in a `jsonb` column, with the
+//     planar area-weighted centroid + axis-aligned bounding box
+//     computed in application code at write time and persisted as
+//     `double precision` columns — no PostGIS extension on the Phase-1
+//     self-managed Postgres). The search-indexer (TS-053-followup-3)
+//     reads the centroid into `ProviderDiscoveryDocument.centroid`;
+//     polygon-intersection / geo-distance scoring lands with TS-210.
+//     The `provider.service_areas_updated` event fires inside the
+//     service-area-update transaction; consumers re-fetch the
+//     discovery snapshot to re-project (PDD §8.5 / §14.1).
+//   - TS-203 — provider availability self-service editor. Lands the
+//     `provider_availability_windows` table (one row per recurring
+//     weekly `(weekday, start_time, end_time)` triple, with multiple
+//     non-overlapping windows allowed per weekday) and the
+//     `provider_availability_exceptions` table (one row per
+//     date-keyed all-day blackout). New enum
+//     `provider_availability_weekday` with seven lowercased English
+//     literals. The discovery-snapshot endpoint projects the next-7-
+//     days resolved availability from these rows into the
+//     `ProviderDiscoveryDocument.availabilitySummary` field that the
+//     search-indexer (TS-053) consumes. The
+//     `provider.availability_updated` event fires inside the
+//     availability-update transaction; consumers re-fetch the
+//     discovery snapshot to re-project.
+//   - TS-204 — provider pricing-band editor. Adds the `hourly_rate`
+//     `Decimal(12,2)` + `hourly_rate_currency` `Char(3)` columns to
+//     `providers` (both nullable; set / cleared together). The write
+//     path enforces the rate sits inside the platform band for the
+//     provider's `tier`; the `provider.pricing_updated` event fires
+//     inside the pricing-update transaction.
+//   - TS-090 — Stripe Connect Express payout. Adds payout-method
+//     status columns; the actual `stripe_account_id` lives in the
+//     payouts service per the cross-service-FK convention.
+//   - `provider_metrics` LANDED under TS-305d, and its shape differs
+//     from the sketch above in two ways worth stating here. There is
+//     **no `rating_avg`** — nothing on this platform captures a
+//     rating, and a nullable column would read as "no rating for this
+//     provider" when the truth is "we do not collect ratings"
+//     (TS-305e). And the table is fed by a second, new table,
+//     `provider_booking_facts` (one row per booking), because
+//     `response_time_p50` and any rolling window are not computable
+//     from counters alone. `provider_metrics` therefore holds only
+//     LIFETIME figures, which cannot go stale; windowed ones are
+//     derived at read time from the facts. See both models' doc-blocks.
+//     This also made service-provider a first-time outbox CONSUMER —
+//     hence `outbox_consumer_dedup` alongside the producer-side
+//     `outbox_events`.
+//
+// Cross-service references are by id only — never a foreign key into
+// another service schema (CLAUDE.md §2.3, §4.1). Specifically:
+//
+//   - `providers.user_id` is a soft FK into `identity.users.id`.
+//   - `provider_applications.reviewer_user_id` is a soft FK into
+//     `identity.users.id` (set by ops staff during review).
+//
+// Joins across these boundaries happen via the gateway BFF (TS-140)
+// or via events (TS-142), never via SQL JOIN.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. The feature has
+  // been production-stable since Prisma 5.0 even though it remains
+  // under the `previewFeatures` umbrella in 5.x.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `provider` Postgres schema. Every other
+  // service gets its own schema in the same database (Phase 1) or
+  // its own database entirely (Phase 3 — see PDD §7.2 final
+  // paragraph).
+  schemas  = ["provider"]
+}
+
+/// Provider lifecycle status. Drives whether the profile is bookable,
+/// surfaced in search, and whether tier promotions are allowed.
+/// Distinct from `tier` because a provider can sit at any tier while
+/// not-yet-bookable (e.g. background check pending after a tier
+/// upgrade).
+///
+/// `pending`    = provider row exists but no application submitted
+///                (transitional shape; today the row is created at
+///                application-submit time so the row never sits in
+///                `pending` in practice — captured for forward-
+///                compatibility with a future "save draft profile"
+///                flow).
+/// `in_review`  = application submitted; background check started;
+///                ops queue (PRD §10.7) reviewing. The profile is
+///                invisible to search and no bookings accepted.
+/// `active`     = approved; bookable; surfaced in search subject to
+///                tier filters. The normal steady state.
+/// `suspended`  = temporary hold (welfare-concern flag, complaint
+///                under review, certification lapse). Profile pulled
+///                from search; existing recurring bookings honour
+///                their own cancellation policy rather than auto-
+///                cancel. Resolvable back to `active` via TS-052
+///                admin tooling.
+/// `archived`   = provider left / was terminated. No further
+///                activity; row retained for audit / accounting
+///                historical reads.
+enum ProviderStatus {
+  pending
+  in_review
+  active
+  suspended
+  archived
+
+  @@map("provider_status")
+  @@schema("provider")
+}
+
+/// Provider tier — PRD §5.2 / §5.4 pricing & commission bands.
+///
+///   `basic`     — $29/mo subscription; 30% marketplace commission;
+///                 standard listing. Default for newly-onboarded
+///                 providers until their first Cooking Academy
+///                 certification lands (TS-052).
+///   `certified` — $99/mo subscription; 20% marketplace commission;
+///                 featured placement; premium listing badge.
+///                 Requires Taste & See Cooking Academy certification
+///                 (CCC).
+///   `elite`     — $199–$499/mo; 10% marketplace commission; luxury-
+///                 tier client access; concierge-tier placements.
+///                 Requires ECC certification + advanced credentials.
+///
+/// Tier is a marketplace pricing/commission band. The booking service
+/// (TS-064) enforces the "Tier 3 (Concierge) households can only book
+/// Elite providers" rule at the service layer (CLAUDE.md §12). Tier
+/// transitions write to a history table once TS-052 lands; today the
+/// column is set at creation and updated by admin tooling alone.
+enum ProviderTier {
+  basic
+  certified
+  elite
+
+  @@map("provider_tier")
+  @@schema("provider")
+}
+
+/// Provider-application lifecycle status (TS-051).
+///
+/// `submitted`  = applicant has POSTed the application; background
+///                check is being initiated. The default state on
+///                insert.
+/// `in_review`  = background check returned (clear / consider / etc.)
+///                and ops is now actively reviewing the application.
+///                The transition is owned by TS-052 admin tooling.
+/// `approved`   = ops accepted the application; the matching
+///                `providers.status` flips to `active`.
+/// `rejected`   = ops declined the application; the matching
+///                `providers.status` stays `pending` (or moves to
+///                `archived` on a terminal decision).
+/// `withdrawn`  = applicant withdrew their application before any
+///                ops decision was rendered.
+///
+/// The terminal-state transitions (approved / rejected / withdrawn)
+/// stamp `reviewed_at` and the reviewer's `identity.users.id`. The
+/// `submitted` and `in_review` states leave them null.
+enum ApplicationStatus {
+  submitted
+  in_review
+  approved
+  rejected
+  withdrawn
+
+  @@map("application_status")
+  @@schema("provider")
+}
+
+/// Checkr background-check status (TS-051). Mirrors the Checkr
+/// catalog of report statuses with two locally-introduced shapes:
+///
+///   `pending`     = row inserted, no Checkr response yet (the
+///                   row exists before the candidate-create call
+///                   completes — covers the brief window between
+///                   row insert and Checkr SDK call). The default
+///                   state on insert.
+///   `processing`  = Checkr accepted the report; results are still
+///                   being computed.
+///   `clear`       = Checkr cleared the candidate; no adverse
+///                   findings.
+///   `consider`    = Checkr returned adverse findings; ops manual
+///                   review required.
+///   `suspended`   = Checkr-side suspended (typically when the
+///                   account requires additional documentation).
+///   `engaged`     = Continuous-monitoring enrolment is active.
+///   `dispute`     = Candidate is disputing findings via Checkr's
+///                   dispute flow.
+///   `canceled`    = Report canceled before completion (operator-
+///                   initiated or candidate-initiated).
+///   `failed`      = Checkr couldn't complete the report (e.g.
+///                   candidate did not finish providing required
+///                   info within the window).
+///
+/// Provider-tier promotion (TS-052) gates on the combined
+/// `clear` ∧ KYC-verified condition.
+enum BackgroundCheckStatus {
+  pending
+  processing
+  clear
+  consider
+  suspended
+  engaged
+  dispute
+  canceled
+  failed
+
+  @@map("background_check_status")
+  @@schema("provider")
+}
+
+/// Provider — the row that backs every chef / culinary-companion /
+/// caregiver listing on the platform.
+///
+/// One provider per identity user (the `user_id` column is unique). A
+/// human can hold at most one provider account; staff who also
+/// subscribe as a family payer wear two different rows in two
+/// different services.
+///
+/// **Storage shape rationale** (CLAUDE.md §17.1; PDD §16.3 / §21.3).
+/// The profile holds business-marketing-shaped content (name,
+/// headline, bio, photo, video) plus operational pricing metadata
+/// (tier, status). Strictly-sensitive material (full DOB, SSN-for-
+/// Checkr, payout bank account) does NOT live on this row — that
+/// data class belongs to service-identity (KYC light, TS-026), the
+/// soon-to-arrive `provider_documents` table (background-check
+/// artefacts, TS-052), and service-payouts (Stripe Connect account,
+/// TS-090). Keeping the public profile row narrow bounds the blast
+/// radius of an accidental read-path leak and keeps the search-
+/// indexer's projection cheap.
+///
+/// `display_name` is the public-facing name on the profile card. It
+/// can differ from the legal name on the KYC record (chefs frequently
+/// brand under a "Chef <FirstName>" stage name). Family-portal
+/// renders this verbatim.
+///
+/// `headline` is a short tagline (≤120 chars at the contract layer).
+/// Drives the search result card and the social-share preview.
+///
+/// `bio` is a longer free-form body (≤4000 chars at the contract
+/// layer). Markdown-friendly; rendered to HTML at the family-portal
+/// boundary with strict sanitisation (CLAUDE.md §3.9 — no auto-render
+/// of LLM / user-supplied content as raw HTML).
+///
+/// `profile_photo_key` / `video_intro_key` are forward references to
+/// TS-110 `media-svc`. Stored as TEXT pointers with no FK or content
+/// guarantee — when media-svc lands, the contract gate requires each
+/// key to belong to a successfully-scanned asset before the family-
+/// portal renders the asset (CLAUDE.md §3.4 mandatory pipeline).
+/// Today the portal treats a non-null key as "asset uploaded; render
+/// placeholder until media-svc validates".
+///
+/// `time_zone` is a required IANA zone (e.g. "America/New_York").
+/// The availability service (TS-053) uses it to interpret weekday/
+/// time-of-day windows; defaulting to the provider's signup-time
+/// browser timezone is a TS-122 (web-provider) concern, not a schema
+/// default.
+///
+/// Soft-delete preserves the audit history of every provider who has
+/// ever served a booking — accounting reads (PDD §11.2 / Appendix A)
+/// and compliance reads (PDD §17) must remain queryable after
+/// archive.
+model Provider {
+  id                String         @id @default(cuid())
+  /// Soft FK into `identity.users.id`. Never declare a Prisma
+  /// relation here — cross-service relations would couple the two
+  /// services' Prisma clients and violate CLAUDE.md §2.3 / §4.1.
+  ///
+  /// Unique: at most one provider profile per identity user. The
+  /// `@unique` here mirrors the application-layer invariant; a
+  /// DB-level guard against accidental double-create races is worth
+  /// the index footprint cost given the row count is bounded by
+  /// Year-1 ≈ 200 (PRD §12.2).
+  userId            String         @unique @map("user_id")
+  status            ProviderStatus @default(pending)
+  tier              ProviderTier   @default(basic)
+  displayName       String         @map("display_name")
+  headline          String?
+  bio               String?
+  profilePhotoKey   String?        @map("profile_photo_key")
+  videoIntroKey     String?        @map("video_intro_key")
+  timeZone          String         @map("time_zone")
+  /// TS-200 — Boolean flag set when the provider claims dementia-
+  /// sensitive dining specialty. Default `false` so existing rows
+  /// backfill with a safe "no claim either way" baseline; the
+  /// provider re-confirms via the editor (`PUT /api/v1/providers/
+  /// :id/profile`). The family-portal search filter on dementia-
+  /// sensitive providers (PRD §6.1 / §6.3) reads this column via
+  /// the discovery doc projection (TS-111).
+  dementiaSensitive Boolean        @default(false) @map("dementia_sensitive")
+  /// TS-204 — provider's self-set hourly rate, in the row's
+  /// `hourly_rate_currency`. `Decimal(12,2)` per CLAUDE.md §4.1 —
+  /// **never a float**. Nullable: a freshly-onboarded provider has no
+  /// rate until they set one via `PUT /api/v1/providers/:id/pricing`.
+  /// The write path enforces the rate sits inside the platform-set
+  /// band for the provider's `tier` (PRD §5.2 / §7.2; the band lives
+  /// in the contract layer's `PROVIDER_PRICING_BANDS` until TS-204-
+  /// followup-2 moves it into a configurable `service_catalog` row).
+  /// The rate flows into booking quotes (`booking.base_price`) once
+  /// TS-204-followup-1 wires the cross-service read.
+  hourlyRate        Decimal?       @map("hourly_rate") @db.Decimal(12, 2)
+  /// TS-204 — ISO-4217 currency for `hourly_rate`. Set / cleared in
+  /// lockstep with the rate (a half-populated pair is a data bug the
+  /// service never writes). Phase-1 USD-only (PRD §11.4); the column
+  /// is `Char(3)` so the multi-currency rollout (Phase 3) needs no
+  /// migration.
+  hourlyRateCurrency String?       @map("hourly_rate_currency") @db.Char(3)
+  createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt         DateTime?      @map("deleted_at") @db.Timestamptz(6)
+
+  @@index([status], map: "providers_status_idx")
+  @@index([tier], map: "providers_tier_idx")
+  @@index([deletedAt], map: "providers_deleted_at_idx")
+  @@map("providers")
+  @@schema("provider")
+}
+
+/// Polymorphic profile tag (TS-200). The single source of truth for
+/// the provider's language / cuisine / dietary-expertise tag sets
+/// edited by `PUT /api/v1/providers/:providerId/profile`.
+///
+/// **Why polymorphic over three sibling tables**. PDD §8.2 framed
+/// these as `provider_languages` / `provider_cuisines` /
+/// `provider_dietary_expertise`. Collapsing to one table:
+///   - One migration to evolve (e.g. adding `created_by_user_id`
+///     to all three; tracking soft-delete).
+///   - One repository + one outbox event composition.
+///   - The discovery doc (TS-111) projects flat tag arrays per
+///     kind — the polymorphic shape aligns 1:1 with the doc's
+///     projection.
+///
+/// **Tag string discipline**. The contract layer
+/// (`provider-profile.schema.ts`) enforces lowercase + hyphen +
+/// underscore, max 48 chars. The DB-level `kind` enum constrains
+/// the discriminator so a controller bypass (admin tooling, repair
+/// script) hits a 23-error on a malformed kind. Per-(provider,
+/// kind, tag) uniqueness is enforced by the partial-free unique
+/// index `provider_profile_tags_unique_idx` (see migration
+/// `20260520140000_add_profile_tags_and_dementia_sensitive`).
+///
+/// **No FK to providers** — soft FK convention per CLAUDE.md §4.1.
+/// Hard-deleting a provider should not orphan tag rows, but Phase-1
+/// never hard-deletes providers (soft-delete via
+/// `providers.deleted_at`). When a future cleanup tool needs to
+/// purge tag rows for a hard-deleted provider, a one-off DELETE WHERE
+/// provider_id NOT IN (SELECT id FROM providers) suffices.
+model ProviderProfileTag {
+  id         String                 @id @default(cuid())
+  providerId String                 @map("provider_id")
+  kind       ProviderProfileTagKind
+  tag        String
+  createdAt  DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([providerId, kind, tag], map: "provider_profile_tags_unique_idx")
+  @@index([providerId, kind], map: "provider_profile_tags_provider_kind_idx")
+  @@index([kind, tag], map: "provider_profile_tags_kind_tag_idx")
+  @@map("provider_profile_tags")
+  @@schema("provider")
+}
+
+/// TS-200 — Tag kind discriminator for the polymorphic
+/// `provider_profile_tags` table. Mirrors the contract-layer
+/// `ProviderProfileTagKindSchema`.
+///
+///   `language`           — BCP-47 / ISO 639-1 language specifier.
+///   `cuisine`            — free-text cuisine identifier.
+///   `dietary_expertise`  — free-text dietary skill identifier.
+enum ProviderProfileTagKind {
+  language
+  cuisine
+  dietary_expertise
+
+  @@map("provider_profile_tag_kind")
+  @@schema("provider")
+}
+
+/// Provider application — one row per formal application submission.
+///
+/// **Lifecycle**. A row is inserted at application-submit time with
+/// `status = submitted`. Ops review (TS-052) transitions to
+/// `in_review` then to one of the terminal states (`approved` /
+/// `rejected`). The applicant can withdraw before a terminal state
+/// is reached, transitioning to `withdrawn`.
+///
+/// **Why a separate row from `providers`**. Each application is an
+/// auditable event — the platform needs to keep a record of every
+/// attempt, including rejections, for compliance and pattern-of-
+/// abuse detection. A provider who applies, gets rejected, and
+/// re-applies six months later creates two `provider_applications`
+/// rows with the same `providers.id`. The applicant-side notes,
+/// ops-side reviewer notes, and the per-attempt background-check row
+/// (`provider_background_checks`) all hang off this row.
+///
+/// **No applicant PII** lives on this row. The applicant's legal
+/// name, DOB, SSN-for-Checkr, and address travel directly to Checkr
+/// at submission time; only the opaque `checkr_candidate_id` lands
+/// on the matching `provider_background_checks` row. CLAUDE.md
+/// §17.1.
+model ProviderApplication {
+  id             String            @id @default(cuid())
+  /// Soft FK into the local `providers.id`. The Prisma relation is
+  /// declared here (same-schema FK is fine — CLAUDE.md §4.1 bars
+  /// only cross-service FKs).
+  providerId     String            @map("provider_id")
+  status         ApplicationStatus @default(submitted)
+  /// Optional free-text from the applicant ("I worked at Daniel for
+  /// six years and want to make this my full-time career"). Bounded
+  /// at the contract layer; UI surfaces it on the ops review page.
+  applicantNotes String?           @map("applicant_notes")
+  /// Soft FK into `identity.users.id`. Set when an ops admin reviews
+  /// the application. Null while `submitted` / `in_review`.
+  reviewerUserId String?           @map("reviewer_user_id")
+  /// Free-text ops notes captured at review time. Audit-logged at
+  /// the admin-tooling layer (TS-052 / TS-100).
+  reviewNotes    String?           @map("review_notes")
+  submittedAt    DateTime          @default(now()) @map("submitted_at") @db.Timestamptz(6)
+  reviewedAt     DateTime?         @map("reviewed_at") @db.Timestamptz(6)
+  withdrawnAt    DateTime?         @map("withdrawn_at") @db.Timestamptz(6)
+  createdAt      DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime          @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Powers "show me this provider's most recent application" — the
+  /// dominant read path for the provider-portal `GET .../me`
+  /// endpoint and for the ops review queue.
+  @@index([providerId, submittedAt(sort: Desc)], map: "provider_applications_provider_recent_idx")
+  /// Powers the ops queue ("show me every application in
+  /// `submitted` waiting for review").
+  @@index([status], map: "provider_applications_status_idx")
+  @@map("provider_applications")
+  @@schema("provider")
+}
+
+/// Provider background check — Checkr lifecycle row.
+///
+/// **One row per Checkr report**. Each `ProviderApplication` typically
+/// has one matching `ProviderBackgroundCheck` row; continuous
+/// monitoring (TS-051-followup) would land additional rows as Checkr
+/// emits periodic re-checks.
+///
+/// **Webhook idempotency**. Stripe Identity's idempotency key is
+/// `event.id`; Checkr's is also `event.id` but the relationship to
+/// the report is via `report.id` not the candidate-level id.
+/// `lastEventId` tracks the most-recent Checkr event applied to
+/// this row; the matching `applyWebhookEvent` short-circuits when
+/// the same `event.id` is redelivered.
+///
+/// **Encrypted payload columns** (`payload_*`). The raw Checkr event
+/// (which can include adverse-findings detail — county records,
+/// names, dates) is encrypted at-rest under
+/// `BACKGROUND_CHECK_PAYLOAD_ENC_KEY`. The cipher key is
+/// **independent** from any other cipher in the codebase (CLAUDE.md
+/// §3.5 compartmentalisation — a leaked KYC cipher key does NOT
+/// grant the ability to read background-check payloads, and vice
+/// versa). Columns are nullable so a freshly-inserted `pending` row
+/// has no payload yet; on the first webhook event all four columns
+/// transition to non-null together.
+///
+/// **No applicant PII** lives in clear columns. The Checkr candidate
+/// id is opaque; the report id is opaque. The names / DOBs / SSNs
+/// the applicant submitted live only inside the encrypted blob and
+/// inside Checkr's own systems.
+model ProviderBackgroundCheck {
+  id                String                @id @default(cuid())
+  /// Soft FK into the local `providers.id`. Same-schema FK is fine
+  /// (CLAUDE.md §4.1 bars only cross-service FKs).
+  providerId        String                @map("provider_id")
+  /// Soft FK into the local `provider_applications.id`. Nullable
+  /// because future continuous-monitoring re-checks (TS-051-followup)
+  /// may not pair with a fresh application row.
+  applicationId     String?               @map("application_id")
+  status            BackgroundCheckStatus @default(pending)
+  /// Checkr's `candidate.id` — opaque; the natural lookup key for
+  /// the create-report → events-on-report flow.
+  checkrCandidateId String                @unique @map("checkr_candidate_id")
+  /// Checkr's `report.id` — opaque; set after the create-report
+  /// call returns. The natural lookup key for the inbound webhook
+  /// events; unique when set (an event references exactly one
+  /// report row).
+  checkrReportId    String?               @unique @map("checkr_report_id")
+  /// Last applied Checkr `event.id`. Idempotency on webhook replay.
+  lastEventId       String?               @map("last_event_id")
+  /// Set exactly once on the transition into a terminal status
+  /// (`clear` | `consider` | `failed` | `canceled`). Preserved
+  /// across redelivered events so admin tooling has a stable
+  /// "completed-as-of-when" answer.
+  completedAt       DateTime?             @map("completed_at") @db.Timestamptz(6)
+  /// AES-256-GCM ciphertext of the JSON-stringified Checkr event
+  /// payload. Nullable — populated on the first webhook event.
+  payloadCiphertext Bytes?                @map("payload_ciphertext")
+  /// 96-bit random IV used for the GCM encryption.
+  payloadIv         Bytes?                @map("payload_iv")
+  /// 128-bit GCM authentication tag.
+  payloadAuthTag    Bytes?                @map("payload_auth_tag")
+  /// Key version used for the encryption — supports forward-
+  /// compatible key rotation via TS-051-followup-N's backfill
+  /// worker (mirrors TS-026-followup-2 / TS-031-followup-3).
+  payloadKeyVersion Int?                  @map("payload_key_version")
+  createdAt         DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime              @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Powers "show me this provider's most recent background check" —
+  /// the provider-portal `GET .../me` endpoint and the ops review
+  /// page.
+  @@index([providerId, createdAt(sort: Desc)], map: "provider_background_checks_provider_recent_idx")
+  /// Powers the ops queue ("show me every check currently
+  /// `consider`-state awaiting manual review").
+  @@index([status], map: "provider_background_checks_status_idx")
+  @@map("provider_background_checks")
+  @@schema("provider")
+}
+
+/// Tier-transition reason (TS-052). Captures *why* a tier moved.
+///
+///   `auto_evaluation` — `TierPromotionService.evaluateAndApply`
+///                       recomputed eligibility from the provider's
+///                       active certifications + status and applied
+///                       the resulting tier. The driver was almost
+///                       always a cert grant / revoke / expiry; the
+///                       exact upstream is captured by the actor in
+///                       `triggered_by_user_id` plus the audit log
+///                       at the calling endpoint.
+///   `admin_override`  — `TierPromotionService.overrideTier` set
+///                       the tier directly. Used when ops needs to
+///                       suspend a tier (e.g. complaint review) or
+///                       restore a tier outside the certification
+///                       rules. Requires the `provider:approve`
+///                       permission at the controller boundary.
+///
+/// Kept narrow on purpose. More-granular distinctions
+/// (`certification_granted` vs `certification_revoked`) are derivable
+/// from the actor + endpoint logs, and a richer enum would force a
+/// schema change every time a new trigger lands.
+enum TierTransitionReason {
+  auto_evaluation
+  admin_override
+
+  @@map("tier_transition_reason")
+  @@schema("provider")
+}
+
+/// Certification catalog (TS-052). One row per credential the
+/// platform recognises.
+///
+/// **What lives here**. The cooking-academy certifications Taste &
+/// See issues plus any third-party credentials we honour. Phase-1
+/// seed (PRD §5.2 + §9):
+///   - `ccc` — Certified Culinary Companion (gates `certified` tier)
+///   - `ecc` — Elite Concierge Provider (gates `elite` tier alongside CCC)
+///   - `dementia_sensitive` — Dementia-Sensitive Dining (specialty)
+///   - `therapeutic_meals` — Therapeutic Meals (specialty)
+///
+/// **`code` discipline**. Stable forever — referenced by tier rules
+/// and by every issuance row. To retire a certification, flip
+/// `active = false` and stop offering it; never reuse a code.
+///
+/// **`default_validity_months`**. When set, `provider_certifications`
+/// rows for this cert auto-compute an `expires_at` from `issued_at +
+/// validity_months`. NULL means no expiry — appropriate for one-shot
+/// credentials with no renewal cycle. Gate certs (CCC, ECC) ship
+/// with a 24-month renewal cycle (PRD §9.3 / §15.2); specialty certs
+/// can ship with longer cycles or no expiry depending on the
+/// program design.
+///
+/// **Lifecycle**. The seed function (`seedCertificationsCatalog`)
+/// upserts on `code` so a rerun against a hand-edited row only
+/// refreshes the columns the catalog owns. Operators retire a cert
+/// by editing `active = false`; existing issuance rows continue to
+/// reference the catalog row.
+model Certification {
+  id                    String   @id @default(cuid())
+  code                  String   @unique
+  name                  String
+  description           String
+  issuer                String
+  defaultValidityMonths Int?     @map("default_validity_months")
+  sortPosition          Int      @default(0) @map("sort_position")
+  active                Boolean  @default(true)
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("certifications")
+  @@schema("provider")
+}
+
+/// Provider certification issuance (TS-052) — one row per grant of a
+/// credential to a provider.
+///
+/// **Lifecycle**. `issued_at` stamps creation; `expires_at` is
+/// optional (set when the catalog's `default_validity_months` is
+/// non-null, or supplied directly by the granter); `revoked_at` is
+/// set on explicit revoke. A cert is **active** when
+/// `revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now)`.
+///
+/// **Idempotency**. The partial unique index
+/// `provider_certifications_active_unique_idx` enforces "at most one
+/// active row per (provider, certification)" at the database level.
+/// Re-granting after revoke creates a fresh row — the partial
+/// predicate scopes uniqueness to the active set so the audit trail
+/// is preserved.
+///
+/// **Soft-FK convention**. `certificationId` is a soft FK into the
+/// same-schema `certifications.id` (same-schema FK is permitted per
+/// CLAUDE.md §4.1). `issuerUserId` and `revokerUserId` are soft FKs
+/// into `identity.users.id` and are not declared as Prisma
+/// relations.
+model ProviderCertification {
+  id               String    @id @default(cuid())
+  providerId       String    @map("provider_id")
+  certificationId  String    @map("certification_id")
+  issuedAt         DateTime  @default(now()) @map("issued_at") @db.Timestamptz(6)
+  expiresAt        DateTime? @map("expires_at") @db.Timestamptz(6)
+  revokedAt        DateTime? @map("revoked_at") @db.Timestamptz(6)
+  revocationReason String?   @map("revocation_reason")
+  issuerUserId     String?   @map("issuer_user_id")
+  revokerUserId    String?   @map("revoker_user_id")
+  notes            String?
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Dominant read path — `listForProvider(providerId)`.
+  @@index([providerId], map: "provider_certifications_provider_idx")
+  /// Powers "every provider who holds <cert>" — used by the search
+  /// indexer (TS-053) and ops reporting.
+  @@index([certificationId], map: "provider_certifications_certification_idx")
+  @@map("provider_certifications")
+  @@schema("provider")
+}
+
+/// Outbox event (TS-142-followup-1, PDD §7.3, CLAUDE.md §5.3).
+///
+/// Producer-side row written in the same Prisma transaction as the
+/// business state change. The `apps/workers/outbox-relay` worker
+/// polls for rows with `dispatched_at IS NULL`, forwards them to
+/// Redis Streams (`events:{event_name}`), and stamps `dispatched_at`
+/// on success. Consumers must be idempotent on `event_id`
+/// (at-least-once delivery semantics).
+///
+/// Column shape is identical across every producer service — each
+/// service ships its own migration that creates a separate
+/// `{schema}.outbox_events` table. The `@taste-and-see/nest-outbox`
+/// SDK is schema-agnostic; services compose `OutboxModule.forRoot`
+/// with their schema name and the SDK writes the row via raw SQL
+/// inside the caller's `prisma.$transaction`.
+///
+/// The model is declared here primarily so `prisma generate` reflects
+/// the table on the local client (for ad-hoc queries via Prisma
+/// Studio + admin tooling). Service code writes via the SDK's raw
+/// SQL surface; reads happen exclusively through the relay's
+/// `pg`-backed claim repository (the worker app does not share this
+/// Prisma client).
+///
+/// Provider-side producers (TS-052-followup-1):
+///   - `provider.certification_granted`  — emitted by
+///     ProviderCertificationsService.grant on a successful insert.
+///   - `provider.certification_revoked`  — emitted by
+///     ProviderCertificationsService.revoke on a successful revoke.
+///   - `provider.tier_changed`           — emitted by
+///     TierPromotionService.evaluateAndApply / overrideTier when a
+///     tier transition actually lands a row in
+///     `provider.provider_tier_history`. Consumed by
+///     `apps/workers/search-indexer` (TS-053) to keep the
+///     Elasticsearch provider-discovery doc fresh.
+model OutboxEvent {
+  /// Dedup key — consumers must idempotency-check on this. UUID v4
+  /// generated by the SDK by default; producers may pass an explicit
+  /// id (e.g. a deterministic `{providerId}.tier.{occurredAtEpochMs}`
+  /// composite) for cross-boundary exactly-once-effective delivery.
+  eventId         String    @id @map("event_id")
+  /// Dot-notation event name from `packages/contracts/events`. The
+  /// SDK validates the name against the registry before inserting
+  /// — unknown names are rejected at the producer boundary.
+  eventName       String    @map("event_name")
+  /// Validated domain payload (validated by the SDK against the
+  /// matching `eventRegistry` schema before insert).
+  payload         Json
+  /// Producer wall-clock time the event semantically happened. May
+  /// differ from `created_at` for backfilled events.
+  occurredAt      DateTime  @map("occurred_at") @db.Timestamptz(6)
+  /// Service name that produced the row (e.g. `service-provider`).
+  /// Useful for relay observability + per-service throughput metrics.
+  producerService String    @map("producer_service")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Stamped by the relay when the row has been successfully
+  /// forwarded onto the bus. Null means undispatched + eligible for
+  /// the next poll cycle.
+  dispatchedAt    DateTime? @map("dispatched_at") @db.Timestamptz(6)
+  /// Failed dispatch counter. The relay stops retrying once this
+  /// reaches `MAX_ATTEMPTS` — those rows are dead-lettered for ops
+  /// attention (surfaced via metrics + an admin endpoint).
+  attempts        Int       @default(0)
+  /// Stamped by the relay on the most recent failed attempt.
+  lastAttemptAt   DateTime? @map("last_attempt_at") @db.Timestamptz(6)
+  /// Most recent failure message — capped at 2000 chars at the
+  /// relay's record-failure path.
+  lastError       String?   @map("last_error")
+
+  /// Relay's dominant read query: "give me the next batch of
+  /// undispatched rows ordered by created_at". A partial index on
+  /// `dispatched_at IS NULL` keeps the index footprint bounded
+  /// against an ever-growing table (the table is append-only; the
+  /// partial filter is highly selective at steady state).
+  ///
+  /// Prisma's `@@index` cannot directly express the partial
+  /// predicate; the partial index is materialised in the migration
+  /// SQL (20260516120000_outbox_events).
+  @@index([eventName], map: "outbox_events_event_name_idx")
+  @@map("outbox_events")
+  @@schema("provider")
+}
+
+/// Provider tier history (TS-052) — append-only audit of every tier
+/// transition.
+///
+/// **Append-only invariant**. Rows are inserted and never updated or
+/// deleted (CLAUDE.md §3.6 / §17.7). The TierPromotionService inserts
+/// exactly one row per transition; admin tooling reads but never
+/// mutates.
+///
+/// **`fromTier` nullable**. The first transition for a freshly-
+/// created provider records the initial tier with `from_tier = NULL`.
+/// In practice this rarely fires (providers default to `basic` at row
+/// creation and most evaluations are no-ops until a certification
+/// lands), but the column is kept nullable for cases where the
+/// initial state was set out-of-band.
+///
+/// **No FK to the providers table** because the same-schema FK
+/// constraint can break tier-history reads when a provider is hard-
+/// deleted. The soft-FK pattern keeps history readable forever; ops
+/// reads filter by `provider_id` and accept that an orphaned row is
+/// orphaned data (in practice we never hard-delete providers — see
+/// the `Provider.deletedAt` column).
+model ProviderTierHistory {
+  id                String               @id @default(cuid())
+  providerId        String               @map("provider_id")
+  fromTier          ProviderTier?        @map("from_tier")
+  toTier            ProviderTier         @map("to_tier")
+  reason            TierTransitionReason
+  triggeredByUserId String?              @map("triggered_by_user_id")
+  notes             String?
+  occurredAt        DateTime             @default(now()) @map("occurred_at") @db.Timestamptz(6)
+  createdAt         DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// Dominant read path — `getHistory(providerId)` returns the
+  /// provider's transitions newest-first for the ops review page.
+  @@index([providerId, occurredAt(sort: Desc)], map: "provider_tier_history_provider_occurred_idx")
+  @@map("provider_tier_history")
+  @@schema("provider")
+}
+
+/// Weekday literal (TS-203). Mirrors the contract-layer
+/// `ProviderAvailabilityWeekdaySchema`. Lowercased English names
+/// because the family-portal's locale-aware rendering happens at
+/// the UI layer — the booking-svc availability gate matches on the
+/// literal, so swapping to numeric 0..6 here would force the
+/// downstream to translate.
+enum ProviderAvailabilityWeekday {
+  sunday
+  monday
+  tuesday
+  wednesday
+  thursday
+  friday
+  saturday
+
+  @@map("provider_availability_weekday")
+  @@schema("provider")
+}
+
+/// Recurring weekly availability window (TS-203). One row per
+/// `(provider_id, weekday, start_time, end_time)` quadruple.
+/// Multiple non-overlapping windows per weekday are allowed (e.g.
+/// lunch + dinner shifts on the same day).
+///
+/// **Half-open interval semantics**. `[start_time, end_time)` — a
+/// 09:00–13:00 window is inclusive of 09:00 and exclusive of 13:00.
+/// Midnight-spanning windows are NOT supported by the contract
+/// layer; the DB schema does not enforce the constraint (the
+/// downstream contract refine catches it before any INSERT lands)
+/// to keep the column shape simple.
+///
+/// **Time stored without timezone**. The provider's `time_zone`
+/// column on `providers` carries the interpretation — when the
+/// booking-svc availability gate (TS-060 / TS-205) reads a window,
+/// it composes the parent provider's `time_zone` with the local
+/// `start_time` / `end_time` to materialise a real instant. The
+/// `@db.Time(0)` column is timezone-naive minute-precision.
+///
+/// **Uniqueness**. The partial-free unique index
+/// `provider_availability_windows_unique_idx` enforces "at most one
+/// row per (provider, weekday, start, end)" so a malformed direct
+/// write surfaces as a 23505 PG unique-violation rather than
+/// silently doubling a shift. Cross-window overlap detection
+/// (Sunday 09:00–13:00 vs Sunday 12:00–14:00) lives at the contract
+/// layer — the DB cannot express the overlap predicate without a
+/// trigger.
+///
+/// **Soft-FK to providers** — same-schema FK is allowed per
+/// CLAUDE.md §4.1, but the soft-FK pattern is consistent with the
+/// rest of the provider domain and keeps history readable if a
+/// provider is hard-deleted (which Phase-1 never does — `Provider.
+/// deletedAt` is the canonical removal).
+model ProviderAvailabilityWindow {
+  id         String                      @id @default(cuid())
+  providerId String                      @map("provider_id")
+  weekday    ProviderAvailabilityWeekday
+  /// Local-time inclusive start (minute precision; no seconds).
+  startTime  DateTime                    @map("start_time") @db.Time(0)
+  /// Local-time exclusive end (minute precision; no seconds). The
+  /// contract layer enforces `startTime < endTime`.
+  endTime    DateTime                    @map("end_time") @db.Time(0)
+  createdAt  DateTime                    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime                    @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Dominant read path — `getAvailability(providerId)` returns the
+  /// full set of windows for one provider, partitioned by weekday
+  /// client-side. The `(provider_id, weekday, start_time)` shape
+  /// also serves the booking-svc availability gate's
+  /// "does this provider have a slot covering 2026-05-21 11:30?"
+  /// query with index-only scans.
+  @@index([providerId, weekday, startTime], map: "provider_availability_windows_provider_weekday_idx")
+  /// Defence-in-depth dedup at the DB layer — the contract layer
+  /// rejects overlapping windows + duplicates at the boundary.
+  @@unique([providerId, weekday, startTime, endTime], map: "provider_availability_windows_unique_idx")
+  @@map("provider_availability_windows")
+  @@schema("provider")
+}
+
+/// Date-keyed availability exception (TS-203). One row per
+/// `(provider_id, exception_date)` pair. The provider declares "I
+/// am not available on this date" — every recurring window
+/// scheduled for that date is treated as blocked. Partial-day
+/// blocks + per-date overrides are NOT modelled in this phase
+/// (TS-203-followup-1 lands them).
+///
+/// **Date stored as PG `date`**. Calendar date in the provider's
+/// local timezone; no time-of-day component. The booking-svc
+/// availability gate reads the date verbatim against the same
+/// timezone-naive comparison the recurring windows use.
+///
+/// **Uniqueness**. One exception per (provider, date) pair.
+/// Duplicate writes surface as a 23505 PG unique-violation.
+model ProviderAvailabilityException {
+  id            String   @id @default(cuid())
+  providerId    String   @map("provider_id")
+  /// Date in the provider's local timezone (calendar date only).
+  exceptionDate DateTime @map("exception_date") @db.Date
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// Dominant read path — `getAvailability(providerId)` returns the
+  /// full set of exceptions for one provider, sorted by date. The
+  /// booking-svc availability gate also reads with this index when
+  /// resolving "is YYYY-MM-DD blocked for this provider?".
+  @@index([providerId, exceptionDate], map: "provider_availability_exceptions_provider_date_idx")
+  /// Defence-in-depth dedup at the DB layer — the contract layer
+  /// rejects duplicate dates at the boundary.
+  @@unique([providerId, exceptionDate], map: "provider_availability_exceptions_unique_idx")
+  @@map("provider_availability_exceptions")
+  @@schema("provider")
+}
+
+/// Provider service area (TS-202). One row per declared coverage
+/// polygon. A provider serving both Manhattan's Upper East Side and
+/// parts of Brooklyn declares two rows.
+///
+/// **GeoJSON, not PostGIS** (Phase-1 scope choice). `geo_polygon`
+/// stores the GeoJSON `Polygon` (RFC 7946) verbatim as `jsonb`. The
+/// `centroid_*` + `bbox_*` columns are the planar area-weighted
+/// centroid + axis-aligned bounding box, computed in
+/// `ServiceAreasService` at write time and persisted so the
+/// search-indexer (TS-053-followup-3) + the household-in-service-area
+/// gate (TS-210) can read them without re-parsing the polygon. No
+/// PostGIS extension is required on the Phase-1 self-managed Postgres;
+/// polygon-intersection search lands with the live Elasticsearch geo
+/// wiring (TS-210).
+///
+/// **Float columns are geographic coordinates, NOT money** — the
+/// CLAUDE.md §4.1 "no floats for money" rule does not apply. WGS84
+/// decimal degrees in `double precision` is the conventional geo
+/// representation; six fractional digits (~10 cm) is far inside
+/// `double`'s precision.
+///
+/// **Soft-FK to providers** — same-schema FK is allowed per CLAUDE.md
+/// §4.1, but the soft-FK pattern is consistent with the rest of the
+/// provider domain and keeps history readable if a provider is
+/// hard-deleted (which Phase-1 never does — `Provider.deletedAt` is
+/// the canonical removal).
+///
+/// **Full-set replace semantics** — the editor PUTs the complete set;
+/// the service DELETEs every row for the provider then bulk-inserts
+/// the new set inside one transaction. No per-row uniqueness
+/// constraint: two identical polygons are a client error the contract
+/// layer does not (yet) reject, but a duplicate coverage area is
+/// harmless to the centroid + radius scoring.
+model ProviderServiceArea {
+  id         String @id @default(cuid())
+  providerId String @map("provider_id")
+  /// Optional human label ("Upper East Side"). Null = unlabelled.
+  label      String?
+  /// GeoJSON `Polygon` (RFC 7946) stored verbatim. `coordinates[0]`
+  /// is the exterior ring; subsequent rings are holes. Positions are
+  /// `[longitude, latitude]`.
+  geoPolygon Json   @map("geo_polygon")
+  /// Planar area-weighted centroid of the exterior ring (WGS84 decimal
+  /// degrees). Read by the discovery-doc projection (TS-053-followup-3).
+  centroidLatitude  Float @map("centroid_latitude")
+  centroidLongitude Float @map("centroid_longitude")
+  /// Axis-aligned bounding box (WGS84 decimal degrees). `min* <= max*`
+  /// guaranteed by the producer. A cheap pre-filter for the
+  /// household-in-service-area gate (TS-210).
+  bboxMinLatitude   Float @map("bbox_min_latitude")
+  bboxMinLongitude  Float @map("bbox_min_longitude")
+  bboxMaxLatitude   Float @map("bbox_max_latitude")
+  bboxMaxLongitude  Float @map("bbox_max_longitude")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Dominant read path — `getServiceAreas(providerId)` returns the
+  /// full set of areas for one provider. The discovery-snapshot
+  /// projection (TS-053-followup-3) reads the same way.
+  @@index([providerId], map: "provider_service_areas_provider_idx")
+  @@map("provider_service_areas")
+  @@schema("provider")
+}
+
+/// External calendar provider (TS-206). Mirrors the contract-layer
+/// `ProviderCalendarProviderSchema`. Phase-1 ships `google` only;
+/// `icloud` (CalDAV) + `outlook` (Microsoft Graph) append — never
+/// reorder — with TS-206-followup-2.
+enum ProviderCalendarProvider {
+  google
+
+  @@map("provider_calendar_provider")
+  @@schema("provider")
+}
+
+/// External-calendar connection health (TS-206). Mirrors the contract-
+/// layer `ProviderCalendarConnectionStatusSchema`.
+///
+///   `connected` — refresh token held + last free/busy pull succeeded.
+///   `error`     — last sync failed (Google rejected the refresh token:
+///                 the provider revoked access on Google's side, or the
+///                 grant expired). The provider must reconnect; the
+///                 reconsent prompt is TS-206-followup-5.
+///
+/// A disconnected provider has NO row at all (the DELETE drops it), so
+/// there is no `disconnected` member.
+enum ProviderCalendarConnectionStatus {
+  connected
+  error
+
+  @@map("provider_calendar_connection_status")
+  @@schema("provider")
+}
+
+/// Provider external-calendar connection (TS-206). One row per
+/// (provider, external calendar) — Phase-1 one Google connection per
+/// provider, enforced by the `provider_id` unique index (the
+/// `calendar_provider` column is forward-compat for the iCloud /
+/// Outlook siblings; when a provider can link more than one external
+/// calendar, the unique moves to `(provider_id, calendar_provider)`).
+///
+/// **Refresh token at rest is encrypted** (AES-256-GCM) under
+/// `CALENDAR_TOKEN_ENC_KEY` — an **independent** key from every other
+/// cipher in the codebase (CLAUDE.md §3.5 compartmentalisation). The
+/// four `refresh_token_*` columns mirror the `provider_background_checks.
+/// payload_*` shape (ciphertext + 96-bit IV + 128-bit GCM tag + key
+/// version). The refresh token is a long-lived secret — never logged
+/// (CLAUDE.md §3.9 / §17.2). Columns are non-null: a connection row is
+/// only ever written with a freshly-encrypted token.
+///
+/// **`connected_account_email`** is low-sensitivity (the provider's own
+/// Google account address, captured from the `openid email` claim) and
+/// stored in clear for display in the portal. Nullable — a re-grant may
+/// omit the claim.
+///
+/// **No event content** is stored here — busy intervals live in the
+/// separate `provider_availability_external` mirror; this row holds only
+/// the connection state + the encrypted token.
+///
+/// **Soft-FK to providers** — same-schema FK is allowed (CLAUDE.md §4.1)
+/// but the soft-FK pattern is consistent with the rest of the provider
+/// domain.
+model ProviderCalendarConnection {
+  id                    String                           @id @default(cuid())
+  providerId            String                           @unique @map("provider_id")
+  calendarProvider      ProviderCalendarProvider         @default(google) @map("calendar_provider")
+  status                ProviderCalendarConnectionStatus @default(connected)
+  /// Low-sensitivity Google account address (display only). Nullable.
+  connectedAccountEmail String?                          @map("connected_account_email")
+  /// OAuth scope string granted at consent time. Stored for audit /
+  /// debugging ("does this grant still carry the freebusy scope?").
+  grantedScope          String?                          @map("granted_scope")
+  /// AES-256-GCM ciphertext of the Google refresh token.
+  refreshTokenCiphertext Bytes                           @map("refresh_token_ciphertext")
+  /// 96-bit random IV used for the GCM encryption.
+  refreshTokenIv        Bytes                            @map("refresh_token_iv")
+  /// 128-bit GCM authentication tag.
+  refreshTokenAuthTag   Bytes                            @map("refresh_token_auth_tag")
+  /// Key version used for the encryption — forward-compatible rotation
+  /// via TS-206-followup-5's backfill worker.
+  refreshTokenKeyVersion Int                             @map("refresh_token_key_version")
+  /// Last successful free/busy pull. Null until the first sync lands.
+  lastSyncedAt          DateTime?                        @map("last_synced_at") @db.Timestamptz(6)
+  /// Last failure message when `status = error`; null when healthy.
+  /// Capped at 512 chars at the service boundary.
+  lastSyncError         String?                          @map("last_sync_error")
+  createdAt             DateTime                         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime                         @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("provider_calendar_connections")
+  @@schema("provider")
+}
+
+/// Provider external availability busy mirror (TS-206) — the read-only
+/// cache of busy intervals pulled from the provider's external calendar
+/// via the free/busy API. The availability projection (TS-203
+/// `resolveNextSevenDays`) unions these intervals with the recurring
+/// windows + date exclusions: a window occurrence that overlaps an
+/// external busy block is treated as unavailable.
+///
+/// **Derived + re-buildable.** A sync DELETEs every row for the provider
+/// then bulk-inserts the fresh set inside one transaction; dropping +
+/// re-syncing is always safe (the source of truth is the external
+/// calendar). The table name `provider_availability_external` matches
+/// the TS-206 acceptance wording.
+///
+/// **No event content** — only opaque absolute `[starts_at, ends_at)`
+/// UTC instants + the source. Never a title / attendee / location /
+/// description (the OAuth scope is free/busy-only; ADR-0003).
+///
+/// **Absolute UTC instants.** Unlike the recurring `provider_availability
+/// _windows` (local wall-clock `time(0)`), external busy intervals are
+/// concrete instants from the external calendar, stored as
+/// `timestamptz`. The availability-union helper converts the local
+/// recurring windows into UTC instants (using the provider's `time_zone`)
+/// before testing overlap.
+///
+/// **Soft-FK to providers** — soft-FK convention per CLAUDE.md §4.1.
+model ProviderCalendarExternalBusy {
+  id               String                   @id @default(cuid())
+  providerId       String                   @map("provider_id")
+  source           ProviderCalendarProvider @default(google)
+  startsAt         DateTime                 @map("starts_at") @db.Timestamptz(6)
+  endsAt           DateTime                 @map("ends_at") @db.Timestamptz(6)
+  /// When this busy interval was last (re-)synced into the mirror. All
+  /// rows from one sync carry the same timestamp.
+  syncedAt         DateTime                 @default(now()) @map("synced_at") @db.Timestamptz(6)
+  createdAt        DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// Dominant read path — `getExternalBusyIntervals(providerId)` returns
+  /// the provider's mirrored intervals ordered by start. The
+  /// `(provider_id, starts_at)` shape also serves a future booking-svc
+  /// availability gate's "is this provider busy at instant T?" range
+  /// scan (TS-206-followup-4).
+  @@index([providerId, startsAt], map: "provider_availability_external_provider_starts_idx")
+  @@map("provider_availability_external")
+  @@schema("provider")
+}
+
+/// Consumer-side dedup ledger for `@taste-and-see/nest-outbox-consumer`
+/// (TS-305d — service-provider's FIRST outbox-consumer surface; every
+/// other table in this schema is producer-side or write-side master).
+///
+/// Mirrors the canonical copy in `service-accounting` /
+/// `service-trust-safety`. The `state` CHECK constraint and the partial
+/// index on `dead_lettered_at IS NOT NULL` live in the migration SQL,
+/// not here — Prisma cannot express either.
+///
+/// **This table is a CACHE of processing decisions, not the idempotency
+/// guarantee.** Truncate it, or rename the consumer group, and every
+/// event replays. The durable guard for the metrics projection is that
+/// each handler's write is *conditional* — it fills a column that is
+/// still null and never overwrites a decided one — so replaying an
+/// event is a no-op rather than a double count. See
+/// `ProviderBookingFact`.
+model OutboxConsumerDedup {
+  consumerGroup  String    @map("consumer_group")
+  eventId        String    @map("event_id")
+  eventName      String    @map("event_name")
+  state          String
+  attempts       Int       @default(1)
+  lastError      String?   @map("last_error")
+  firstSeenAt    DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  lastAttemptAt  DateTime  @default(now()) @map("last_attempt_at") @db.Timestamptz(6)
+  processedAt    DateTime? @map("processed_at") @db.Timestamptz(6)
+  deadLetteredAt DateTime? @map("dead_lettered_at") @db.Timestamptz(6)
+
+  @@id([consumerGroup, eventId])
+  @@map("outbox_consumer_dedup")
+  @@schema("provider")
+}
+
+/// Per-booking projection of service-booking's lifecycle events — the
+/// fact table `provider_metrics` is derived from (TS-305d).
+///
+/// **Why a per-booking row and not counters alone.** Two of the three
+/// figures PDD §8.2 promises cannot be computed from counters:
+///
+///   - **Response time** needs the offer instant *and* the response
+///     instant on the same booking. `booking.confirmed` carries
+///     `confirmedAt` but NOT the original offer time, so the projector
+///     has to retain `booking.created.occurredAt` somewhere. A row is
+///     that somewhere.
+///   - **A rolling window** cannot be decremented out of a counter
+///     without the underlying dates. Keeping the dates makes any
+///     window a query rather than a schema decision — which matters,
+///     because 90 days is an unconfirmed product number (see
+///     `PROVIDER_METRICS_WINDOW_DAYS` at the contract layer).
+///
+/// **This is a read model built from events, not a copy of another
+/// service's table** (CLAUDE.md §2.3 forbids the latter). It carries no
+/// household id, no senior id, no money and no free text — only what a
+/// reliability aggregate needs. The booking's identity is kept solely
+/// so the projection can be idempotent and order-independent.
+///
+/// **Every column is written CONDITIONALLY.** Each handler fills the
+/// fields for its own lifecycle position, and only while they are still
+/// unset, so a replayed event is a no-op and out-of-order events still
+/// converge (a `booking.completed` seen before its `booking.created`
+/// creates the row; the later `created` fills the offer instant). This
+/// is the durable idempotency guard — `outbox_consumer_dedup` is only a
+/// cache in front of it.
+///
+/// **What this table deliberately CANNOT answer: who caused a
+/// cancellation.** `booking.canceled` carries `canceledByUserId`, but
+/// service-provider cannot resolve whether that id is the provider, the
+/// family payer or an admin without a cross-service read §2.3 forbids —
+/// the same wall TS-308c hit. So the figure derived here is "bookings
+/// cancelled after this provider accepted them", which is a fact, and
+/// NOT "cancellations the provider caused", which would be a guess. The
+/// contract's field names say so out loud.
+model ProviderBookingFact {
+  /// Soft FK into `booking.bookings.id`. The PK — one row per booking,
+  /// which is what makes every handler an upsert.
+  bookingId              String    @id @map("booking_id")
+  /// Soft FK into `providers.id`. Present on every booking lifecycle
+  /// event (`BookingIdentifiersSchema`), so any handler can create the
+  /// row even when it is the first one seen for that booking.
+  providerId             String    @map("provider_id")
+  /// `BookingServiceKind` from the contract layer. TEXT rather than an
+  /// enum: this is a projection of another context's vocabulary, and a
+  /// new service kind there must not require a `CREATE TYPE` here.
+  serviceKind            String?   @map("service_kind")
+  /// `booking.created.occurredAt` — when the request reached the
+  /// provider. Null when the `created` event has not been seen (an
+  /// out-of-order delivery, or a booking that predates this
+  /// projection); a null offer instant excludes the row from
+  /// response-time statistics but NOT from completion statistics.
+  offeredAt              DateTime? @map("offered_at") @db.Timestamptz(6)
+  /// When the offer was answered — `confirmedAt` or `declinedAt`.
+  respondedAt            DateTime? @map("responded_at") @db.Timestamptz(6)
+  /// `accepted` | `declined`. Set together with `responded_at`, always.
+  responseKind           String?   @map("response_kind")
+  /// `provider_declined` | `window_expired` | `admin_declined` from
+  /// `booking.declined`. Load-bearing, and the reason acceptance is not
+  /// one number: `window_expired` is a provider who never answered,
+  /// `admin_declined` is not the provider's act at all, and collapsing
+  /// the three would score ops decisions against the provider.
+  declineKind            String?   @map("decline_kind")
+  /// Terminal lifecycle position: `completed` | `canceled` | `declined`.
+  outcome                String?
+  /// When the terminal position was reached.
+  outcomeAt              DateTime? @map("outcome_at") @db.Timestamptz(6)
+  /// `BookingCancellationReason` when `outcome = 'canceled'`. Kept
+  /// because `no_show` is a materially different event from
+  /// `family_schedule_change`, and one cancellation rate hides that.
+  cancellationReason     String?   @map("cancellation_reason")
+  /// `pending` | `confirmed` | `in_progress` — the status the booking
+  /// was cancelled OUT OF. This is what makes a cancellation relatable
+  /// to the acceptance at all: a booking cancelled from `pending` was
+  /// never accepted, so it belongs to the offer funnel and not to
+  /// reliability.
+  canceledPreviousStatus String?   @map("canceled_previous_status")
+  createdAt              DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The dominant read path is always "this provider's facts, bounded
+  /// by a date". `outcome_at` bounds the reliability figures;
+  /// `offered_at` bounds the funnel figures, which the second index
+  /// serves.
+  @@index([providerId, outcomeAt], map: "provider_booking_facts_provider_outcome_idx")
+  @@index([providerId, offeredAt], map: "provider_booking_facts_provider_offered_idx")
+  @@map("provider_booking_facts")
+  @@schema("provider")
+}
+
+/// Lifetime reliability rollup per provider (TS-305d) — the
+/// `provider_metrics` table PDD §8.2 has named since TS-050.
+///
+/// **Only LIFETIME figures live here, and that is the whole design
+/// decision.** A stored rolling-window figure is wrong the moment the
+/// clock moves past its edge: a provider who stops working keeps a
+/// flattering 90-day completion rate forever, because nothing arrives
+/// to trigger a recompute. Lifetime counters have no such edge — they
+/// change only when an event arrives, which is exactly when this row is
+/// recomputed. The windowed figures are therefore derived at READ time
+/// from `provider_booking_facts`, where they cannot go stale.
+///
+/// So the split is: this table exists for reads that span MANY
+/// providers (search ranking, TS-053-followup-4's discovery document, a
+/// future reliability-aware tier rule) where a per-provider aggregate
+/// would be an N+1. A single-provider read (the dossier, the 360) goes
+/// to the facts.
+///
+/// **Recomputed, never incremented.** Each handler re-derives this row
+/// from that provider's facts inside the same transaction as the fact
+/// write. An increment would drift the moment one event were replayed
+/// or applied out of order; a recompute cannot.
+///
+/// **No rating columns.** PDD §8.2's sketch lists `rating_avg`, but
+/// nothing on this platform captures a rating, and a nullable column
+/// here would read as "this provider has no rating" when the truth is
+/// "Taste and See does not collect ratings" (TS-305e). The absence is
+/// deliberate, exactly as it is in the dossier contract.
+model ProviderMetrics {
+  /// Soft FK into `providers.id`. One row per provider, created on the
+  /// first booking event seen for them.
+  providerId                      String    @id @map("provider_id")
+  /// Offers seen — rows with a known `offered_at`.
+  bookingsOffered                 Int       @default(0) @map("bookings_offered")
+  bookingsAccepted                Int       @default(0) @map("bookings_accepted")
+  /// Declines the provider actually made (`decline_kind =
+  /// 'provider_declined'`). Excludes `window_expired` and
+  /// `admin_declined` — see `ProviderBookingFact.declineKind`.
+  bookingsDeclined                Int       @default(0) @map("bookings_declined")
+  /// Offers that lapsed unanswered (`decline_kind = 'window_expired'`).
+  /// Counted separately because "said no" and "never answered" are
+  /// different provider behaviours with different remedies.
+  bookingsExpired                 Int       @default(0) @map("bookings_expired")
+  bookingsCompleted               Int       @default(0) @map("bookings_completed")
+  /// Bookings cancelled after this provider accepted them, by any
+  /// party. NOT "cancellations the provider caused" — see the
+  /// `ProviderBookingFact` doc-block.
+  bookingsCanceledAfterAcceptance Int       @default(0) @map("bookings_canceled_after_acceptance")
+  /// Sum and count of offer-to-response gaps, in whole seconds, over
+  /// bookings where both instants are known. A MEAN is derivable from
+  /// this pair; a MEDIAN is not — which is why the dossier's
+  /// response-time figure is computed from the facts, and this pair
+  /// serves only the many-provider reads.
+  responseSecondsTotal            BigInt    @default(0) @map("response_seconds_total")
+  responseSamples                 Int       @default(0) @map("response_samples")
+  /// Earliest and latest fact observed. `firstObservedAt` tells a
+  /// reader how far back the record actually goes, which a rate alone
+  /// never does.
+  firstObservedAt                 DateTime? @map("first_observed_at") @db.Timestamptz(6)
+  lastObservedAt                  DateTime? @map("last_observed_at") @db.Timestamptz(6)
+  /// When this rollup was last re-derived.
+  computedAt                      DateTime  @default(now()) @map("computed_at") @db.Timestamptz(6)
+  createdAt                       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("provider_metrics")
+  @@schema("provider")
+}

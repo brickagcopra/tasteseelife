@@ -1,0 +1,149 @@
+# Per-app base for web-marketing (TS-151-followup-1 rollout). Consumes the
+# reusable web-app component (Next.js 15 standalone).
+#
+# Lives in `platform-frontends`. No Secret object (ConfigMap-only envFrom);
+# the marketing site has no SECRET server env — it is a public static-ish
+# brand + blog-reader surface. It does need `API_GATEWAY_BASE_URL`
+# (TS-282-followup-6): the blog reads through the gateway's anonymous proxy,
+# and the value is a cluster-internal address, not a credential.
+# Runs on container port 3000; the component
+# Service maps 80 → 3000 and the Ingress routes public traffic in via
+# ingress-nginx. The Ingress host + TLS are placeholders here and patched
+# per-env in the overlays (www.<env>.tasteseelife.com + LE issuer).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-frontends
+
+components:
+  - ../../components/web-app
+
+commonLabels:
+  app.kubernetes.io/name: web-marketing
+  app.kubernetes.io/instance: web-marketing
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: web-app
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-marketing
+
+  - target:
+      kind: ConfigMap
+      name: web-app-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-marketing-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          # LOG_LEVEL is intentionally NOT set here. It was copied from the service
+          # ConfigMap template, and no Next portal reads it: no schema declares it, no
+          # source reads it off process.env, and `next start` has no such setting. A key
+          # that configures nothing while looking like configuration is the
+          # TS-306-followup-1c defect, and `k8s-required-env-coverage.test.ts` now fails
+          # on it. Portal-side log level arrives with portal observability
+          # (TS-504-followup-2a-1); wire it up there rather than re-adding it here.
+          PORT: "3000"
+          NEXT_TELEMETRY_DISABLED: "1"
+          SERVICE_VERSION: dev
+          # EMPTY = off, and the portal simply does not initialise Sentry rather
+          # than failing to boot. Same posture as the 24 Nest workloads: the real
+          # DSN is supplied per env by the overlay or the operator, it is not
+          # committed, and it is not a Secret placeholder because a REPLACE_WITH_
+          # value is not a valid DSN.
+          #
+          # Only the SERVER and EDGE runtimes report. There is no browser SDK
+          # here — session replay and DOM breadcrumbs over a named senior's care
+          # schedule is a §12 / PDD §16.3 consent question, not a default
+          # (TS-504-followup-2a-1).
+          SENTRY_DSN: ""
+          # TS-282-followup-6 — the public blog (TS-282-followup-3) reads
+          # through the gateway's anonymous proxy. Set in the BASE, not
+          # per-overlay, because the value is cluster-internal DNS and is
+          # identical in every environment — the same posture web-family,
+          # web-admin and web-provider already have. Without it `blog.ts`
+          # makes no fetch at all and both /blog routes render their quiet
+          # "unavailable" state; the site still builds and serves, which is
+          # exactly why the gap could go unnoticed.
+          API_GATEWAY_BASE_URL: http://api-gateway.platform-services.svc.cluster.local:3000
+
+  - target:
+      kind: Service
+      name: web-app
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-marketing
+
+  - target:
+      kind: Deployment
+      name: web-app
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-marketing
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: web-marketing
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/web-marketing:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: web-marketing-config
+
+  - target:
+      kind: NetworkPolicy
+      name: web-app
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-marketing
+
+  - target:
+      kind: PodDisruptionBudget
+      name: web-app
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-marketing
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: web-app
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-marketing
+      - op: replace
+        path: /spec/scaleTargetRef/name
+        value: web-marketing
+
+  - target:
+      kind: Ingress
+      name: web-app
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-marketing
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: www.tasteseelife.com
+      - op: replace
+        path: /spec/tls/0/secretName
+        value: web-marketing-tls
+      - op: replace
+        path: /spec/rules/0/host
+        value: www.tasteseelife.com
+      - op: replace
+        path: /spec/rules/0/http/paths/0/backend/service/name
+        value: web-marketing

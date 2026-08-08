@@ -1,0 +1,342 @@
+// Notification bounded context — see PDD §7.2 (service inventory entry
+// #9), PDD §12.1 (channels), PDD §12.2 (templating — MJML + Handlebars,
+// locale-aware, variables strictly typed via shared contract package),
+// PDD §10.15 (centralised template management in the admin CMS with
+// versioning + preview + test sends), and CLAUDE.md §3.3 (Zod
+// validation at boundaries) + §17.7 (mutating an authored version
+// would orphan the rendered output that referenced it).
+//
+// Scope so far:
+//   - TS-072 adds the `notification` Postgres schema with two tables:
+//     `notification_templates` (the per-`(code, locale)` registry row)
+//     and `notification_template_versions` (the per-template monotonic
+//     immutable content blob). The DB-level append-only enforcement on
+//     versions (UPDATE / DELETE triggers, mirror of audit_events) lands
+//     as TS-072-followup-11; today the service layer is the only writer
+//     and it never updates a written version.
+//
+//   - Channel-specific delivery (TS-073) adds sibling tables
+//     `notification_messages` (per-message dispatch state) + the
+//     Cassandra `notification.history` keyspace (PDD §8.3 — high-volume
+//     append-only delivery log).
+//
+// Cross-service references are by id only — never a foreign key into
+// another service schema (CLAUDE.md §2.3, §4.1). The `created_by_user_id`
+// columns are free TEXT — service-notification doesn't maintain
+// referential integrity with `identity.users`.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  schemas  = ["notification"]
+}
+
+/// Channel kind for a template. PDD §12.1 inventory:
+///   - `email`   — transactional email (Postmark / SES). MJML-authored.
+///   - `sms`     — Twilio SMS (booking reminders, OTPs, escalations).
+///                 Plain-text body only; subject is irrelevant.
+///   - `push`    — APNs + FCM. Plain-text body + optional title (subject).
+///   - `in_app`  — real-time WebSocket fan-out (TS-070 messaging deck).
+///                 Plain-text body + optional subject.
+///
+/// The Renderer enforces the per-kind body-shape rules at render time;
+/// the storage layer's CHECK constraints in the migration enforce the
+/// same rules at the row level (defence-in-depth).
+enum NotificationChannelKind {
+  email
+  sms
+  push
+  in_app
+
+  @@map("notification_channel_kind")
+  @@schema("notification")
+}
+
+/// Locale tag for a template. PRD §11.4 lists en-US Phase 1, then
+/// es-US + zh-CN Phase 2. We list all three so the admin tooling can
+/// author Phase-2 templates ahead of the channel launch.
+enum NotificationLocale {
+  en_US
+  es_US
+  zh_CN
+
+  @@map("notification_locale")
+  @@schema("notification")
+}
+
+/// Notification template — the per-`(code, locale)` registry row.
+///
+/// A template has zero-or-more versions; one of them may be the
+/// "active" version that the renderer resolves at render time. Until a
+/// version is activated, the template is reachable in the admin UI but
+/// the renderer returns 404.
+///
+/// **`(code, locale)` UNIQUE.** The renderer looks up by the pair —
+/// every channel call carries the locale so the same `code` resolves
+/// to the right localised content.
+///
+/// **No tenant scoping yet.** Phase 1 templates are global. When
+/// partner-org branding requires per-tenant overrides (PDD §400),
+/// add a nullable `tenant_id` column with a sibling partial-unique
+/// index `(code, locale, tenant_id) WHERE deleted_at IS NULL`.
+///
+/// **`created_by_user_id`** is a soft FK into `identity.users.id` — free
+/// TEXT, no Prisma relation (CLAUDE.md §2.3 / §4.1).
+model NotificationTemplate {
+  id              String                   @id @default(cuid())
+  code            String
+  locale          NotificationLocale
+  kind            NotificationChannelKind
+  name            String
+  description     String?
+  /// The currently-rendering version. Null until first activation.
+  /// Points at a row in `notification_template_versions`. Kept as a
+  /// soft FK (Prisma relation declared below) so the renderer fetches
+  /// the version directly without a second round-trip.
+  activeVersionId String?                  @map("active_version_id")
+  createdByUserId String                   @map("created_by_user_id")
+  createdAt       DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  versions      NotificationTemplateVersion[] @relation("template_versions")
+  activeVersion NotificationTemplateVersion?  @relation("active_version", fields: [activeVersionId], references: [id], onDelete: SetNull)
+
+  /// `(code, locale)` UNIQUE — drives the renderer's primary lookup
+  /// and prevents accidental dupes when the admin tooling lands the
+  /// same code twice.
+  @@unique([code, locale], map: "notification_templates_code_locale_key")
+  /// `kind` composite — drives the "all email templates" admin filter.
+  @@index([kind, code], map: "notification_templates_kind_code_idx")
+
+  @@map("notification_templates")
+  @@schema("notification")
+}
+
+/// Notification category (TS-073). Drives the preference + quiet-hours
+/// gate inside the dispatch orchestrator.
+///   - `transactional` — default opt-in; honors quiet hours unless the
+///     caller asks for `bypassQuietHours`.
+///   - `marketing` — default opt-OUT (TCPA / CAN-SPAM). Always honors
+///     quiet hours.
+///   - `system` — default opt-in; honors quiet hours.
+enum NotificationCategory {
+  transactional
+  marketing
+  system
+
+  @@map("notification_category")
+  @@schema("notification")
+}
+
+/// Dispatch lifecycle status (TS-073). Recorded on the
+/// `notification_dispatches` row. See contract docs for semantics.
+enum NotificationDispatchStatus {
+  queued
+  sent
+  failed
+  suppressed_by_preference
+  suppressed_by_quiet_hours
+  suppressed_by_unsubscribed
+
+  @@map("notification_dispatch_status")
+  @@schema("notification")
+}
+
+/// Why was a dispatch suppressed? Set when status is one of the
+/// `suppressed_by_*` variants. Null otherwise (DB CHECK below).
+enum NotificationSuppressionReason {
+  preference_opted_out
+  quiet_hours
+  globally_unsubscribed
+  recipient_address_missing
+
+  @@map("notification_suppression_reason")
+  @@schema("notification")
+}
+
+/// Per-user notification preference row (TS-073). Composite PK on
+/// `(user_id, channel, category)` — the same user has one row per
+/// `(channel, category)` pair, e.g. (email, transactional, opt_in=true).
+///
+/// Quiet hours + senior_mode + time_zone live on a SEPARATE row keyed
+/// by `user_id` only — `NotificationUserPreferenceProfile`. The split
+/// keeps the per-pair preference toggle (the dominant write path) from
+/// dragging the quiet-hours columns along on every UPSERT.
+///
+/// Cross-service: `user_id` is a soft-FK into `identity.users.id` (TEXT,
+/// no Prisma relation — CLAUDE.md §2.3).
+model NotificationPreference {
+  userId    String                  @map("user_id")
+  channel   NotificationChannelKind
+  category  NotificationCategory
+  optIn     Boolean                 @map("opt_in")
+  createdAt DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@id([userId, channel, category])
+  @@index([userId], map: "notification_preferences_user_idx")
+  @@map("notification_preferences")
+  @@schema("notification")
+}
+
+/// Per-user notification profile (TS-073) — quiet-hours window + senior
+/// flag + time zone. One row per user. The dispatch orchestrator joins
+/// against this and applies senior-mode defaults when the row is missing
+/// for a senior-flagged user.
+///
+/// Stored as minute-of-day integers `[0, 1440)` paired with an IANA
+/// time-zone identifier so the gate can reconstruct the user's local
+/// time without ambiguity around DST. Both window columns are either
+/// both set (a window is configured) or both null (no window).
+///
+/// `senior_mode` is denormalised from `service-household`'s senior
+/// records via an outbox event (TS-073-followup); pre-relay the column
+/// is admin-set or defaults to false.
+model NotificationUserPreferenceProfile {
+  userId                String   @id @map("user_id")
+  quietHoursStartMinute Int?     @map("quiet_hours_start_minute")
+  quietHoursEndMinute   Int?     @map("quiet_hours_end_minute")
+  timeZone              String?  @map("time_zone")
+  seniorMode            Boolean  @default(false) @map("senior_mode")
+  globallyUnsubscribed  Boolean  @default(false) @map("globally_unsubscribed")
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("notification_user_preference_profiles")
+  @@schema("notification")
+}
+
+/// Per-dispatch row (TS-073). One row per call to the dispatch
+/// orchestrator, regardless of outcome (sent / failed / suppressed_*).
+///
+/// **`idempotency_key` UNIQUE.** The orchestrator dedups on this key so
+/// a retried upstream call returns the original dispatch row. Length
+/// floor enforced by the contract; format is caller-defined.
+///
+/// **`recipient_address`** carries the channel-specific address: email,
+/// E.164 phone, FCM device token, etc. The orchestrator validates the
+/// shape against the channel before persisting.
+///
+/// **`status`** + **`suppression_reason`** + **`provider_message_id`** +
+/// **`error_message`** form a discriminated tuple — the DB CHECK below
+/// enforces the per-status invariants so a malformed row can't land.
+///
+/// **`template_id`** / **`template_version_id`** are soft FKs into the
+/// notification schema's own tables (within-schema; we don't declare a
+/// Prisma relation so failed dispatches that reference a deleted
+/// template version don't cascade-delete the audit trail).
+///
+/// **No DELETE.** Retention policy lands as a follow-up; until then the
+/// row is permanent.
+model NotificationDispatch {
+  id                    String                          @id @default(cuid())
+  recipientUserId       String                          @map("recipient_user_id")
+  channel               NotificationChannelKind
+  category              NotificationCategory
+  templateCode          String                          @map("template_code")
+  locale                NotificationLocale
+  templateId            String?                         @map("template_id")
+  templateVersionId     String?                         @map("template_version_id")
+  recipientAddress      String                          @map("recipient_address")
+  status                NotificationDispatchStatus
+  suppressionReason     NotificationSuppressionReason?  @map("suppression_reason")
+  providerMessageId     String?                         @map("provider_message_id")
+  errorMessage          String?                         @map("error_message")
+  idempotencyKey        String                          @map("idempotency_key")
+  sourceEventId         String?                         @map("source_event_id")
+  bypassQuietHours      Boolean                         @default(false) @map("bypass_quiet_hours")
+  occurredAt            DateTime                        @default(now()) @map("occurred_at") @db.Timestamptz(6)
+  sentAt                DateTime?                       @map("sent_at") @db.Timestamptz(6)
+
+  @@unique([idempotencyKey], map: "notification_dispatches_idempotency_key_uniq")
+  @@index([recipientUserId, occurredAt(sort: Desc)], map: "notification_dispatches_recipient_occurred_idx")
+  @@index([status, occurredAt(sort: Desc)], map: "notification_dispatches_status_occurred_idx")
+  @@index([channel, category, occurredAt(sort: Desc)], map: "notification_dispatches_channel_category_idx")
+  @@map("notification_dispatches")
+  @@schema("notification")
+}
+
+/// Notification template version — the per-template monotonic
+/// immutable content blob.
+///
+/// **Immutable after write.** Service-layer code only INSERTs;
+/// activation flips a pointer on the parent template, never mutates a
+/// version row. The DB-level UPDATE / DELETE triggers that enforce
+/// this at the storage layer land as TS-072-followup-11.
+///
+/// **Monotonic `version` per template.** The service stamps the next
+/// `MAX(version) + 1` for the parent template; the `(template_id, version)`
+/// UNIQUE index serialises concurrent inserts (one winner, the loser
+/// retries — captured as the standard Phase-1 concurrent-version-create
+/// recovery path).
+///
+/// **Body shape varies by kind (denormalised from parent).**
+///   - `email`:  `subject` + (`body_mjml` OR `body_html`) required.
+///   - `sms`:    `body_text` required; `subject` / MJML / HTML absent.
+///   - `push`:   `body_text` required; `subject` optional (notification
+///               title); MJML / HTML absent.
+///   - `in_app`: `body_text` required; `subject` optional; MJML / HTML
+///               absent.
+///
+/// The CHECK constraints in the migration enforce this at the row
+/// level — defence-in-depth against a service-layer code regression.
+///
+/// **`body_html`** is populated by the MJML compiler at version-create
+/// time (the dominant path) or supplied directly by the admin (rare).
+/// Either way the render path reads `body_html` exclusively — the
+/// renderer never re-compiles MJML at render time (PDD §7.3 performance
+/// budget — render is a sync HTTP handler).
+///
+/// **`variables_schema`** declares the variables the Handlebars
+/// renderer will accept. Stored as a JSONB array matching the
+/// `NotificationVariableEntrySchema` contract shape — the service
+/// validates the array against the contract before INSERT.
+model NotificationTemplateVersion {
+  id              String                  @id @default(cuid())
+  templateId      String                  @map("template_id")
+  /// Denormalised from the parent template so the renderer's per-row
+  /// CHECK constraints work without a JOIN.
+  kind            NotificationChannelKind
+  version         Int
+  subject         String?
+  bodyMjml        String?                 @map("body_mjml")
+  bodyHtml        String?                 @map("body_html")
+  bodyText        String?                 @map("body_text")
+  /// JSONB array matching `NotificationVariableEntrySchema[]` from the
+  /// contracts package. Stored verbatim; the service re-validates on
+  /// the read path so a future contract tightening surfaces as a 422.
+  variablesSchema Json                    @map("variables_schema")
+  changeSummary   String?                 @map("change_summary")
+  createdByUserId String                  @map("created_by_user_id")
+  createdAt       DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  template      NotificationTemplate   @relation("template_versions", fields: [templateId], references: [id], onDelete: Cascade)
+  activeFor     NotificationTemplate[] @relation("active_version")
+
+  /// `(template_id, version)` UNIQUE — monotonic per template.
+  @@unique([templateId, version], map: "notification_template_versions_template_version_key")
+  /// Powers "list all versions for this template, newest first" — the
+  /// admin detail view.
+  @@index([templateId, version(sort: Desc)], map: "notification_template_versions_template_version_desc_idx")
+
+  @@map("notification_template_versions")
+  @@schema("notification")
+}

@@ -1,0 +1,40 @@
+-- TS-217-prep-4c-followup-1 — precise per-search query→booking attribution.
+--
+-- The nightly search-relevance aggregation (TS-217-prep-3b) now also computes a
+-- PRECISE per-search conversion numerator: `booking_created_events` rows in the
+-- UTC-day window whose `search_id` (the correlation token threaded by
+-- TS-217-prep-4c) joins a same-window `search_events.event_id`. This replaces
+-- prep-3b's approximate `(household_id, time-window)` funnel with an exact
+-- per-search attribution, surfaced as `attributed_bookings` on the daily summary
+-- mart (the approximate `bookings_created` / `distinct_searchers` funnel is
+-- RETAINED alongside it for continuity + a token-coverage cross-check).
+--
+-- `attributed_bookings` is a recomputed COUNT primitive (the dashboard derives
+-- the rate `attributed_bookings / total_searches`, guarding a zero denominator),
+-- so it follows the same raw-counts-not-rates discipline as the rest of the
+-- mart.
+--
+-- DERIVED mart, recomputed idempotently each run (delete-and-reinsert keyed by
+-- `metric_date`, folded into the existing prep-3b transaction). The column is
+-- added `NOT NULL DEFAULT 0`: forward-compatible expand (CLAUDE.md §4.1) — any
+-- pre-existing `search_relevance_daily` row reads 0 until the next nightly
+-- recompute rewrites that day from the raw landing tables (which is when the
+-- precise count first becomes available). The default is a constant, so the
+-- ALTER is a metadata-only change on this one-row-per-day table (no row rewrite).
+--
+-- The join key — `search_id` on `booking_created_events` + its index — already
+-- shipped in TS-217-prep-4c; no raw-table change is required here.
+--
+-- Reversal plan:
+--   ALTER TABLE "analytics"."search_relevance_daily" DROP COLUMN "attributed_bookings";
+-- Safe in isolation — additive column, no other object depends on it.
+--
+-- Migration was authored by hand to match prisma/schema.prisma exactly.
+-- Apply locally with:
+--   pnpm -F @taste-and-see/service-analytics prisma:migrate:deploy
+-- against a Postgres reachable at $DATABASE_URL (docker-compose:
+-- `pnpm infra:up` brings up postgres on 5432).
+
+-- AlterTable: add the precise per-search attribution numerator.
+ALTER TABLE "analytics"."search_relevance_daily"
+    ADD COLUMN "attributed_bookings" INTEGER NOT NULL DEFAULT 0;

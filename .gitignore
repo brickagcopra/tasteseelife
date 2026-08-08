@@ -1,0 +1,92 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+out/
+.next/
+.turbo/
+*.tsbuildinfo
+
+# Test outputs
+coverage/
+coverage-integration/
+playwright-report/
+test-results/
+.nyc_output/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment files (per CLAUDE.md §3.5 / §17.12 — never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Operator secret values consumed by infra/kubernetes/scripts/seal-secrets.mjs
+# (TS-151-followup-2). These hold ~133 LIVE credentials in plaintext — the
+# SealedSecret ciphertext is what belongs in git, never its input.
+secrets.*.env
+secrets.env
+
+# Sealed-secrets controller private key backups. Losing this key makes every
+# committed SealedSecret permanently undecryptable, so the runbook says to back
+# it up — and it is a Secret manifest in the clear, so it must never land here.
+sealed-secrets-key*.yaml
+sealed-secrets-master.key
+
+# Editor + OS
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.DS_Store
+Thumbs.db
+
+# Generated
+*.pid
+*.seed
+.cache/
+
+# Docker volumes
+.docker-data/
+
+# Prisma generated client
+**/prisma/generated/
+
+# Local infra data
+infra/local/data/
+
+# Terraform (HashiCorp official template, trimmed)
+# Local .terraform directories
+**/.terraform/*
+# State files — never commit, even encrypted (CLAUDE.md §3.5 / §17.12)
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+# Crash logs
+crash.log
+crash.*.log
+# Variable files — may carry tokens, DB DSNs, SSH keypaths
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+# CLI / planning artifacts
+.terraformrc
+terraform.rc
+*.tfplan
+*.tfplan.binary
+
+# Husky auto-generated wrapper scripts (committed hooks live alongside)
+.husky/_/

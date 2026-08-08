@@ -1,0 +1,1578 @@
+/*
+ * Taste & See — admin console global styles (TS-123).
+ *
+ * Mirrors `apps/web-provider/app/globals.css` for the auth + dashboard
+ * primitives. The admin surface diverges visually in two small ways:
+ *
+ *   1. `.admin-banner` runs across the top of every authenticated
+ *      surface, naming the console and the operator's signed-in id so
+ *      there's no ambiguity about who is acting. (Borrowed from the
+ *      Birador / CareConnect admin patterns.)
+ *
+ *   2. `.dash-card--placeholder` softens the disabled-state card colour
+ *      so the "permissions pending" surface reads as deliberately
+ *      unfinished rather than broken.
+ *
+ * Senior-mode tokens (contrast pairs, tap target sizes) inherit from
+ * the design-tokens import; the admin console does not surface a
+ * senior-mode toggle (staff are not the senior-mode audience), but the
+ * AAA-contrast pair stays available for any operator with low-vision
+ * needs.
+ */
+
+@import '@taste-and-see/design-tokens/styles/tokens.css';
+
+:root {
+  --serif: var(--font-cormorant), 'Cormorant Garamond', Georgia, serif;
+  --sans: var(--font-dm-sans), 'DM Sans', system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+/* Auth surfaces — login, verify. */
+.auth-shell {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+}
+.auth-card {
+  width: 100%;
+  max-width: 480px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 48px 40px;
+  box-shadow: var(--shadow-card);
+}
+.auth-card h1 {
+  font-family: var(--serif);
+  font-weight: 300;
+  font-size: clamp(28px, 3vw, 38px);
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  margin: 0 0 8px;
+  color: var(--espresso);
+}
+.auth-card p {
+  margin: 0 0 24px;
+  color: var(--ink-soft);
+}
+.auth-form {
+  display: grid;
+  gap: 16px;
+}
+.auth-form label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--espresso);
+  font-weight: 500;
+}
+.auth-form input {
+  font-family: var(--sans);
+  font-size: 15px;
+  padding: 12px 14px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: 4px;
+  outline: none;
+  transition: border-color 0.15s ease;
+  min-height: var(--tap-target-min);
+}
+.auth-form input:focus-visible {
+  border-color: var(--espresso);
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: var(--focus-ring-offset);
+}
+.auth-form .help {
+  font-size: 12px;
+  color: var(--ink-soft);
+  font-weight: 400;
+}
+.auth-form .submit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 14px 22px;
+  border-radius: 999px;
+  background: var(--espresso);
+  color: var(--paper);
+  border: 1px solid var(--espresso);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  min-height: var(--tap-target-min);
+  transition:
+    transform 0.15s ease,
+    background 0.15s ease;
+}
+.auth-form .submit:hover {
+  background: var(--ink);
+  transform: translateY(-1px);
+}
+.auth-form .submit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.auth-alert {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border-radius: 4px;
+  background: rgba(168, 79, 51, 0.08);
+  border: 1px solid var(--clay);
+  color: var(--espresso);
+  font-size: 14px;
+}
+.auth-alert--info {
+  background: rgba(127, 142, 109, 0.12);
+  border-color: var(--sage);
+}
+.auth-foot {
+  margin-top: 24px;
+  font-size: 13.5px;
+  color: var(--ink-soft);
+}
+.auth-foot a {
+  color: var(--espresso);
+  text-decoration: underline;
+}
+
+/* Admin banner — sits above the dashboard top bar so the operator's
+ * scope of authority is impossible to miss. Black-on-cream by default,
+ * inverts on hover for the sign-out button. */
+.admin-banner {
+  background: var(--ink);
+  color: var(--paper);
+  padding: 6px 32px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.admin-banner__operator {
+  opacity: 0.85;
+}
+
+/* Impersonation banner (TS-297) — sits above everything, including the
+ * admin banner, whenever an impersonation session is live. Clay-toned so
+ * it cannot be mistaken for the ordinary operator banner; WCAG AA+
+ * contrast pair from the design tokens. */
+.impersonation-banner {
+  background: var(--clay);
+  color: var(--paper);
+  padding: 8px 32px;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.impersonation-banner__label strong {
+  font-weight: 700;
+}
+.impersonation-banner__end {
+  background: var(--paper);
+  color: var(--ink);
+  border: 1px solid var(--paper);
+  padding: 4px 14px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  min-height: 32px;
+}
+.impersonation-banner__end:hover,
+.impersonation-banner__end:focus-visible {
+  background: var(--ink);
+  color: var(--paper);
+}
+.impersonation-banner__end:focus-visible {
+  outline: var(--focus-ring-width) solid var(--paper);
+  outline-offset: 2px;
+}
+
+/* Dashboard shell. */
+.dash-shell {
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+  min-height: 100vh;
+  background: var(--linen);
+}
+.dash-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 32px;
+  background: var(--paper);
+  border-bottom: 1px solid var(--rule);
+}
+.dash-brand {
+  font-family: var(--serif);
+  font-size: 20px;
+  font-weight: 400;
+  color: var(--espresso);
+}
+.dash-account {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 13.5px;
+  color: var(--ink-soft);
+}
+.dash-logout {
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-size: 13px;
+  color: var(--espresso);
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+.dash-logout:hover {
+  border-color: var(--espresso);
+  background: var(--espresso);
+  color: var(--paper);
+}
+.dash-main {
+  padding: 48px 32px;
+  max-width: 1080px;
+  margin: 0 auto;
+  width: 100%;
+}
+.dash-main h1 {
+  font-family: var(--serif);
+  font-weight: 300;
+  font-size: clamp(34px, 4vw, 52px);
+  letter-spacing: -0.02em;
+  color: var(--espresso);
+  margin: 0 0 16px;
+}
+.dash-main p {
+  color: var(--ink-soft);
+  max-width: 60ch;
+}
+.dash-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px;
+  margin-top: 40px;
+}
+.dash-card {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 24px;
+}
+.dash-card h2 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 20px;
+  color: var(--espresso);
+  margin: 0 0 8px;
+}
+.dash-card p {
+  font-size: 14px;
+  margin: 0;
+}
+.dash-card--placeholder {
+  background: rgba(127, 142, 109, 0.06);
+  border-style: dashed;
+}
+.dash-card--placeholder h2 {
+  color: var(--espresso);
+}
+
+.role-list {
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.role-list li {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12.5px;
+  color: var(--espresso);
+}
+
+/* TS-126 — Users console primitives. Filter bar, table-as-grid, detail
+ * sections. Kept under the admin surface only — these are not exposed
+ * to family / provider portals. */
+
+.dash-card__cta {
+  display: inline-block;
+  margin-top: 16px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--espresso);
+  text-decoration: underline;
+}
+
+.filter-bar {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1.5fr auto;
+  gap: 12px;
+  align-items: end;
+  margin: 32px 0 24px;
+  padding: 16px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+}
+.filter-bar__field {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--espresso);
+  font-weight: 500;
+}
+.filter-bar__field input,
+.filter-bar__field select {
+  font-family: var(--sans);
+  font-size: 14px;
+  padding: 8px 10px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: 4px;
+  min-height: var(--tap-target-min);
+}
+.filter-bar__field input:focus-visible,
+.filter-bar__field select:focus-visible {
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: var(--focus-ring-offset);
+  border-color: var(--espresso);
+}
+.filter-bar__actions {
+  display: flex;
+  gap: 8px;
+}
+.filter-bar__submit {
+  display: inline-flex;
+  align-items: center;
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: var(--espresso);
+  color: var(--paper);
+  border: 1px solid var(--espresso);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  min-height: var(--tap-target-min);
+}
+.filter-bar__reset {
+  display: inline-flex;
+  align-items: center;
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--espresso);
+  border: 1px solid var(--rule);
+  font-size: 13px;
+  font-weight: 500;
+  min-height: var(--tap-target-min);
+}
+
+.user-empty {
+  padding: 32px;
+  border: 1px dashed var(--rule);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--ink-soft);
+  text-align: center;
+}
+
+.user-table {
+  display: grid;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.user-table__head,
+.user-row {
+  display: grid;
+  grid-template-columns: 2.5fr 1fr 0.6fr 0.6fr 1fr;
+  gap: 16px;
+  padding: 12px 16px;
+  align-items: center;
+  font-size: 14px;
+}
+.user-table__head {
+  font-size: 11.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  border-bottom: 1px solid var(--rule);
+  background: rgba(127, 142, 109, 0.04);
+}
+.user-row {
+  color: var(--ink);
+  text-decoration: none;
+  border-bottom: 1px solid var(--rule);
+  transition: background 0.1s ease;
+}
+.user-row:last-child {
+  border-bottom: none;
+}
+.user-row:hover {
+  background: rgba(127, 142, 109, 0.06);
+}
+.user-row__email {
+  font-weight: 500;
+  color: var(--espresso);
+  margin-right: 8px;
+}
+.user-row__chip {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(127, 142, 109, 0.16);
+  border: 1px solid var(--sage);
+  font-size: 11px;
+  color: var(--espresso);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.user-row__chip--warn {
+  background: rgba(168, 79, 51, 0.12);
+  border-color: var(--clay);
+}
+.user-row__chip--ok {
+  background: rgba(127, 142, 109, 0.3);
+  border-color: var(--sage);
+  font-weight: 600;
+}
+.user-row__status {
+  font-size: 12.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+.user-row__status--active {
+  color: var(--sage);
+}
+.user-row__status--suspended,
+.user-row__status--deactivated {
+  color: var(--clay);
+}
+.user-row__date {
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.user-pagination {
+  margin-top: 16px;
+  font-size: 13.5px;
+  color: var(--ink-soft);
+}
+
+/* Detail surface. */
+.user-detail__sub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: -8px 0 32px;
+}
+.user-detail__section {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 24px;
+  margin-bottom: 16px;
+}
+.user-detail__section h2 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 18px;
+  color: var(--espresso);
+  margin: 0 0 16px;
+}
+.user-detail__section--placeholder {
+  background: rgba(127, 142, 109, 0.06);
+  border-style: dashed;
+}
+.user-detail__dl {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 8px 16px;
+  margin: 0;
+  font-size: 14px;
+}
+.user-detail__dl dt {
+  color: var(--ink-soft);
+  font-weight: 500;
+}
+.user-detail__dl dd {
+  margin: 0;
+  color: var(--ink);
+}
+.user-detail__hint {
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+.user-detail__mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  color: var(--espresso);
+}
+.user-detail__role-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 12px;
+}
+.user-detail__role-list li {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--rule);
+}
+.user-detail__role-list li:last-child {
+  border-bottom: none;
+}
+.user-detail__role-name {
+  font-weight: 500;
+  color: var(--espresso);
+  margin-right: 8px;
+}
+.user-detail__permissions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 8px;
+}
+.user-detail__permissions code {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(127, 142, 109, 0.1);
+  color: var(--espresso);
+}
+
+/**
+ * TS-129 accounting view additions — a totals row at the foot of the
+ * trial balance, plus a code-block presentation for the journal-detail
+ * context payload. Reuses the existing user-row primitive so the
+ * accounting tables share the same chrome as the rest of the admin
+ * console.
+ */
+.user-row--total {
+  border-top: 2px solid var(--rule);
+  background: rgba(127, 142, 109, 0.04);
+  font-weight: 500;
+}
+.user-detail__pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  padding: 12px;
+  border-radius: 6px;
+  background: rgba(127, 142, 109, 0.08);
+  color: var(--espresso);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/**
+ * TS-126-followup-1 admin user actions. Three disclosure cards (one
+ * per action) inside the existing user-detail__section chrome. Disabled
+ * cards render flat (no <details>) so the surface clearly reflects
+ * which actions are legal in the current state. The danger button uses
+ * a warmer red than the chip palette to read as a deliberate destructive
+ * affordance without being alarmist.
+ */
+.user-detail__actions-grid {
+  display: grid;
+  gap: 16px;
+  margin-top: 16px;
+}
+.user-detail__action-card {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 16px;
+  background: var(--paper);
+}
+.user-detail__action-card--disabled {
+  background: rgba(127, 142, 109, 0.04);
+  display: grid;
+  gap: 4px;
+  color: var(--ink-soft);
+}
+.user-detail__action-card > summary {
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  list-style: none;
+}
+.user-detail__action-card > summary::-webkit-details-marker {
+  display: none;
+}
+.user-detail__action-card > summary::before {
+  content: '▶ ';
+  display: inline;
+  color: var(--ink-soft);
+  margin-right: 4px;
+}
+.user-detail__action-card[open] > summary::before {
+  content: '▼ ';
+}
+.user-detail__action-form {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+.user-detail__action-label {
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.user-detail__action-label select,
+.user-detail__action-label textarea,
+.user-detail__action-label input {
+  font: inherit;
+  padding: 8px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--ink);
+}
+.user-detail__action-label textarea {
+  resize: vertical;
+}
+.user-detail__subhead {
+  margin: 12px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.user-detail__action-button {
+  font: inherit;
+  font-weight: 500;
+  padding: 10px 20px;
+  border-radius: 6px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--espresso);
+  cursor: pointer;
+  justify-self: start;
+}
+.user-detail__action-button:hover {
+  background: rgba(127, 142, 109, 0.08);
+}
+.user-detail__action-button--danger {
+  background: #a83a3a;
+  border-color: #a83a3a;
+  color: #fff;
+}
+.user-detail__action-button--danger:hover {
+  background: #8d2f2f;
+}
+.user-detail__action-button:disabled,
+.user-detail__action-button--danger:disabled {
+  background: rgba(127, 127, 127, 0.15);
+  border-color: var(--rule);
+  color: var(--ink-soft);
+  cursor: not-allowed;
+}
+.user-detail__action-button--danger:disabled:hover {
+  background: rgba(127, 127, 127, 0.15);
+}
+.user-detail__actions-warn {
+  background: rgba(184, 122, 32, 0.08);
+  border-left: 3px solid #b87a20;
+  padding: 8px 12px;
+  border-radius: 4px;
+  margin: 8px 0 0;
+}
+.user-detail__banner {
+  padding: 12px 16px;
+  border-radius: 6px;
+  margin-bottom: 16px;
+  font-weight: 500;
+}
+.user-detail__banner--ok {
+  background: rgba(82, 122, 64, 0.1);
+  color: #355430;
+  border: 1px solid rgba(82, 122, 64, 0.4);
+}
+.user-detail__banner--err {
+  background: rgba(168, 58, 58, 0.08);
+  color: #8d2f2f;
+  border: 1px solid rgba(168, 58, 58, 0.3);
+}
+
+/* ── Concierge ops console (TS-224) ──────────────────────────────────── */
+.concierge-queue {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+.concierge-queue__row {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--paper);
+}
+.concierge-queue__link {
+  display: grid;
+  gap: 6px;
+  padding: 12px 16px;
+  text-decoration: none;
+  color: var(--ink);
+}
+.concierge-queue__link:hover {
+  background: rgba(127, 142, 109, 0.08);
+}
+.concierge-queue__subject {
+  font-weight: 600;
+  color: var(--espresso);
+}
+.concierge-queue__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.concierge-queue__household {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+.concierge-chip--escalated {
+  background: rgba(168, 79, 51, 0.14);
+  border-color: var(--clay);
+}
+.concierge-sla {
+  margin-left: 8px;
+  font-size: 12px;
+  letter-spacing: 0.03em;
+  color: var(--ink-soft);
+}
+.concierge-sla--overdue {
+  color: #8d2f2f;
+  font-weight: 600;
+}
+.concierge-detail__body {
+  white-space: pre-wrap;
+  line-height: 1.55;
+}
+.concierge-detail__facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  margin: 12px 0 0;
+}
+.concierge-detail__fact {
+  display: contents;
+}
+.concierge-detail__fact dt {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.concierge-detail__fact dd {
+  margin: 0;
+  color: var(--ink);
+}
+.concierge-notes {
+  list-style: none;
+  margin: 0 0 16px;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.concierge-notes__item {
+  border-left: 3px solid var(--sage);
+  padding: 6px 12px;
+  background: rgba(127, 142, 109, 0.06);
+  border-radius: 0 4px 4px 0;
+}
+.concierge-notes__body {
+  margin: 0 0 2px;
+  white-space: pre-wrap;
+  line-height: 1.5;
+}
+.concierge-note-form {
+  margin-top: 8px;
+}
+
+/* ── Concierge scheduled events (TS-227) ─────────────────────────────── */
+.concierge-event-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+}
+.concierge-event-form,
+.concierge-event-update {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  align-items: end;
+}
+.concierge-event-form button,
+.concierge-event-update button {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+/* Grouped sub-section within a create form (TS-271b ads campaign creatives /
+   targeting). Spans the full grid width and re-lays its fields in a sub-grid. */
+.concierge-event-form__group {
+  grid-column: 1 / -1;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 12px 14px;
+  margin: 0;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  align-items: end;
+}
+.concierge-event-form__group legend {
+  grid-column: 1 / -1;
+  padding: 0;
+  font-weight: 600;
+}
+/* Checkbox affordance within an admin action form (TS-277b ads creative review).
+   Spans the full form grid and lays the box + label as an inline row. */
+.user-detail__action-checkbox {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink);
+  font-size: 14px;
+}
+.user-detail__action-checkbox input {
+  width: auto;
+  margin: 0;
+}
+.concierge-event-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+.concierge-event-card {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--paper);
+  padding: 14px 16px;
+}
+.concierge-event-card__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.concierge-event-card__title {
+  font-weight: 600;
+  color: var(--espresso);
+  margin-right: 4px;
+}
+.concierge-event-update {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--rule);
+}
+
+/* TS-228 — Tier-3 onboarding checklist. */
+.onboarding-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0 4px;
+}
+.onboarding-progress__track {
+  flex: 1;
+  height: 8px;
+  border-radius: var(--radius-full, 999px);
+  background: var(--linen);
+  overflow: hidden;
+}
+.onboarding-progress__fill {
+  height: 100%;
+  background: var(--sage);
+  border-radius: var(--radius-full, 999px);
+  transition: width 120ms ease;
+}
+.onboarding-progress__label {
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+.onboarding-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+.onboarding-step {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--paper);
+  padding: 14px 16px;
+}
+.onboarding-step__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.onboarding-step__title {
+  font-weight: 600;
+  color: var(--espresso);
+}
+.onboarding-step__description {
+  margin: 6px 0 0;
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+}
+.onboarding-step__meta,
+.onboarding-step__notes {
+  margin: 6px 0 0;
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+}
+.onboarding-step__form {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--rule);
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  align-items: end;
+}
+.onboarding-step__form button {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+.onboarding-cancel-form {
+  margin-top: 12px;
+}
+
+/* TS-229 — Tier-3 weekly enrichment summary. */
+.enrichment-sections {
+  display: grid;
+  gap: 14px;
+  margin-top: 14px;
+}
+.enrichment-section {
+  border-top: 1px dashed var(--rule);
+  padding-top: 12px;
+}
+.enrichment-section__title {
+  margin: 0 0 4px;
+  font-size: 0.95rem;
+  color: var(--espresso);
+}
+.enrichment-section__body {
+  margin: 0;
+  color: var(--ink-soft);
+  white-space: pre-wrap;
+}
+.enrichment-transitions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+/* TS-251-followup-1 — Cooking Academy catalog editor (module → lesson tree). */
+.academy-tree {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 14px;
+}
+.academy-module {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--paper);
+  padding: 14px 16px;
+}
+.academy-lesson-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0 0 0 16px;
+  border-left: 2px solid var(--linen);
+  display: grid;
+  gap: 10px;
+}
+.academy-lesson {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--paper);
+  padding: 10px 12px;
+}
+.academy-disclosure {
+  margin-top: 10px;
+}
+.academy-disclosure > summary {
+  cursor: pointer;
+  font-size: 0.9rem;
+  color: var(--espresso);
+  font-weight: 600;
+}
+.academy-disclosure[open] > summary {
+  margin-bottom: 10px;
+}
+
+/* SaaS-metrics dashboard (TS-266) */
+.saas-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: 8px 0 4px;
+}
+.saas-export {
+  display: inline-block;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--espresso);
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.saas-export:hover,
+.saas-export:focus-visible {
+  background: rgba(127, 142, 109, 0.08);
+}
+.saas-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin: 16px 0 8px;
+}
+.saas-kpi {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+}
+.saas-kpi__label {
+  font-size: 11.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+.saas-kpi__value {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--espresso);
+  font-variant-numeric: tabular-nums;
+}
+.saas-section-title {
+  margin-top: 28px;
+}
+.saas-sparks {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+.saas-spark {
+  padding: 14px 16px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+}
+.saas-spark__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.saas-spark__label {
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+.saas-spark__latest {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--espresso);
+  font-variant-numeric: tabular-nums;
+}
+.saas-spark__svg {
+  display: block;
+  width: 100%;
+  height: 48px;
+}
+.saas-spark__line {
+  fill: none;
+  stroke: var(--sage);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+.saas-spark__dot {
+  fill: var(--sage);
+}
+.saas-spark__empty {
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.saas-table__head,
+.saas-table__row {
+  grid-template-columns: 1.2fr 1fr 1fr 1fr 1.1fr 0.7fr 0.8fr 0.8fr;
+  font-variant-numeric: tabular-nums;
+}
+.saas-neg {
+  color: var(--clay);
+}
+
+/* Search-relevance dashboard (TS-217b) */
+.srm-table__head,
+.srm-table__row {
+  grid-template-columns: 1.2fr 0.9fr 0.9fr 0.7fr 0.9fr 0.9fr 1fr 1fr;
+  font-variant-numeric: tabular-nums;
+}
+.srm-q-table__head,
+.srm-q-table__row {
+  grid-template-columns: 3fr 1fr 1fr;
+  font-variant-numeric: tabular-nums;
+}
+.srm-sort-table__head,
+.srm-sort-table__row {
+  grid-template-columns: 2fr 1fr 1fr;
+  font-variant-numeric: tabular-nums;
+}
+.srm-ctr-table__head,
+.srm-ctr-table__row {
+  grid-template-columns: 1fr 1fr 1.2fr 1fr;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── Content authoring (TS-281 / ADR-0004) ──────────────────────────────── */
+.content-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.content-editor__modes {
+  display: inline-flex;
+  gap: 0.25rem;
+}
+.content-editor__mode {
+  font-family: var(--sans);
+  font-size: 0.8rem;
+  padding: 0.25rem 0.75rem;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+.content-editor__mode--active {
+  background: var(--clay);
+  color: var(--paper);
+  border-color: var(--clay);
+}
+.content-editor__wysiwyg,
+.content-editor__markdown {
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--paper);
+  padding: 0.75rem;
+  min-height: 12rem;
+  font-family: var(--sans);
+  color: var(--ink);
+  width: 100%;
+}
+.content-editor__markdown {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  resize: vertical;
+}
+.content-editor__surface:focus {
+  outline: 2px solid var(--clay);
+  outline-offset: 2px;
+}
+.content-editor__wysiwyg .content-editor__surface > * + * {
+  margin-top: 0.6rem;
+}
+.content-editor__wysiwyg h1,
+.content-editor__wysiwyg h2,
+.content-editor__wysiwyg h3 {
+  font-family: var(--serif);
+  color: var(--espresso);
+  line-height: 1.2;
+}
+.content-editor__wysiwyg a {
+  color: var(--clay);
+  text-decoration: underline;
+}
+
+/* Sanitized preview / rendered content (packages/ui ContentMarkdown consumers). */
+.content-markdown {
+  font-family: var(--sans);
+  color: var(--ink);
+  line-height: 1.6;
+}
+.content-markdown h1,
+.content-markdown h2,
+.content-markdown h3 {
+  font-family: var(--serif);
+  color: var(--espresso);
+}
+.content-markdown a {
+  color: var(--clay);
+  text-decoration: underline;
+}
+
+/* RBAC permission matrix (TS-290 role builder). Semantic table — one
+   row per resource, labelled checkboxes per action. Tap targets +
+   focus states per CLAUDE.md §8.3/§8.5. */
+.perm-matrix {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 14px;
+}
+.perm-matrix th,
+.perm-matrix td {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--rule);
+  text-align: left;
+  vertical-align: top;
+}
+.perm-matrix thead th {
+  font-size: 11.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  background: rgba(127, 142, 109, 0.04);
+}
+.perm-matrix tbody tr:last-child th,
+.perm-matrix tbody tr:last-child td {
+  border-bottom: none;
+}
+.perm-matrix__actions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.perm-matrix__label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  min-height: var(--tap-target-min);
+  cursor: pointer;
+}
+.perm-matrix__label input[type='checkbox'] {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  align-self: center;
+  accent-color: var(--sage);
+}
+.perm-matrix__label input[type='checkbox']:focus-visible {
+  outline: 2px solid var(--clay);
+  outline-offset: 2px;
+}
+.perm-matrix__label input[type='checkbox']:disabled {
+  cursor: not-allowed;
+}
+.perm-matrix__description {
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+/* RBAC role-edit review diff (TS-291). Rides the .perm-matrix table
+   base; added/removed always pair color with a text label so the
+   diff never relies on color alone (§8.3 senior-mode). */
+.perm-diff__entry {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.perm-diff__entry--removed code {
+  text-decoration: line-through;
+  text-decoration-color: var(--clay);
+}
+.perm-diff__chip {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--sage);
+  background: rgba(127, 142, 109, 0.16);
+  font-size: 11px;
+  color: var(--espresso);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.perm-diff__chip--removed {
+  background: rgba(168, 79, 51, 0.12);
+  border-color: var(--clay);
+}
+.perm-diff__empty {
+  color: var(--ink-soft);
+  font-size: 13px;
+  font-style: italic;
+}
+.perm-diff__unchanged {
+  margin-top: 12px;
+}
+.perm-diff__unchanged summary {
+  display: flex;
+  align-items: center;
+  min-height: var(--tap-target-min);
+  cursor: pointer;
+  color: var(--ink-soft);
+}
+.perm-diff__unchanged summary:focus-visible {
+  outline: 2px solid var(--clay);
+  outline-offset: 2px;
+}
+.perm-diff__unchanged ul {
+  padding: 8px 0 0 0;
+}
+
+/* Explicit "added / positive" chip variant (TS-292 assignment + bulk
+   tables). Same visual as the base chip — named so table cells never
+   rely on the default alone to signal a positive state. */
+.perm-diff__chip--added {
+  background: rgba(127, 142, 109, 0.16);
+  border-color: var(--sage);
+}
+
+/* Bulk role-assignment workflow (TS-292). */
+.bulk-assign__upload {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 16px;
+  margin: 16px 0;
+}
+.bulk-assign__file-label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.bulk-assign__file-label input[type='file'] {
+  min-height: var(--tap-target-min);
+}
+.bulk-assign__file-label input[type='file']:focus-visible {
+  outline: 2px solid var(--clay);
+  outline-offset: 2px;
+}
+.bulk-assign__table td {
+  vertical-align: top;
+}
+.bulk-assign__errors {
+  margin: 6px 0 0 0;
+  padding: 0 0 0 16px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.bulk-assign__commit {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 16px;
+}
+.bulk-assign__confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--tap-target-min);
+  cursor: pointer;
+}
+.bulk-assign__confirm input[type='checkbox']:focus-visible {
+  outline: 2px solid var(--clay);
+  outline-offset: 2px;
+}
+
+/* Compact per-row form (assignment revoke buttons in tables). */
+.user-detail__inline-form {
+  display: inline-block;
+  margin: 0;
+}
+
+/* Screen-reader-only helper (semantic captions the layout hides). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/*
+ * Media asset previews (TS-282-followup-5b).
+ *
+ * The reviewer's frame is a FIXED box with `object-fit: contain` rather than
+ * letting each asset size itself: an accessibility reviewer is comparing
+ * several creatives against one declared alt text and one contrast pair, and a
+ * grid whose tiles jump between a 200px icon and a 4000px banner makes that
+ * comparison harder, not easier. The true pixel dimensions are printed under
+ * the tile, so nothing is lost by normalising the frame.
+ *
+ * The checkerboard backdrop is load-bearing on this surface specifically: a
+ * transparent PNG on a plain background silently borrows the page's colour,
+ * which is precisely the thing a WCAG contrast review must not do.
+ */
+.media-preview__grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 18px;
+}
+.media-preview__tile {
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  padding: 12px;
+  background: var(--paper);
+}
+.media-preview__frame {
+  position: relative;
+  width: 100%;
+  height: 200px;
+  border-radius: 6px;
+  overflow: hidden;
+  background-color: #ffffff;
+  background-image: linear-gradient(45deg, rgba(0, 0, 0, 0.06) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(0, 0, 0, 0.06) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgba(0, 0, 0, 0.06) 75%),
+    linear-gradient(-45deg, transparent 75%, rgba(0, 0, 0, 0.06) 75%);
+  background-size: 16px 16px;
+  background-position:
+    0 0,
+    0 8px,
+    8px -8px,
+    -8px 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.media-preview__placeholder {
+  font-size: 13px;
+  color: var(--espresso);
+}
+.media-preview__meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+.media-preview__key {
+  font-size: 11.5px;
+  word-break: break-all;
+  color: var(--espresso);
+}
+.media-preview__link {
+  font-size: 13px;
+  align-self: flex-start;
+}
+
+/*
+ * Summary-row asset thumbnail (TS-282-followup-5b-followup-2). Deliberately
+ * small and inline: this is a list cell, not the review frame. Shares the
+ * checkerboard rationale with `.media-preview__frame` — a transparent PNG must
+ * not borrow the page's colour.
+ */
+.media-thumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.media-thumb__frame {
+  position: relative;
+  flex: 0 0 auto;
+  width: 72px;
+  height: 48px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  overflow: hidden;
+  background-color: #ffffff;
+  background-image: linear-gradient(45deg, rgba(0, 0, 0, 0.06) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(0, 0, 0, 0.06) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgba(0, 0, 0, 0.06) 75%),
+    linear-gradient(-45deg, transparent 75%, rgba(0, 0, 0, 0.06) 75%);
+  background-size: 12px 12px;
+  background-position:
+    0 0,
+    0 6px,
+    6px -6px,
+    -6px 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.media-thumb__meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}

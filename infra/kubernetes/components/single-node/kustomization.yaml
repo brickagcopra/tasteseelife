@@ -1,0 +1,77 @@
+# Single-node resource profile (TS-151-followup-13).
+#
+# ## The arithmetic this exists to fix
+#
+# The dev overlay already patches every workload to `replicas: 1`, which is
+# what makes a one-box deployment sound plausible. It is not the binding
+# constraint. Rendered, the dev overlay's 34 Deployments request:
+#
+#     cpu    7.15 cores
+#     memory 7.88 GiB
+#
+# — and that is BEFORE the platform's own workloads, which the base pulls in
+# from Helm charts and which are not small: kube-prometheus-stack, Loki, Tempo,
+# Grafana, ingress-nginx, cert-manager, and the sealed-secrets controller add
+# roughly 2 more cores and 4+ GiB. Call it ~10 cores and ~13 GiB of REQUESTS.
+#
+# Requests are a scheduling floor, not a usage estimate. On a box with 8 vCPU
+# the last several pods simply never schedule — they sit `Pending` with
+# `Insufficient cpu`, indefinitely, with every Deployment reporting healthy
+# replicas of zero. That failure is confusing precisely because nothing has
+# crashed.
+#
+# ## What this component does
+#
+# Cuts CPU requests hard and memory requests moderately, across every workload
+# Deployment, leaving LIMITS untouched.
+#
+# That asymmetry is the entire design. The request is what the scheduler
+# reserves; the limit is what the container may burst to. A Node service
+# idling between requests genuinely uses ~20-50m of CPU, so a 250m request
+# reserves roughly an order of magnitude more than it needs — fine when the
+# cluster has three nodes to spread across, ruinous when there is one. Leaving
+# the limits alone means a service under real load can still burst exactly as
+# far as it could before; it just no longer holds the headroom hostage while
+# idle.
+#
+# Memory is cut far less (256Mi -> 192Mi) because memory is not compressible:
+# a container that exceeds its limit is OOM-killed rather than throttled, and a
+# Node heap plus the Prisma query engine does not fit in much less than this.
+#
+# ## What it does NOT do
+#
+# It does not touch HPAs, PDBs, or replica counts — the dev overlay already
+# sets those. It does not touch the observability stack or the Helm-inflated
+# charts: those carry their own values files, and silently reaching into an
+# upstream chart's resources from here would be invisible to whoever next
+# upgrades it. If the box is still short after this, turn the observability
+# stack off rather than starving it (see `infra/kubernetes/README.md`).
+#
+# ## Use
+#
+# Opt in from an overlay — it is deliberately not applied by default, because
+# on the three-node topology ADR-0001 describes it is the wrong trade:
+#
+#     components:
+#       - ../../components/single-node
+#
+# Expect roughly: cpu 7.15 -> ~1.7 cores, memory 7.88 -> ~6.0 GiB.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+  # One patch, every workload Deployment. The three reusable components
+  # (nestjs-service / web-app / bullmq-worker) all emit a single container at
+  # index 0 with both bounds set, so the paths below resolve for all of them —
+  # and a future component that does not would fail this patch loudly rather
+  # than silently skipping.
+  - target:
+      kind: Deployment
+      labelSelector: app.kubernetes.io/part-of=taste-and-see
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: 50m
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 192Mi

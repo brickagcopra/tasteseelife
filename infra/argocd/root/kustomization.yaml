@@ -1,0 +1,21 @@
+# Root Applications aggregate.
+#
+# `kubectl apply -k infra/argocd/root/` after the install + projects overlays
+# are healthy. This is the LAST manual step — once these three root Applications
+# exist, every subsequent change to infra/kubernetes/ or infra/argocd/ flows
+# via git push + ArgoCD reconciliation.
+#
+# Order of bootstrap (per infra/argocd/README.md):
+#   1. kubectl apply -k infra/argocd/install/   --enable-helm
+#   2. kubectl apply -k infra/argocd/projects/
+#   3. kubectl apply -k infra/argocd/root/      ← you are here
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - root-dev.yaml
+  - root-staging.yaml
+  - root-prod.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: taste-and-see

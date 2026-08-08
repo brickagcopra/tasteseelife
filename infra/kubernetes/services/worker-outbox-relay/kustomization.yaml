@@ -1,0 +1,120 @@
+# Per-worker base for worker-outbox-relay (TS-151-followup-1 rollout).
+# FIRST consumer of the reusable bullmq-worker component. The relay is
+# load-bearing: it reads undispatched rows from every producer's
+# `{schema}.outbox_events` table and publishes them onto Redis Streams
+# (PDD §7.3). Without it, domain events never leave the producing
+# service — accounting/notification/analytics consumers go silent.
+#
+# Lives in `platform-workers` (not platform-services). Headless: the
+# bullmq-worker component ships NO Service / Ingress / HPA — the relay
+# runs on a polling timer and exposes only /healthz + /readyz for the
+# k8s probes. Egress to Postgres + Redis is allowed by the base
+# data-access egress policy; the only ingress policy is deny-all.
+#
+# PORT is pinned to the component's default 3000 (the probe port) rather
+# than the env schema's 3050 default — purely a healthz listener, so
+# matching the component avoids per-port patching.
+#
+# OUTBOX_SOURCES lists EVERY schema that owns an `outbox_events` table, not
+# just the ones with a producer today (TS-505d2-followup-1). "Extend it as
+# more producer services come online" was the previous rule and it silently
+# failed twice: `search.outbox_events` had two live emitters and appeared in
+# no source list at all, and `accounting.outbox_events` was in `.env.example`
+# but not here, so the two disagreed. Draining an empty table costs one
+# indexed lookup per poll; missing a live one loses events forever.
+# `packages/testing/src/boot/outbox-sources-coverage.test.ts` keeps this value,
+# `.env.example`, and the set of schemas that actually own the table in sync.
+#
+# Env overlays in infra/kubernetes/overlays/<env>/ patch image tag,
+# replica count, and a handful of ConfigMap values per env.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-workers
+
+components:
+  - ../../components/bullmq-worker
+
+resources:
+  - secret-placeholder.yaml
+
+commonLabels:
+  app.kubernetes.io/name: worker-outbox-relay
+  app.kubernetes.io/instance: worker-outbox-relay
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-outbox-relay
+
+  - target:
+      kind: ConfigMap
+      name: bullmq-worker-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-outbox-relay-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3000"
+          SERVICE_VERSION: dev
+          OUTBOX_SOURCES: accounting.outbox_events,ads.outbox_events,booking.outbox_events,content.outbox_events,household.outbox_events,identity.outbox_events,provider.outbox_events,search.outbox_events,subscription.outbox_events,trust_safety.outbox_events,webhook.outbox_events
+          POLL_INTERVAL_MS: "1000"
+          BATCH_SIZE: "100"
+          MAX_ATTEMPTS: "10"
+          STREAM_MAXLEN: "100000"
+          STREAM_NAME_PREFIX: events
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          # TS-504-followup-2a — Sentry error reporting (CLAUDE.md §10).
+          # EMPTY = off, and the service logs that it is off rather than
+          # staying quiet. The real DSN is supplied per env by the overlay or
+          # the operator; it is not committed, and it is not a Secret
+          # placeholder because a REPLACE_WITH_ value is not a valid URL and
+          # would fail Zod boot on every workload that does not use Sentry.
+          SENTRY_DSN: ""
+
+  - target:
+      kind: Deployment
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-outbox-relay
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: worker-outbox-relay
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/worker-outbox-relay:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: worker-outbox-relay-config
+          - secretRef:
+              name: worker-outbox-relay-secrets
+
+  - target:
+      kind: NetworkPolicy
+      name: bullmq-worker-ingress-deny
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-outbox-relay-ingress-deny
+
+  - target:
+      kind: PodDisruptionBudget
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-outbox-relay

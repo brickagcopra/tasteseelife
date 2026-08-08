@@ -1,0 +1,50 @@
+{
+  "name": "@taste-and-see/nest-bullmq-scheduler",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Shared in-service BullMQ repeatable-sweep scheduler for the Taste & See platform. `BullMqSchedulerModule.forRoot({ serviceName, environment, redisUrl })` owns the REDIS_URL decomposition and the CLAUDE.md §3.7 key prefix; `BullMqSchedulerService.schedule({ queueName, intervalMs, processor })` upserts one repeatable job scheduler cluster-wide and tears the queue + worker down on application shutdown. Extracted at the third copy of a skeleton that was verbatim in service-identity's rbac-revoker (TS-293) and service-booking's anomaly sweep (TS-308a/c). TS-308a-followup-1.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "bullmq": "5.79.2"
+  },
+  "peerDependencies": {
+    "@nestjs/common": "^11.0.0",
+    "reflect-metadata": "^0.2.0"
+  },
+  "devDependencies": {
+    "@nestjs/common": "11.0.0",
+    "@nestjs/core": "11.0.0",
+    "@nestjs/testing": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "reflect-metadata": "0.2.2",
+    "rimraf": "6.0.1",
+    "rxjs": "7.8.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

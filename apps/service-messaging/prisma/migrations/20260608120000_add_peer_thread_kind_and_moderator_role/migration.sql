@@ -1,0 +1,49 @@
+-- TS-209 — provider community: peer messaging (moderated).
+--
+-- Additive enum extension, forward-compatible per CLAUDE.md §4.1
+-- (add, never repurpose):
+--
+--   1. `thread_kind` gains `peer_thread` — a provider-to-provider
+--      community / best-practice forum thread (PRD §7.7). Neither
+--      `household_id` nor `booking_id` applies (both stay null).
+--   2. `thread_participant_role` gains `moderator` — trust-safety /
+--      provider-ops staff who join a peer thread to keep the space safe
+--      and (once `service-trust-safety` lands — TS-300) action the
+--      moderation queue.
+--
+-- No table / column / index change: peer threads ride the existing
+-- `threads` + `thread_participants` shape. The per-participant inbox
+-- index (`thread_participants_user_joined_idx`) already covers the
+-- "my community threads" read path and `threads_kind_created_idx`
+-- covers the admin "all peer threads" view.
+--
+-- `ADD VALUE IF NOT EXISTS` is idempotent and safe to re-run. On
+-- PostgreSQL 16 `ALTER TYPE ... ADD VALUE` runs inside the migration
+-- transaction provided the new value is not *used* in the same
+-- transaction (it is not — no data references it here), so no
+-- out-of-transaction handling is required.
+--
+-- Reversal plan: PostgreSQL does not support dropping a single enum
+-- value in place. To reverse, recreate each enum without the new value
+-- and re-point the column (only safe while no row uses the value):
+--   -- threads.kind / thread_participants.role must hold no
+--   -- 'peer_thread' / 'moderator' row first.
+--   ALTER TYPE "messaging"."thread_kind" RENAME TO "thread_kind_old";
+--   CREATE TYPE "messaging"."thread_kind" AS ENUM ('household','booking','concierge');
+--   ALTER TABLE "messaging"."threads"
+--     ALTER COLUMN "kind" TYPE "messaging"."thread_kind"
+--     USING "kind"::text::"messaging"."thread_kind";
+--   DROP TYPE "messaging"."thread_kind_old";
+--   -- (mirror for thread_participant_role / 'moderator')
+-- This is the standard additive-enum tradeoff; in practice peer-thread
+-- data is retained and the value is left in place.
+--
+-- Apply locally with:
+--   pnpm -F @taste-and-see/service-messaging prisma:migrate:deploy
+-- against a Postgres reachable at $DATABASE_URL.
+
+-- AlterEnum
+ALTER TYPE "messaging"."thread_kind" ADD VALUE IF NOT EXISTS 'peer_thread';
+
+-- AlterEnum
+ALTER TYPE "messaging"."thread_participant_role" ADD VALUE IF NOT EXISTS 'moderator';

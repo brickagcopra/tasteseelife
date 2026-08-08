@@ -1,0 +1,248 @@
+# Per-service base for service-notification (TS-151-followup-1 rollout,
+# Batch 2 — billing/payments path). Mirrors the canonical
+# service-identity base: consumes the reusable nestjs-service component
+# + overrides every placeholder for the notification service's specifics
+# (port 3017, env-var contract from
+# apps/service-notification/src/config/env.ts, Secret refs for the
+# secret-class envs).
+#
+# The render + dispatch internal endpoints are pinned by shared-secret
+# HEADER NAMES (non-secret, ConfigMap) whose VALUES are required secrets.
+# The channel SDK credentials (Postmark / Twilio / Firebase) are OPTIONAL
+# in the env schema — each adapter falls back to stub mode when its
+# credential is absent (Phase-1 posture). They are intentionally omitted
+# from the Secret placeholder so a fresh deploy boots in stub mode rather
+# than attempting live sends with invalid keys; the operator adds them
+# when a channel goes live.
+#
+# Env overlays in infra/kubernetes/overlays/<env>/ patch image tag,
+# replica count, and a handful of ConfigMap values per env.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-services
+
+components:
+  - ../../components/nestjs-service
+
+resources:
+  - secret-placeholder.yaml
+  # TS-151-followup-12 — ArgoCD PreSync hook (wave -10) that applies this
+  # service's Prisma migrations before anything else in the sync. Listed ahead
+  # of any seed Job below because it must also run ahead of it at apply time.
+  - migrate-job.yaml
+
+commonLabels:
+  app.kubernetes.io/name: service-notification
+  app.kubernetes.io/instance: service-notification
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-notification
+
+  - target:
+      kind: ConfigMap
+      name: nestjs-service-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-notification-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3017"
+          SERVICE_VERSION: dev
+          JWT_ISSUER: taste-and-see/service-identity
+          JWT_AUDIENCE: taste-and-see/api
+          INTERNAL_TRUST_MAX_AGE_SECONDS: "60"
+          NOTIFICATION_RENDER_HEADER_NAME: x-internal-api-key
+          NOTIFICATION_DISPATCH_HEADER_NAME: x-internal-api-key
+          NOTIFICATION_EMAIL_FROM_ADDRESS: no-reply@tasteseelife.com
+          NOTIFICATION_EMAIL_FROM_NAME: Taste & See
+          # TS-042-followup-3a2 — the dunning ladder. This service's FIRST
+          # outbox-consumer cluster and its first Redis dependency.
+          # OUTBOX_CONSUMER_NAME is deliberately ABSENT here — it comes from
+          # the downward API on the container env below, because it must
+          # differ per pod (two replicas sharing a name corrupt the PEL).
+          # OUTBOX_STREAM_PREFIX must match the relay's STREAM_NAME_PREFIX;
+          # a mismatch means this service reads an empty stream forever and
+          # no family is ever told their payment failed, with every
+          # dashboard still green.
+          OUTBOX_STREAM_PREFIX: events
+          OUTBOX_CONSUMER_MAX_ATTEMPTS: "10"
+          OUTBOX_CONSUMER_POLL_BLOCK_MS: "5000"
+          OUTBOX_CONSUMER_RECLAIM_IDLE_MS: "60000"
+          OUTBOX_CONSUMER_POLL_INTERVAL_MS: "1000"
+          # Kill switch: "false" registers NO handlers, leaving the events in
+          # the stream to be picked up when it is flipped back — rather than
+          # acking them into oblivion.
+          DUNNING_NOTIFICATIONS_ENABLED: "true"
+          HOUSEHOLD_SERVICE_BASE_URL: http://service-household:3011
+          # MUST equal what service-household READS. It said
+          # `x-internal-api-key` here — a name the callee never looks at, so
+          # every dunning-recipient resolution 401'd in any cluster rendered
+          # from this manifest. The code default was corrected earlier; this
+          # explicit value silently overrode the fix, and the cross-app
+          # header-agreement guard in `packages/testing` compares CODE
+          # defaults, so it could not see this (TS-042-followup-3a1a-followup-2).
+          # service-household's and api-gateway's manifests both already
+          # carried the correct name.
+          HOUSEHOLD_MEMBERSHIPS_INTERNAL_HEADER_NAME: x-household-memberships-internal-api-key
+          IDENTITY_SERVICE_BASE_URL: http://service-identity:3010
+          # Correct as-is — service-identity's reader defaults to this name.
+          IDENTITY_RECIPIENT_CONTACTS_HEADER_NAME: x-internal-api-key
+          # TS-042-followup-3a1a — the provider customer-group hop. Without
+          # it a provider whose card fails is told nothing.
+          PROVIDER_SERVICE_BASE_URL: http://service-provider:3014
+          PROVIDER_BILLING_CONTACTS_INTERNAL_HEADER_NAME: x-provider-billing-contacts-internal-api-key
+          # The `billingUrl` every dunning template renders. Points at
+          # web-family's /billing, which opens a Stripe Billing Portal
+          # session — the page where a card can actually be changed
+          # (TS-042-followup-3a3-followup-1). It was /billing/invoices, a
+          # READ-ONLY receipts page, and the template copy was written
+          # around that absence.
+          #
+          # MUST MATCH service-subscription's BILLING_PORTAL_RETURN_URL,
+          # which is where Stripe drops the family when they close the
+          # portal. Two variables in two services because services share
+          # no config surface (CLAUDE.md §2.3), not because they are two
+          # decisions. A test in service-notification asserts the copy
+          # names the card update; pointing this back at a read-only page
+          # makes the copy a false promise.
+          DUNNING_BILLING_URL: https://app.tasteseelife.com/billing
+          DUNNING_APP_NAME: Taste & See
+          # TS-510-followup-4 — the verification-email consumer. The event
+          # has been produced (and drained by the relay) since TS-510 with
+          # NOTHING consuming it, so no verification email was ever
+          # physically sent. Own switch, separate from the dunning one:
+          # silencing billing mail must not also stop new customers getting
+          # the link that lets them use their account.
+          EMAIL_VERIFICATION_NOTIFICATIONS_ENABLED: "true"
+          # Where the emailed link points. The consumer appends
+          # `?token=<token>`. Config, never payload — a producer that could
+          # name the destination would let a forged event point a real
+          # verification link at somebody else's host.
+          EMAIL_VERIFICATION_URL_BASE: https://app.tasteseelife.com/verify-email
+          # TS-306-followup-1d — this workload now boots the OTel SDK
+          # (`src/observability/bootstrap.ts`, first import in main.ts). Both
+          # default to true in the Zod schema; stated here so the enabled
+          # posture is visible in the manifest rather than implied.
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          # TS-504-followup-2a — Sentry error reporting (CLAUDE.md §10).
+          # EMPTY = off, and the service logs that it is off rather than
+          # staying quiet. The real DSN is supplied per env by the overlay or
+          # the operator; it is not committed, and it is not a Secret
+          # placeholder because a REPLACE_WITH_ value is not a valid URL and
+          # would fail Zod boot on every workload that does not use Sentry.
+          SENTRY_DSN: ""
+
+  - target:
+      kind: Service
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-notification
+      - op: replace
+        path: /spec/ports/0/port
+        value: 3017
+
+  - target:
+      kind: Deployment
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-notification
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: service-notification
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/service-notification:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/ports/0/containerPort
+        value: 3017
+      # TS-042-followup-3a2 — the Redis Streams consumer identity. MUST
+      # differ per pod: `XAUTOCLAIM` tells a crashed pod's pending entries
+      # from a live pod's by this name, so two replicas sharing one corrupt
+      # the PEL and an event can be ACKed by a pod that never applied it —
+      # here, a family never told their payment failed. Set on the container
+      # `env` (which wins over the ConfigMap envFrom) rather than the
+      # ConfigMap, which cannot reference the downward API. Same wiring as
+      # service-subscription / service-booking / service-trust-safety.
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: OUTBOX_CONSUMER_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: service-notification-config
+          - secretRef:
+              name: service-notification-secrets
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe/httpGet/port
+        value: 3017
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe/httpGet/port
+        value: 3017
+      - op: replace
+        path: /spec/template/spec/containers/0/livenessProbe/httpGet/port
+        value: 3017
+      - op: replace
+        path: /spec/template/metadata/annotations/prometheus.io~1port
+        value: "3017"
+
+  - target:
+      kind: NetworkPolicy
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-notification
+      - op: replace
+        path: /spec/ingress/0/ports/0/port
+        value: 3017
+      # worker-certification-renewal + worker-wellness-summary
+      # (platform-workers) POST the internal dispatch endpoint, so admit
+      # that namespace in addition to the component default
+      # (platform-services).
+      - op: add
+        path: /spec/ingress/0/from/-
+        value:
+          namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: platform-workers
+
+  - target:
+      kind: PodDisruptionBudget
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-notification
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-notification
+      - op: replace
+        path: /spec/scaleTargetRef/name
+        value: service-notification

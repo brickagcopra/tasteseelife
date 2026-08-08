@@ -1,0 +1,90 @@
+# Loki Helm values — SingleBinary deployment mode with filesystem
+# storage. The right Phase-1 shape: no object-storage dependency, one
+# pod, bounded retention. The horizontally-scalable read/write/backend
+# topology + object storage is a Phase-2/3 follow-up when log volume
+# (PDD §27: 250K msgs/mo + 1M notifications/mo) outgrows one node.
+#
+# Author-blind (no local helm) — CI's kubeconform --enable-helm render
+# is the gate. chart grafana/loki 6.18.0.
+deploymentMode: SingleBinary
+
+loki:
+  # Single-tenant Phase 1 — no per-tenant auth on the Loki API. Access
+  # is already gated at the network layer (observability is the only
+  # namespace that can reach it; nothing exposes it via Ingress).
+  auth_enabled: false
+  commonConfig:
+    replication_factor: 1
+  schemaConfig:
+    configs:
+      - from: "2024-04-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: loki_index_
+          period: 24h
+  storage:
+    type: filesystem
+  limits_config:
+    retention_period: 168h # 7 days hot; long-term archive is Phase 3
+    reject_old_samples: true
+    reject_old_samples_max_age: 168h
+  # The single-binary target needs the analytics reporting off (it phones
+  # home to grafana.com otherwise) — disable for a closed cluster.
+  analytics:
+    reporting_enabled: false
+
+singleBinary:
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 10Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Zero out the scalable-topology components — SingleBinary mode runs
+# everything in the one StatefulSet above.
+read:
+  replicas: 0
+write:
+  replicas: 0
+backend:
+  replicas: 0
+
+# The memcached caches default to large memory requests that would
+# dominate the Phase-1 node budget; disable for the single-binary path.
+chunksCache:
+  enabled: false
+resultsCache:
+  enabled: false
+
+# Gateway (nginx) fronts the single binary so Grafana's datasource has a
+# stable `loki-gateway` Service to target.
+gateway:
+  enabled: true
+  replicas: 1
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+# The chart bundles a self-monitoring/canary stack that pulls in extra
+# pods + its own Loki tenant — overkill for Phase 1.
+monitoring:
+  selfMonitoring:
+    enabled: false
+    grafanaAgent:
+      installOperator: false
+  lokiCanary:
+    enabled: false
+test:
+  enabled: false

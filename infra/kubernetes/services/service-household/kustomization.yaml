@@ -1,0 +1,170 @@
+# Per-service base for service-household (TS-151-followup-1 rollout).
+# Mirrors the canonical service-identity base: consumes the reusable
+# nestjs-service component + overrides every placeholder for the
+# household service's specifics (port 3011, env-var contract from
+# apps/service-household/src/config/env.ts, Secret refs for the
+# secret-class envs).
+#
+# Two independent AES-256-GCM keys (intake PII + access instructions)
+# ride the Secret; their *_VERSION counters are non-secret ConfigMap
+# values. Two internal shared-secret header NAMES (visit-prep +
+# wellness-summary) are non-secret; their *_API_KEY VALUES are required
+# secrets.
+#
+# Env overlays in infra/kubernetes/overlays/<env>/ patch image tag,
+# replica count, and a handful of ConfigMap values per env.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-services
+
+components:
+  - ../../components/nestjs-service
+
+resources:
+  - secret-placeholder.yaml
+  # TS-151-followup-12 — ArgoCD PreSync hook (wave -10) that applies this
+  # service's Prisma migrations before anything else in the sync. Listed ahead
+  # of any seed Job below because it must also run ahead of it at apply time.
+  - migrate-job.yaml
+
+commonLabels:
+  app.kubernetes.io/name: service-household
+  app.kubernetes.io/instance: service-household
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-household
+
+  - target:
+      kind: ConfigMap
+      name: nestjs-service-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-household-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3011"
+          SERVICE_VERSION: dev
+          JWT_ISSUER: taste-and-see/service-identity
+          JWT_AUDIENCE: taste-and-see/api
+          INTERNAL_TRUST_MAX_AGE_SECONDS: "60"
+          HOUSEHOLD_INTAKE_ENC_KEY_VERSION: "1"
+          HOUSEHOLD_ACCESS_ENC_KEY_VERSION: "1"
+          IDEMPOTENCY_TTL_SECONDS: "86400"
+          IDEMPOTENCY_IN_FLIGHT_TTL_SECONDS: "60"
+          HOUSEHOLD_VISIT_PREP_INTERNAL_HEADER_NAME: x-household-visit-prep-internal-api-key
+          # TS-505d2-followup-5 — the seam the api-gateway calls to establish a
+          # request's household tenant scope. Its secret is REQUIRED: the pod
+          # will not boot without HOUSEHOLD_MEMBERSHIPS_INTERNAL_API_KEY.
+          HOUSEHOLD_MEMBERSHIPS_INTERNAL_HEADER_NAME: x-household-memberships-internal-api-key
+          HOUSEHOLD_WELLNESS_SUMMARY_INTERNAL_HEADER_NAME: x-internal-api-key
+          # TS-306-followup-1d — this workload now boots the OTel SDK
+          # (`src/observability/bootstrap.ts`, first import in main.ts). Both
+          # default to true in the Zod schema; stated here so the enabled
+          # posture is visible in the manifest rather than implied.
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          # TS-504-followup-2a — Sentry error reporting (CLAUDE.md §10).
+          # EMPTY = off, and the service logs that it is off rather than
+          # staying quiet. The real DSN is supplied per env by the overlay or
+          # the operator; it is not committed, and it is not a Secret
+          # placeholder because a REPLACE_WITH_ value is not a valid URL and
+          # would fail Zod boot on every workload that does not use Sentry.
+          SENTRY_DSN: ""
+
+  - target:
+      kind: Service
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-household
+      - op: replace
+        path: /spec/ports/0/port
+        value: 3011
+
+  - target:
+      kind: Deployment
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-household
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: service-household
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/service-household:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/ports/0/containerPort
+        value: 3011
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: service-household-config
+          - secretRef:
+              name: service-household-secrets
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe/httpGet/port
+        value: 3011
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe/httpGet/port
+        value: 3011
+      - op: replace
+        path: /spec/template/spec/containers/0/livenessProbe/httpGet/port
+        value: 3011
+      - op: replace
+        path: /spec/template/metadata/annotations/prometheus.io~1port
+        value: "3011"
+
+  - target:
+      kind: NetworkPolicy
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-household
+      - op: replace
+        path: /spec/ingress/0/ports/0/port
+        value: 3011
+      # worker-wellness-summary (platform-workers) POSTs the internal
+      # households batch endpoint, so admit that namespace in addition to
+      # the component default (platform-services).
+      - op: add
+        path: /spec/ingress/0/from/-
+        value:
+          namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: platform-workers
+
+  - target:
+      kind: PodDisruptionBudget
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-household
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-household
+      - op: replace
+        path: /spec/scaleTargetRef/name
+        value: service-household

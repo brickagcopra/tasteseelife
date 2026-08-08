@@ -1,0 +1,158 @@
+# Per-service base for service-content (TS-300-followup-2 - one of the
+# three post-fleet-rollout stragglers no task had owned, so the service
+# had no build workflow and no manifests at all and could not deploy).
+# Mirrors the canonical service-concierge base: consumes the reusable
+# nestjs-service component and overrides every placeholder for this
+# service (port 3025, env-var contract from
+# apps/service-content/src/config/env.ts).
+#
+# The narrowest contract of the three - three required secrets
+# (DATABASE_URL, REDIS_URL, JWT_ACCESS_SECRET) and nothing optional. The
+# PUBLIC blog surface (TS-282-followup-3) is served through the
+# api-gateway anonymous proxy rather than from here directly, so this
+# base needs no ingress of its own.
+#
+# NetworkPolicy: standard backend (component-default admit of
+# platform-services).
+#
+# Env overlays in infra/kubernetes/overlays/<env>/ patch image tag,
+# replica count, and a handful of ConfigMap values per env.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-services
+
+components:
+  - ../../components/nestjs-service
+
+resources:
+  - secret-placeholder.yaml
+  # TS-151-followup-12 — ArgoCD PreSync hook (wave -10) that applies this
+  # service's Prisma migrations before anything else in the sync. Listed ahead
+  # of any seed Job below because it must also run ahead of it at apply time.
+  - migrate-job.yaml
+
+commonLabels:
+  app.kubernetes.io/name: service-content
+  app.kubernetes.io/instance: service-content
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-content
+
+  - target:
+      kind: ConfigMap
+      name: nestjs-service-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-content-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3025"
+          SERVICE_VERSION: dev
+          JWT_ISSUER: taste-and-see/service-identity
+          JWT_AUDIENCE: taste-and-see/api
+          INTERNAL_TRUST_MAX_AGE_SECONDS: "60"
+          IDEMPOTENCY_TTL_SECONDS: "86400"
+          IDEMPOTENCY_IN_FLIGHT_TTL_SECONDS: "60"
+          # TS-306-followup-1c — the service now boots the OTel SDK. Until it
+          # did, these keys were correctly absent; service-trust-safety's base
+          # carried them from the concierge template while its `loadEnv` key
+          # pick silently dropped them, which is the shape of a ConfigMap that
+          # reads as configuration and configures nothing.
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          # TS-504-followup-2a — Sentry error reporting (CLAUDE.md §10).
+          # EMPTY = off, and the service logs that it is off rather than
+          # staying quiet. The real DSN is supplied per env by the overlay or
+          # the operator; it is not committed, and it is not a Secret
+          # placeholder because a REPLACE_WITH_ value is not a valid URL and
+          # would fail Zod boot on every workload that does not use Sentry.
+          SENTRY_DSN: ""
+
+  - target:
+      kind: Service
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-content
+      - op: replace
+        path: /spec/ports/0/port
+        value: 3025
+
+  - target:
+      kind: Deployment
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-content
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: service-content
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/service-content:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/ports/0/containerPort
+        value: 3025
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: service-content-config
+          - secretRef:
+              name: service-content-secrets
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe/httpGet/port
+        value: 3025
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe/httpGet/port
+        value: 3025
+      - op: replace
+        path: /spec/template/spec/containers/0/livenessProbe/httpGet/port
+        value: 3025
+      - op: replace
+        path: /spec/template/metadata/annotations/prometheus.io~1port
+        value: "3025"
+
+  - target:
+      kind: NetworkPolicy
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-content
+      - op: replace
+        path: /spec/ingress/0/ports/0/port
+        value: 3025
+
+  - target:
+      kind: PodDisruptionBudget
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-content
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-content
+      - op: replace
+        path: /spec/scaleTargetRef/name
+        value: service-content

@@ -1,0 +1,25 @@
+-- TS-290 — Soft-archive marker for roles (PRD §10.12; PDD §10.3).
+--
+-- Forward-compatible expand-only migration: one nullable column, no
+-- data movement, no index. Existing rows read as live (`archived_at
+-- IS NULL`).
+--
+-- Semantics: a non-null `archived_at` hides the role from assignment
+-- surfaces (`RoleAssignmentService.grant` rejects archived roles with
+-- a 409) and renders it read-only in the RBAC admin tooling. Roles
+-- are never hard-deleted — `user_roles` history rows FK `roles.id`
+-- with ON DELETE RESTRICT, so archive-not-delete preserves referential
+-- integrity and the audit story. Existing ACTIVE assignments of an
+-- archived role keep working until individually revoked — deactivating
+-- holders is an explicit operator decision, not a cascade.
+--
+-- Index note: no index on `archived_at`. The roles table is
+-- operator-curated and small (tens of rows); every read path filters
+-- in-memory-sized result sets. Revisit only if the catalog grows
+-- beyond that shape.
+--
+-- Reversal plan: `ALTER TABLE "identity"."roles" DROP COLUMN
+-- "archived_at";` — safe because the column is nullable with no
+-- default and no dependent constraints.
+
+ALTER TABLE "identity"."roles" ADD COLUMN "archived_at" TIMESTAMPTZ(6);

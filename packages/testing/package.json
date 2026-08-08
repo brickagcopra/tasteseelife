@@ -1,0 +1,51 @@
+{
+  "name": "@taste-and-see/testing",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Shared test harness for Taste & See — Testcontainers-backed Postgres + Redis bootstrap and prisma migrate deploy. Consumed by every service's `test:integration` suite so the container lifecycle + migration-apply path is one canonical implementation rather than seven verbatim copies. TS-009e-followup-1.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./vitest-plugin": "./vitest-plugin.cjs"
+  },
+  "files": [
+    "dist",
+    "vitest-plugin.cjs"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "testcontainers": "10.13.2",
+    "typescript": "5.5.4"
+  },
+  "devDependencies": {
+    "@nestjs/common": "11.0.0",
+    "@nestjs/core": "11.0.0",
+    "@nestjs/testing": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "reflect-metadata": "0.2.2",
+    "rimraf": "6.0.1",
+    "rxjs": "7.8.1",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "peerDependencies": {
+    "@nestjs/testing": "^11.0.0"
+  }
+}

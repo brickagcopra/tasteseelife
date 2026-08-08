@@ -1,0 +1,20 @@
+# ClusterIP Service. Headless variants (clusterIP:None) are not the
+# default — most NestJS services answer aggregated HTTP requests via
+# the api-gateway, and the gateway needs an in-cluster DNS name that
+# resolves to a single endpoint that round-robins under the hood.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nestjs-service
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: backend
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/component: backend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

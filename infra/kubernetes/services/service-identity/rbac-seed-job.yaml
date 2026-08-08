@@ -1,0 +1,117 @@
+# RBAC catalog seed (TS-024-followup-1).
+#
+# **Why this exists.** `seedRbacCatalog` is the single source of truth for the
+# system role + permission graph, and adding a permission is a code change plus
+# a re-seed. Until now the re-seed was a line in a release runbook — and nearly
+# every RBAC-touching task banked since has had to repeat the warning
+# ("`pnpm seed:rbac` must re-run on deploy": TS-290, TS-297, TS-303c1, TS-305a,
+# TS-309a, TS-282-followup-5b). A manual step repeated that often is a step that
+# gets missed, and the failure mode is quiet: the Deployment rolls green, the
+# service is healthy, and every endpoint gated on the new permission returns 403
+# to the staff who are supposed to hold it.
+#
+# **PreSync, not PostSync.** The permission row must exist BEFORE the pods
+# serving the endpoint that requires it. A PostSync seed leaves a window — short
+# on a fast rollout, not short at all on a slow one — where the new build is
+# taking traffic against a catalog that does not yet describe it.
+#
+# **A failure here MUST abort the sync, and it does.** ArgoCD does not proceed
+# past a failed PreSync hook. That is the correct behaviour and worth stating
+# because the instinct is to make seeds best-effort: a release whose catalog did
+# not load is a release that 403s its own operators, so not deploying it is the
+# better outcome.
+#
+# **Ordering against migrations.** The seed writes to tables the Prisma
+# migrations own. This comment used to say migrations ran through CI before
+# deployment per CLAUDE.md §4.4 — they did not; no such CI step was ever built,
+# and there is no route from a GitHub runner to a Postgres on a private VLAN.
+# TS-151-followup-12 moved them into the cluster as `migrate-job.yaml`, and
+# took the lower `sync-wave` (-10) that this comment asked for. This Job stays
+# at the default wave 0, so the schema is guaranteed to be ahead of it.
+#
+# **Safe to re-run, which is what makes a hook on EVERY sync defensible.**
+# `seedRbacCatalog` upserts on `(resource, action)` and on role name, and it
+# deliberately does not delete rows it does not own — removing a permission is
+# intentional friction that goes through the TS-290 admin tooling so an audit
+# event is recorded. So a sync that changes nothing about RBAC runs this Job and
+# changes nothing in the database.
+#
+# The image carries no tag pin of its own: the overlays' `images:` directive is
+# keyed on the image NAME, so this Job inherits the same per-environment tag as
+# the Deployment with no per-overlay edit. (The dev overlay's comment predicted
+# exactly this workload.)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: service-identity-rbac-seed
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # BeforeHookCreation, NOT HookSucceeded: the Job's pod logs are the only
+    # record of what the seed did, and deleting it the moment it succeeds throws
+    # that away. This keeps the last run around until the next sync replaces it.
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    # kube-linter's probe checks are scoped to DeploymentLike, which includes
+    # Job. A one-shot seed has no steady state to probe: it runs, it exits, and
+    # `backoffLimit` + `activeDeadlineSeconds` are its liveness story. Ignoring
+    # the two checks by name — rather than dropping them from
+    # `.kube-linter.yaml` — keeps the gate intact for every long-running
+    # workload, which is what it exists for.
+    ignore-check.kube-linter.io/no-readiness-probe: "A one-shot Job serves no traffic and has nothing to be ready for."
+    ignore-check.kube-linter.io/no-liveness-probe: "A one-shot Job is bounded by backoffLimit + activeDeadlineSeconds, not by a probe."
+spec:
+  # The seed is idempotent, so a retry costs nothing and a transient database
+  # blip should not fail a release.
+  backoffLimit: 2
+  # A seed that has not finished in five minutes is not slow, it is stuck —
+  # most likely on a database it cannot reach. Fail and say so rather than
+  # holding the sync open.
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: rbac-seed
+    spec:
+      restartPolicy: Never
+      serviceAccountName: service-identity
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: seed
+          image: ghcr.io/brickagcopra/service-identity:replace-me
+          imagePullPolicy: IfNotPresent
+          command: ["node", "dist/scripts/seed-rbac.js"]
+          envFrom:
+            - configMapRef:
+                name: service-identity-config
+            - secretRef:
+                name: service-identity-secrets
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              # Both bounds set, matching the nestjs-service component: the
+              # `unset-cpu-requirements` gate wants a limit as well as a
+              # request, and an unbounded seed sharing a node with the pods it
+              # is about to unblock is not a trade worth making.
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

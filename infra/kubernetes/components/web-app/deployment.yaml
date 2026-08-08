@@ -1,0 +1,135 @@
+# Next.js 15 Deployment template.
+#
+# Differences from nestjs-service/deployment.yaml:
+# - default replicas 2 (web tier scales aggressively)
+# - resources skew slightly more memory-heavy (RSC cache)
+# - readiness/liveness hit a Next.js route handler `/api/healthz`
+#   that every web-* app exposes (a no-op `route.ts` returning 200)
+# - readOnlyRootFilesystem:true with emptyDir mounts for /tmp +
+#   .next/cache (Next.js writes static-export cache + on-demand
+#   ISR revalidation state here)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: frontend
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: kustomize
+        app.kubernetes.io/component: frontend
+      annotations:
+        prometheus.io/scrape: "false"
+    spec:
+      serviceAccountName: web-app
+      automountServiceAccountToken: false
+      priorityClassName: taste-and-see-workload-standard
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: app
+          image: ghcr.io/brickagcopra/web-app:replace-me
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: web-app-config
+          env:
+            # Load-bearing: Next.js `output: 'standalone'` server.js binds to
+            # process.env.HOSTNAME. The container runtime otherwise injects
+            # HOSTNAME=<pod-name> here, which is not a bindable address — an
+            # explicit pod-spec env var takes precedence over that default and
+            # forces the listener onto all interfaces. Applies to every Next
+            # standalone app consuming this component.
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            requests:
+              cpu: 250m
+              memory: 384Mi
+            limits:
+              cpu: 750m
+              memory: 768Mi
+          startupProbe:
+            httpGet:
+              path: /api/healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 18
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /api/healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /api/healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+            timeoutSeconds: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: next-cache
+              mountPath: /app/.next/cache
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: next-cache
+          emptyDir:
+            sizeLimit: 256Mi
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: frontend

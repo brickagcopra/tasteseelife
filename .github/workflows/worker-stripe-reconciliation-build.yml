@@ -1,0 +1,117 @@
+# Per-service build pipeline for `worker-stripe-reconciliation`. Mirrors
+# service-identity-build.yml (the canonical shape). See that file's
+# header for the full rationale (build is not a PR gate; dev overlay is
+# auto-bumped, staging/prod are operator-promoted).
+#
+# References: PDD.md §20.4, §11; CLAUDE.md §11.
+
+name: worker-stripe-reconciliation build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/workers/stripe-reconciliation/**"
+      - "packages/**"
+      - "pnpm-lock.yaml"
+      - "infra/docker/**"
+      - ".github/workflows/worker-stripe-reconciliation-build.yml"
+      - ".github/workflows/build-push-image.yml"
+
+  # Manual trigger (TS-009g-followup-8). Two cases it exists for:
+  #   - Path filtering is unreliable on a repository FIRST commit, so an
+  #     initial import can land with no image built and no way to ask for one
+  #     short of an empty commit that fakes a path match.
+  #   - Re-running a build after a transient registry or Trivy failure.
+  workflow_dispatch:
+
+concurrency:
+  group: build-worker-stripe-reconciliation-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      security-events: write
+    uses: ./.github/workflows/build-push-image.yml
+    with:
+      service-name: worker-stripe-reconciliation
+      service-path: apps/workers/stripe-reconciliation
+      service-package: "@taste-and-see/worker-stripe-reconciliation"
+      image-name: ghcr.io/brickagcopra/worker-stripe-reconciliation
+
+  bump-dev-overlay:
+    name: Bump dev overlay `newTag`
+    needs: build
+    # Dispatch can run from any branch; `push` could only ever be main. This
+    # job checks out main, rewrites the dev overlay, and pushes a commit to
+    # main — so without this guard a dispatch from a feature branch would put
+    # an unreviewed build into dev, via the trunk.
+    if: github.ref_name == 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          persist-credentials: true
+
+      - name: Update overlay tag
+        id: bump
+        env:
+          NEW_TAG: ${{ needs.build.outputs.image-sha-tag }}
+        run: |
+          set -euo pipefail
+          overlay='infra/kubernetes/overlays/dev/kustomization.yaml'
+          before="$(grep -A1 '  - name: ghcr.io/brickagcopra/worker-stripe-reconciliation$' "${overlay}" | tail -n 1)"
+          awk -v new_tag="${NEW_TAG}" '
+            BEGIN { pending = 0 }
+            /^[[:space:]]*-[[:space:]]*name:[[:space:]]*ghcr\.io\/brickagcopra\/worker-stripe-reconciliation[[:space:]]*$/ {
+              pending = 1
+              print
+              next
+            }
+            pending == 1 && /^[[:space:]]*newTag:[[:space:]]*/ {
+              sub(/newTag:[[:space:]]*.*/, "newTag: " new_tag)
+              pending = 0
+              print
+              next
+            }
+            { print }
+          ' "${overlay}" > "${overlay}.next"
+          mv "${overlay}.next" "${overlay}"
+          after="$(grep -A1 '  - name: ghcr.io/brickagcopra/worker-stripe-reconciliation$' "${overlay}" | tail -n 1)"
+          echo "before: ${before}"
+          echo "after:  ${after}"
+          if [[ "${before}" == "${after}" ]]; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            echo "Bumper is a no-op (overlay already pins ${NEW_TAG}); skipping commit."
+          else
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Commit & push
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          NEW_TAG: ${{ needs.build.outputs.image-sha-tag }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          git config user.name "${GIT_AUTHOR_NAME}"
+          git config user.email "${GIT_AUTHOR_EMAIL}"
+          git add infra/kubernetes/overlays/dev/kustomization.yaml
+          git commit -m "ci(worker-stripe-reconciliation): bump dev overlay to ${NEW_TAG} [skip ci]" \
+                     -m "Source commit: ${GITHUB_SHA}" \
+                     -m "Image digest: ${{ needs.build.outputs.image-digest }}"
+          git push origin HEAD:main

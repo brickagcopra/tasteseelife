@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "display": "Taste & See — root base TS config (re-exports @taste-and-see/tsconfig/base.json)",
+  "extends": "@taste-and-see/tsconfig/base.json"
+}

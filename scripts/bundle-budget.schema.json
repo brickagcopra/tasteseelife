@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Taste & See — bundle-budget config",
+  "description": "Per-app gzipped JavaScript size budgets, enforced by scripts/check-bundle-budget.mjs. See TS-009b in Completed_tasks.md for design rationale.",
+  "type": "object",
+  "required": ["apps"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "$comment": { "type": "string" },
+    "apps": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["path", "framework", "routes"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Workspace-relative path to the app (e.g. apps/web-marketing)."
+          },
+          "framework": {
+            "type": "string",
+            "enum": ["next-app-router"],
+            "description": "Bundle layout the checker should expect. Only Next.js App Router is supported in TS-009b; add 'next-pages-router' or 'vite' as new app types land."
+          },
+          "routes": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "required": ["maxGzippedJsBytes"],
+              "properties": {
+                "maxGzippedJsBytes": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Hard ceiling for gzipped first-load JS bytes on this route. PR fails if total exceeds this."
+                },
+                "comment": { "type": "string" }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

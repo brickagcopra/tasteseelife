@@ -1,0 +1,50 @@
+{
+  "name": "@taste-and-see/worker-search-indexer",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Search-indexer worker (TS-053). A long-running process that subscribes to provider domain events on the Redis Streams bus (`provider.tier_changed` / `.certification_granted` / `.certification_revoked`), fetches the materialised `ProviderDiscoveryDocument` from service-provider's internal discovery-snapshot endpoint, and PUTs it to service-search's internal upsert endpoint. Implements the search projection half of PDD §8.5 / §14.1.",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "start:dev": "tsc -p tsconfig.build.json --watch",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:boot-graph": "vitest run test/app-module-graph.test.ts",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.0.0",
+    "@nestjs/core": "11.0.0",
+    "@nestjs/platform-express": "11.0.0",
+    "@taste-and-see/contracts": "workspace:*",
+    "@taste-and-see/logger": "workspace:*",
+    "@taste-and-see/nest-common": "workspace:*",
+    "@taste-and-see/nest-observability": "workspace:*",
+    "@taste-and-see/nest-outbox-consumer": "workspace:*",
+    "@taste-and-see/sentry": "workspace:*",
+    "@taste-and-see/tracing": "workspace:*",
+    "ioredis": "5.4.1",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.1",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/testing": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/express": "5.0.0",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "rimraf": "6.0.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

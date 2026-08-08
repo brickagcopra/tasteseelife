@@ -1,0 +1,17 @@
+{
+  "name": "@taste-and-see/prettier-config",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Shared Prettier configuration for the Taste & See monorepo. Consumed by setting `\"prettier\": \"@taste-and-see/prettier-config\"` in a package's package.json or by exporting from .prettierrc.",
+  "main": "index.cjs",
+  "files": [
+    "index.cjs"
+  ],
+  "peerDependencies": {
+    "prettier": ">=3.0.0"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

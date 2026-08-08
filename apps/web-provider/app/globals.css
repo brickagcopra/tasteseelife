@@ -1,0 +1,820 @@
+/*
+ * Taste & See — provider portal global styles (TS-122).
+ *
+ * Mirrors `apps/web-family/app/globals.css` — same warm-textile design
+ * tokens, same auth-shell / auth-card / auth-form primitives, same
+ * dashboard chrome. The two portals deliberately share visual language
+ * so a provider who is also a family-side member doesn't experience two
+ * different brands.
+ *
+ * Senior-mode tokens (`--ts-motion-multiplier`, contrast pairs, tap
+ * target sizes) come from the design-tokens import. The provider portal
+ * does not surface a senior-mode toggle (providers are not the
+ * senior-mode audience), but the AAA-contrast pair stays available for
+ * any provider with low-vision needs.
+ */
+
+@import '@taste-and-see/design-tokens/styles/tokens.css';
+
+:root {
+  --serif: var(--font-cormorant), 'Cormorant Garamond', Georgia, serif;
+  --sans: var(--font-dm-sans), 'DM Sans', system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+/* Auth surfaces — login, signup. */
+.auth-shell {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+}
+.auth-card {
+  width: 100%;
+  max-width: 480px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 48px 40px;
+  box-shadow: var(--shadow-card);
+}
+.auth-card h1 {
+  font-family: var(--serif);
+  font-weight: 300;
+  font-size: clamp(28px, 3vw, 38px);
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  margin: 0 0 8px;
+  color: var(--espresso);
+}
+.auth-card p {
+  margin: 0 0 24px;
+  color: var(--ink-soft);
+}
+.auth-form {
+  display: grid;
+  gap: 16px;
+}
+.auth-form label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--espresso);
+  font-weight: 500;
+}
+.auth-form input {
+  font-family: var(--sans);
+  font-size: 15px;
+  padding: 12px 14px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: 4px;
+  outline: none;
+  transition: border-color 0.15s ease;
+  min-height: var(--tap-target-min);
+}
+.auth-form input:focus-visible {
+  border-color: var(--espresso);
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: var(--focus-ring-offset);
+}
+.auth-form .help {
+  font-size: 12px;
+  color: var(--ink-soft);
+  font-weight: 400;
+}
+.auth-form .submit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 14px 22px;
+  border-radius: 999px;
+  background: var(--espresso);
+  color: var(--paper);
+  border: 1px solid var(--espresso);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  min-height: var(--tap-target-min);
+  transition:
+    transform 0.15s ease,
+    background 0.15s ease;
+}
+.auth-form .submit:hover {
+  background: var(--ink);
+  transform: translateY(-1px);
+}
+.auth-form .submit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.auth-alert {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border-radius: 4px;
+  background: rgba(168, 79, 51, 0.08);
+  border: 1px solid var(--clay);
+  color: var(--espresso);
+  font-size: 14px;
+}
+.auth-alert--info {
+  background: rgba(127, 142, 109, 0.12);
+  border-color: var(--sage);
+}
+.auth-foot {
+  margin-top: 24px;
+  font-size: 13.5px;
+  color: var(--ink-soft);
+}
+.auth-foot a {
+  color: var(--espresso);
+  text-decoration: underline;
+}
+
+/* Tier picker for provider signup. */
+.tier-grid {
+  display: grid;
+  gap: 12px;
+  margin: 0 0 24px;
+}
+.tier-card {
+  display: grid;
+  gap: 6px;
+  padding: 16px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+.tier-card:hover {
+  border-color: var(--espresso);
+}
+.tier-card input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.tier-card.selected {
+  background: var(--espresso);
+  color: var(--paper);
+  border-color: var(--espresso);
+}
+.tier-card .tier-name {
+  font-family: var(--serif);
+  font-size: 20px;
+  font-weight: 400;
+}
+.tier-card .tier-price {
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+.tier-card.selected .tier-price {
+  color: rgba(246, 241, 231, 0.85);
+}
+.tier-card .tier-detail {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  line-height: 1.45;
+}
+.tier-card.selected .tier-detail {
+  color: rgba(246, 241, 231, 0.85);
+}
+
+/* Dashboard shell. */
+.dash-shell {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  min-height: 100vh;
+  background: var(--linen);
+}
+.dash-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 32px;
+  background: var(--paper);
+  border-bottom: 1px solid var(--rule);
+}
+.dash-brand {
+  font-family: var(--serif);
+  font-size: 20px;
+  font-weight: 400;
+  color: var(--espresso);
+}
+.dash-account {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 13.5px;
+  color: var(--ink-soft);
+}
+.dash-logout {
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-size: 13px;
+  color: var(--espresso);
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+.dash-logout:hover {
+  border-color: var(--espresso);
+  background: var(--espresso);
+  color: var(--paper);
+}
+.dash-main {
+  padding: 48px 32px;
+  max-width: 1080px;
+  margin: 0 auto;
+  width: 100%;
+}
+.dash-main h1 {
+  font-family: var(--serif);
+  font-weight: 300;
+  font-size: clamp(34px, 4vw, 52px);
+  letter-spacing: -0.02em;
+  color: var(--espresso);
+  margin: 0 0 16px;
+}
+.dash-main p {
+  color: var(--ink-soft);
+  max-width: 60ch;
+}
+.dash-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px;
+  margin-top: 40px;
+}
+.dash-card {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 24px;
+}
+.dash-card h2 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 20px;
+  color: var(--espresso);
+  margin: 0 0 8px;
+}
+.dash-card p {
+  font-size: 14px;
+  margin: 0;
+}
+
+/* TS-200 — Profile editor: textarea + readonly list + section
+   spacing on top of the shared `auth-form` primitives. The
+   editor reuses the auth-form input + label + help-text tokens so
+   the visual language stays consistent with signup / login. */
+.auth-form textarea {
+  font-family: var(--sans);
+  font-size: 15px;
+  padding: 12px 14px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: 4px;
+  outline: none;
+  transition: border-color 0.15s ease;
+  min-height: 120px;
+  resize: vertical;
+}
+.auth-form textarea:focus-visible {
+  border-color: var(--espresso);
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: var(--focus-ring-offset);
+}
+.auth-form .help.error {
+  color: var(--clay);
+}
+.auth-alert-success {
+  background: rgba(127, 142, 109, 0.12);
+  border-color: var(--sage);
+}
+.profile-header {
+  margin-bottom: 32px;
+}
+.profile-section {
+  margin: 32px 0;
+  padding: 24px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  display: grid;
+  gap: 16px;
+}
+.profile-section-heading {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 22px;
+  color: var(--espresso);
+  margin: 0;
+}
+.profile-readonly-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+.profile-readonly-list div {
+  display: grid;
+  gap: 4px;
+}
+.profile-readonly-list dt {
+  font-size: 12px;
+  color: var(--ink-soft);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.profile-readonly-list dd {
+  margin: 0;
+  font-size: 15px;
+  color: var(--ink);
+  text-transform: capitalize;
+}
+.profile-checkbox {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: start;
+  gap: 12px;
+  cursor: pointer;
+}
+.profile-checkbox input[type='checkbox'] {
+  width: 20px;
+  height: 20px;
+  margin: 4px 0 0;
+}
+.profile-checkbox span {
+  display: grid;
+  gap: 4px;
+}
+
+/* TS-200-followup-3 — Chip-builder UX for tag arrays. Replaces the
+   prior comma-separated text input with a labelled chip row + a
+   draft input. Reuses the auth-form palette so the visual language
+   stays consistent with the rest of the editor. Tap targets meet
+   WCAG 2.2 AA (44×44 minimum on the chip remove button + the
+   draft input, sized via padding). */
+.profile-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  border-radius: 4px;
+  transition: border-color 0.15s ease;
+  min-height: 48px;
+}
+.profile-chip-row:focus-within {
+  border-color: var(--espresso);
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: var(--focus-ring-offset);
+}
+.profile-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(127, 142, 109, 0.16);
+  color: var(--espresso);
+  border-radius: 999px;
+  padding: 4px 4px 4px 12px;
+  font-size: 14px;
+  line-height: 1.4;
+}
+.profile-chip-text {
+  white-space: nowrap;
+}
+.profile-chip-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: transparent;
+  color: var(--espresso);
+  border-radius: 999px;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+.profile-chip-remove:hover,
+.profile-chip-remove:focus-visible {
+  background: rgba(127, 142, 109, 0.28);
+  outline: none;
+}
+.profile-chip-remove:focus-visible {
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: 2px;
+}
+.profile-chip-input {
+  flex: 1 1 160px;
+  min-width: 120px;
+  border: none;
+  background: transparent;
+  outline: none;
+  padding: 8px 4px;
+  font-family: var(--sans);
+  font-size: 15px;
+  color: var(--ink);
+}
+.profile-chip-input::placeholder {
+  color: var(--ink-soft);
+}
+.profile-chip-input:disabled {
+  cursor: not-allowed;
+  color: var(--ink-soft);
+}
+
+/* TS-208 — Visit prep checklist. The provider-facing snapshot the
+   surface renders 24h before each visit and on-arrival. Loud
+   allergen warning, calm dietary chips, and a memory-recipe list
+   that mirrors the family-facing catalog. Built on the existing
+   `dash-card` primitive plus four prep-specific helpers. */
+.prep-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  margin-top: 24px;
+}
+@media (min-width: 640px) {
+  .prep-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+.prep-card {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 24px;
+}
+.prep-card h2 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 18px;
+  color: var(--espresso);
+  margin: 0 0 12px;
+}
+.prep-card--allergens {
+  border-color: #c44747;
+  background: #fff7f5;
+}
+.prep-card--allergens h2 {
+  color: #8a2828;
+}
+.prep-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.prep-chip {
+  display: inline-flex;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: var(--linen);
+  border: 1px solid var(--rule);
+  color: var(--ink);
+  font-size: 13px;
+  text-transform: lowercase;
+}
+.prep-chip--allergen {
+  background: #f8d6d0;
+  border-color: #c44747;
+  color: #8a2828;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.prep-recipes {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 0;
+  list-style: none;
+}
+.prep-recipe {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 12px 16px;
+  background: var(--paper);
+}
+.prep-recipe--requested {
+  border-color: var(--espresso);
+  background: #fff5e6;
+}
+.prep-recipe h3 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 16px;
+  color: var(--espresso);
+  margin: 0 0 4px;
+}
+.prep-recipe p {
+  font-size: 13.5px;
+  color: var(--ink-soft);
+  margin: 0;
+}
+.prep-recipe-meta {
+  font-size: 12px;
+  color: var(--ink-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-top: 6px;
+}
+.prep-empty {
+  color: var(--ink-soft);
+  font-style: italic;
+  font-size: 13.5px;
+  margin: 0;
+}
+.prep-meta-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 16px;
+  margin: 12px 0 0;
+}
+.prep-meta-grid dt {
+  font-size: 12px;
+  color: var(--ink-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 500;
+  align-self: start;
+}
+.prep-meta-grid dd {
+  margin: 0;
+  font-size: 14px;
+  color: var(--ink);
+}
+.prep-status-pill {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--linen);
+  border: 1px solid var(--rule);
+  color: var(--ink);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.prep-warning {
+  margin: 0 0 16px;
+  padding: 12px 16px;
+  border-left: 4px solid #c44747;
+  background: #fff7f5;
+  color: #8a2828;
+  font-size: 14px;
+  border-radius: 0 4px 4px 0;
+}
+
+/* ── Privacy Center (TS-309d) ─────────────────────────────────────────
+   Reuses the concierge form primitives; these are the surface-specific
+   pieces only. Tokens throughout (CLAUDE.md §8.2 — no hardcoded colour or
+   spacing), and every interactive target clears the senior-mode 48px floor
+   via the shared button/control rules. */
+.privacy-section {
+  margin: 32px 0 0;
+  max-width: 720px;
+}
+.privacy-receipt {
+  margin: 18px 0 0;
+  padding: 14px 16px;
+  border-left: 3px solid var(--clay-deep);
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 15px;
+  line-height: 1.6;
+}
+.privacy-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-top: 12px;
+}
+.privacy-card {
+  flex: 1 1 300px;
+  padding: 18px 20px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--paper);
+}
+.privacy-card h3 {
+  margin: 0 0 8px;
+  font-family: var(--sans);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--espresso);
+}
+.privacy-card p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--ink);
+}
+.privacy-fieldset {
+  border: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.privacy-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-height: 48px; /* senior-mode tap target (CLAUDE.md §8.3) */
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--ink);
+}
+.privacy-verify {
+  margin-top: 16px;
+  padding: 18px 20px;
+  border: 1px solid var(--clay-deep);
+  border-radius: 8px;
+  background: var(--paper);
+}
+.privacy-verify h3 {
+  margin: 0 0 8px;
+  font-family: var(--sans);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--espresso);
+}
+.privacy-verify p {
+  margin: 0 0 10px;
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--ink);
+}
+.privacy-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.privacy-list__item {
+  padding: 16px 18px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--paper);
+}
+.privacy-list__head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.privacy-list__kind {
+  font-family: var(--sans);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--espresso);
+}
+.privacy-list__status {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--clay-deep);
+}
+.privacy-list__meta {
+  margin: 6px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+}
+.privacy-list__refusal {
+  margin: 10px 0 0;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--ink);
+}
+.privacy-list__actions {
+  margin: 10px 0 0;
+}
+.privacy-note {
+  margin: 16px 0 0;
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--ink-soft);
+}
+
+/*
+ * Sign-in security / MFA enrolment (TS-309d-followup-1).
+ *
+ * The setup key and the recovery codes are read off a screen and typed or
+ * copied by hand, often by someone older, so both are monospace, generously
+ * spaced, and allowed to wrap rather than truncate. A truncated setup key is
+ * a customer who cannot finish enrolling.
+ */
+.mfa-step {
+  margin-top: 18px;
+}
+.mfa-step h3 {
+  margin: 0 0 6px;
+  font-family: var(--serif);
+  font-size: 18px;
+}
+.mfa-secret code,
+.mfa-uri {
+  display: inline-block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 17px;
+  letter-spacing: 0.08em;
+  word-break: break-all;
+  background: rgba(0, 0, 0, 0.04);
+  padding: 6px 10px;
+  border-radius: 6px;
+}
+.mfa-uri {
+  font-size: 12.5px;
+  letter-spacing: 0;
+}
+.mfa-hint {
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+.mfa-codes {
+  list-style: none;
+  margin: 12px 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 8px;
+}
+.mfa-codes code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 17px;
+  letter-spacing: 0.08em;
+}
+.mfa-method-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.mfa-method {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+}
+.mfa-method__name {
+  font-weight: 600;
+}
+.mfa-method__meta {
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+.mfa-method__form {
+  margin: 0 0 0 auto;
+}

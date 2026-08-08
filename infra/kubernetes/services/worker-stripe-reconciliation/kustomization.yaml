@@ -1,0 +1,114 @@
+# Per-worker base for worker-stripe-reconciliation (TS-151-followup-1
+# rollout, Batch 2 — billing/payments path). Consumes the reusable
+# bullmq-worker component. The worker is a thin nightly scheduler with NO
+# datastore of its own (TS-261): once a day it makes one shared-secret-
+# pinned internal call to service-accounting's
+# `POST /api/v1/internal/accounting/stripe-reconciliation/run`, which
+# owns the Stripe read + the ledger comparison + the ops-ticket
+# persistence (CLAUDE.md §6 daily Stripe → ledger reconciliation).
+#
+# Lives in `platform-workers`. Headless: the bullmq-worker component
+# ships NO Service / Ingress / HPA — the worker runs on a scheduler tick
+# and exposes only /healthz + /readyz for the k8s probes. PORT is pinned
+# to the component's default 3000 (the probe port) rather than the env
+# schema's 3054 default.
+#
+# Egress: opens platform-services:3015 via egress-network-policy.yaml
+# (the accounting base admits ingress from platform-workers). The
+# internal API key matches service-accounting's
+# INTERNAL_POST_JOURNAL_API_KEY — rotation is a two-side deploy.
+#
+# Runs at 03:00 UTC (after the 02:00 SaaS-metrics compute), reconciling
+# the most-recently-completed UTC day. Env overlays patch image tag + a
+# handful of ConfigMap values per env.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-workers
+
+components:
+  - ../../components/bullmq-worker
+
+resources:
+  - secret-placeholder.yaml
+  - egress-network-policy.yaml
+
+commonLabels:
+  app.kubernetes.io/name: worker-stripe-reconciliation
+  app.kubernetes.io/instance: worker-stripe-reconciliation
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-stripe-reconciliation
+
+  - target:
+      kind: ConfigMap
+      name: bullmq-worker-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-stripe-reconciliation-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3000"
+          SERVICE_VERSION: dev
+          # TS-504-followup-2a-2 — this worker now boots the OTel SDK + Sentry
+          # (`src/observability/bootstrap.ts`, first import in main.ts). Both OTel
+          # flags default true in the Zod schema; stated here so the enabled
+          # posture is visible in the manifest rather than implied. SENTRY_DSN
+          # EMPTY = off, and the worker logs that it is off rather than staying quiet.
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          SENTRY_DSN: ""
+          ACCOUNTING_SERVICE_BASE_URL: http://service-accounting.platform-services.svc.cluster.local:3015
+          STRIPE_RECONCILIATION_INTERNAL_HEADER_NAME: x-accounting-internal-api-key
+          REQUEST_TIMEOUT_MS: "30000"
+          STRIPE_RECONCILIATION_ENABLED: "true"
+          STRIPE_RECONCILIATION_RUN_HOUR_UTC: "3"
+          STRIPE_RECONCILIATION_SCHEDULER_TICK_MS: "3600000"
+
+  - target:
+      kind: Deployment
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-stripe-reconciliation
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: worker-stripe-reconciliation
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/worker-stripe-reconciliation:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: worker-stripe-reconciliation-config
+          - secretRef:
+              name: worker-stripe-reconciliation-secrets
+
+  - target:
+      kind: NetworkPolicy
+      name: bullmq-worker-ingress-deny
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-stripe-reconciliation-ingress-deny
+
+  - target:
+      kind: PodDisruptionBudget
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-stripe-reconciliation

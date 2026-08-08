@@ -1,0 +1,51 @@
+{
+  "name": "@taste-and-see/worker-outbox-relay",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Outbox relay worker (TS-142). A separate long-running process that polls each producer service's `{schema}.outbox_events` table for undispatched rows and forwards them onto Redis Streams (one stream per event name: `events:{eventName}`). Consumers subscribe via XREADGROUP + XACK and must be idempotent on event_id (CLAUDE.md §5.3). Implements the outbox pattern from PDD §7.3 — services write event rows in the same Prisma transaction as the state change; the relay guarantees at-least-once delivery to the bus.",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "start:dev": "tsc -p tsconfig.build.json --watch",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:boot-graph": "vitest run test/app-module-graph.test.ts",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.0.0",
+    "@nestjs/core": "11.0.0",
+    "@nestjs/platform-express": "11.0.0",
+    "@taste-and-see/contracts": "workspace:*",
+    "@taste-and-see/logger": "workspace:*",
+    "@taste-and-see/nest-common": "workspace:*",
+    "@taste-and-see/nest-observability": "workspace:*",
+    "@taste-and-see/sentry": "workspace:*",
+    "@taste-and-see/tracing": "workspace:*",
+    "ioredis": "5.4.1",
+    "pg": "8.13.1",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.1",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/testing": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/express": "5.0.0",
+    "@types/node": "22.10.1",
+    "@types/pg": "8.11.10",
+    "eslint": "8.57.0",
+    "rimraf": "6.0.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

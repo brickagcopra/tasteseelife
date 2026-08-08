@@ -1,0 +1,39 @@
+# Sealed-secrets controller (TS-151-followup-2).
+#
+# **What this replaces.** Every per-service base ships a
+# `secret-placeholder.yaml` carrying literal `REPLACE_WITH_…` values, and the
+# Phase-1 runbook told the operator to `kubectl create secret generic …` by hand
+# and then delete the placeholder from the overlay's `resources:` list before
+# applying. That is 31 hand-typed Secrets across ~150 keys, with a footgun
+# attached: forget the deletion and the next `kubectl apply` overwrites the real
+# credential with the placeholder, which every affected pod then fails Zod
+# validation against at boot.
+#
+# With this controller installed, the operator instead runs
+# `infra/kubernetes/scripts/seal-secrets.mjs`, which emits SealedSecret
+# manifests — asymmetrically encrypted under THIS cluster's public key, safe to
+# commit — plus the `$patch: delete` directives that retire the placeholders.
+# See `infra/kubernetes/README.md` § "Secrets".
+#
+# **The controller's private key is the whole trust anchor.** It is generated
+# in-cluster on first start and never leaves. A SealedSecret encrypted for one
+# cluster cannot be decrypted by another, which is the property that makes
+# committing the ciphertext safe — and also means a cluster rebuild without a
+# key backup renders every committed SealedSecret permanently undecryptable.
+# Backing up that key is a runbook step, not an optional extra.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Upstream ships everything in `kube-system`. Retargeting to `platform-system`
+# keeps it with the other cluster-support workloads (cert-manager,
+# ingress-nginx) rather than mixed into k3s's own components, where an operator
+# reading `kube-system` cannot tell platform choices from distribution
+# defaults.
+#
+# Consequence to remember: kubeseal defaults to `--controller-namespace
+# kube-system`, so every invocation must pass `platform-system` explicitly.
+# The seal script does this; a hand-run kubeseal must too.
+namespace: platform-system
+
+resources:
+  - controller.yaml

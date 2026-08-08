@@ -1,0 +1,16 @@
+* text=auto eol=lf
+
+*.{cmd,bat,ps1} text eol=crlf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.avif binary
+*.pdf binary
+*.zip binary
+*.gz binary
+
+pnpm-lock.yaml linguist-generated=true

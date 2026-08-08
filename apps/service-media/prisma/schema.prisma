@@ -1,0 +1,356 @@
+// Media bounded context — see PDD §7.2 (service inventory entry #20)
+// and PDD §21.5 (image-upload pipeline) + CLAUDE.md §3.4 (file-upload
+// mandatory pipeline). The TS-110 slice ships the assets metadata table
+// + the signed-URL issuance + scan-event ingest surfaces; the media-
+// processor worker that produces the scan events lives in its own app
+// (TS-110-followup-1).
+//
+// Soft-FK discipline (CLAUDE.md §2.3, §4.1). Every column that looks
+// like an id into another service's schema (`owner_user_id` into
+// `identity.users.id`, `owner_scope_id` into household / senior /
+// provider / course tables across services) is a plain TEXT — service-
+// media does not maintain referential integrity with the producer
+// services. The service-layer authorization gate (TS-141-followup-3)
+// answers "may this user touch this scope?" at request time.
+//
+// Storage truth lives in S3 (or the stub backing). Postgres holds the
+// metadata + lifecycle state machine + audit trail. Bytes are never
+// stored here.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. Production-stable
+  // since Prisma 5.0 even though it remains under `previewFeatures`.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `media` Postgres schema. Every other service
+  // gets its own schema in the same database (Phase 1) or its own
+  // database entirely (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["media"]
+}
+
+/// Asset kind — controls the per-kind size cap and the allowed MIME
+/// subset. Mirrors `MediaAssetKindSchema` in `packages/contracts`.
+///
+///   - `senior_photo`           — family / chef-uploaded photo of a
+///     senior. Senior consent gate applies (CLAUDE.md §12).
+///   - `provider_profile_photo` — provider-uploaded headshot.
+///   - `provider_video_intro`   — provider-uploaded short video intro
+///     (the largest per-kind cap; 200 MiB).
+///   - `memory_recipe_image`    — family / senior memory-recipe card.
+///   - `provider_document`      — provider-uploaded ID / food handler /
+///     insurance proof (PDF).
+///   - `certification_evidence` — provider-uploaded course completion
+///     evidence (PDF or image).
+///   - `academy_lesson_attachment` — instructor-uploaded lesson asset.
+enum MediaAssetKind {
+  senior_photo
+  provider_profile_photo
+  provider_video_intro
+  memory_recipe_image
+  provider_document
+  certification_evidence
+  academy_lesson_attachment
+
+  @@map("media_asset_kind")
+  @@schema("media")
+}
+
+/// Asset lifecycle status. Mirrors `MediaAssetStatusSchema` in
+/// `packages/contracts`. See the contract doc-comment for the full
+/// state machine; this enum is the persistence layer's view of it.
+enum MediaAssetStatus {
+  awaiting_upload
+  uploaded
+  scanning
+  ready
+  rejected
+  failed
+  expired
+
+  @@map("media_asset_status")
+  @@schema("media")
+}
+
+/// Virus-scan outcome (independent of the overall asset status because
+/// the pipeline runs magic-byte + ClamAV + Sharp in sequence and each
+/// can fail independently). Mirrors `MediaScanStatusSchema`.
+enum MediaScanStatus {
+  pending
+  clean
+  infected
+  failed
+
+  @@map("media_scan_status")
+  @@schema("media")
+}
+
+/// Declared owner-scope kind. service-media doesn't enforce referential
+/// integrity into other service schemas (CLAUDE.md §2.3 — soft FK). The
+/// scope is identified by `(scopeKind, scopeId)` and the service-layer
+/// authorization gate enforces the cross-service "is this user a member
+/// of this scope?" check at request time (TS-141-followup-3).
+enum MediaOwnerScopeKind {
+  user
+  household
+  senior
+  provider
+  course
+
+  @@map("media_owner_scope_kind")
+  @@schema("media")
+}
+
+/// Internal scan-event kind. The media-processor reports each stage of
+/// the pipeline via this discriminator. Mirrors
+/// `MediaAssetEventKindSchema`.
+enum MediaAssetEventKind {
+  upload_completed
+  magic_byte_passed
+  magic_byte_failed
+  scan_passed
+  scan_failed
+  process_passed
+  process_failed
+  expired
+
+  @@map("media_asset_event_kind")
+  @@schema("media")
+}
+
+/// One row per declared upload intent (TS-110).
+///
+/// **Lifecycle.** The state machine sits behind `MediaAssetStatus`:
+///
+///   awaiting_upload → uploaded → scanning → ready
+///                              ↘             ↘
+///                                rejected     rejected/failed
+///                  ↘
+///                    expired
+///
+/// **Idempotency.** `id` is the surrogate primary key (cuid2). The
+/// service does not currently support "give me the same upload URL for
+/// the same client intent twice" — the contract requires the client to
+/// treat a fresh upload-URL request as a fresh asset. Replay semantics
+/// for scan events are keyed off `(asset_id, event_kind)` on the events
+/// table.
+///
+/// **Append-only for sensitive fields.** `storageBucket`, `storageKey`,
+/// `ownerUserId`, `ownerScopeKind`, `ownerScopeId`, and `kind` are set
+/// at create and never updated — the migration adds a BEFORE-UPDATE
+/// Postgres trigger that rejects any UPDATE that mutates these columns.
+/// Service-layer code never UPDATEs them; admin tooling that needs to
+/// remap (e.g. a partner-org tenancy migration) must DROP TRIGGER + apply
+/// the change + recreate.
+///
+/// **No FK across service boundaries.** `ownerUserId` is a soft-FK into
+/// `identity.users.id`; `ownerScopeId` is a soft-FK into one of
+/// `household.households.id` / `household.seniors.id` /
+/// `provider.providers.id` / `academy.courses.id` depending on
+/// `ownerScopeKind`. CLAUDE.md §2.3.
+///
+/// **No bytes here.** Every byte lives in S3 (or the stub backing). The
+/// `storageBucket` + `storageKey` columns are the canonical reference;
+/// `deliveryKey` is the post-processing variant the read surface mints
+/// signed delivery URLs against.
+model MediaAsset {
+  /// Surrogate primary key — the row's stable identity (CUID2).
+  id                          String              @id @default(cuid())
+
+  /// Soft FK into `identity.users.id`. The user who initiated the
+  /// upload — used for "owner reads" and the audit trail.
+  ownerUserId                 String              @map("owner_user_id")
+
+  /// Scope kind + id (soft FK; see CLAUDE.md §2.3). The scope id meaning
+  /// varies with the kind: a `household` scope id resolves to a
+  /// `household.households.id`; a `provider` scope id resolves to a
+  /// `provider.providers.id`; etc.
+  ownerScopeKind              MediaOwnerScopeKind @map("owner_scope_kind")
+  ownerScopeId                String              @map("owner_scope_id")
+
+  /// Asset kind — drives the per-kind MIME allow-list, size cap, and
+  /// (in the media-processor) the Sharp resize / format-conversion
+  /// pipeline.
+  kind                        MediaAssetKind
+
+  /// Lifecycle state. Mutated only via the events table writes.
+  status                      MediaAssetStatus    @default(awaiting_upload)
+
+  /// Independent scan-stage state; see `MediaScanStatus`.
+  scanStatus                  MediaScanStatus     @default(pending) @map("scan_status")
+
+  /// Free-text reason for `rejected` / `failed` / `infected` rows.
+  /// Bounded by `MEDIA_REASON_MAX_LENGTH` at the contract layer.
+  scanReason                  String?             @map("scan_reason")
+
+  /// Client-declared MIME from the upload-URL request. Never trusted —
+  /// magic-byte detection in the media-processor is authoritative
+  /// (CLAUDE.md §17.16).
+  declaredMime                String              @map("declared_mime")
+
+  /// Magic-byte detection result. Null until the media-processor's
+  /// `magic_byte_passed` event lands.
+  detectedMime                String?             @map("detected_mime")
+
+  /// Original client-declared file name (cosmetic only — used for
+  /// content-disposition on delivery). Bounded at the contract layer.
+  declaredFileName            String?             @map("declared_file_name")
+
+  /// Client-declared size in bytes. The signed-URL issuer caps the
+  /// actual S3 upload to this size (Content-Length-Range header on
+  /// presigned-POST; sigv4 query param doesn't enforce on PUT — we
+  /// rely on the magic-byte + Sharp pass to catch size overrun).
+  declaredSizeBytes           BigInt              @map("declared_size_bytes")
+
+  /// Actual size reported by S3 / the magic-byte pass. BigInt so even
+  /// astronomically large uploads fit. CLAUDE.md §4.1 no-float-money
+  /// rule generalises to "no float for any byte counts that drive
+  /// fee/storage math".
+  actualSizeBytes             BigInt?             @map("actual_size_bytes")
+
+  /// Image dimensions (pixels). Populated by the Sharp pass for image
+  /// kinds; null for PDF / video kinds.
+  width                       Int?
+  height                      Int?
+
+  /// SHA-256 hex digest of the original bytes (computed by the
+  /// media-processor's magic-byte pass).
+  sha256                      String?
+
+  /// S3 bucket the original bytes land in.
+  storageBucket               String              @map("storage_bucket")
+
+  /// S3 object key for the original bytes. The Sharp resize / format
+  /// conversion pass writes a sibling `deliveryKey` object (different
+  /// extension; e.g. `.webp` for image kinds) and the read surface
+  /// mints signed delivery URLs against that key — never the original.
+  storageKey                  String              @map("storage_key")
+
+  /// Sibling S3 object key the Sharp pass writes the delivery variant
+  /// to. Null until `process_passed` lands.
+  deliveryKey                 String?             @map("delivery_key")
+
+  /// Whether the S3 SDK ran in live mode (true) or stub mode (false)
+  /// at the time of the upload-URL issuance. Lets ops tell at a glance
+  /// which rows were minted under the Phase-1 stub.
+  liveMode                    Boolean             @default(false) @map("live_mode")
+
+  /// Wall-clock expiry of the upload signed URL (TS-110 stub default:
+  /// 15 minutes; live SDK default: 10 minutes). Used to flip
+  /// `awaiting_upload` rows to `expired` once the cut-off lapses
+  /// without an `upload_completed` event.
+  uploadUrlExpiresAt          DateTime            @map("upload_url_expires_at") @db.Timestamptz(6)
+
+  /// Wall-clock when S3 reported the upload completed (the
+  /// `upload_completed` scan-event).
+  uploadedAt                  DateTime?           @map("uploaded_at") @db.Timestamptz(6)
+
+  /// Wall-clock when the ClamAV pass landed (clean / infected / failed).
+  scannedAt                   DateTime?           @map("scanned_at") @db.Timestamptz(6)
+
+  /// Wall-clock when the Sharp resize / format-conversion pass landed.
+  processedAt                 DateTime?           @map("processed_at") @db.Timestamptz(6)
+
+  createdAt                   DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                   DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Reverse relation: every event that mutated this asset.
+  events                      MediaAssetEvent[]
+
+  /// Powers the "list assets in this scope" read path — primary surface
+  /// for the family / provider portal.
+  @@index([ownerScopeKind, ownerScopeId, createdAt(sort: Desc)], map: "media_assets_scope_created_idx")
+
+  /// Powers the admin "stuck / pending" filter (`status=awaiting_upload`
+  /// older than N minutes; `status=scanning` older than N minutes).
+  @@index([status, createdAt(sort: Desc)], map: "media_assets_status_created_idx")
+
+  /// Powers the admin "all my assets" filter for a single user.
+  @@index([ownerUserId, createdAt(sort: Desc)], map: "media_assets_owner_user_created_idx")
+
+  /// Optional unique guard: a given storage key resolves to exactly one
+  /// asset row. UNIQUE rather than just an index because S3 keys are
+  /// deterministically derived from `(env, kind, year, month, asset id)`
+  /// and a collision would corrupt the audit trail.
+  @@unique([storageBucket, storageKey], map: "media_assets_storage_unique_idx")
+
+  @@map("media_assets")
+  @@schema("media")
+}
+
+/// Append-only audit trail of every state transition on a media asset
+/// (TS-110).
+///
+/// **Idempotency.** `(asset_id, event_kind)` is UNIQUE — a replayed
+/// scan-event hits this constraint and returns the existing row as
+/// `outcome=replayed`. The media-processor's per-stage events are
+/// expected to land at-most-once per asset; a retry of the same stage
+/// is a no-op.
+///
+/// **Append-only.** The migration adds Postgres triggers rejecting any
+/// UPDATE or DELETE on this table. Service-layer code never writes
+/// these triggers' tables outside of INSERT.
+model MediaAssetEvent {
+  /// Surrogate primary key — the row's stable identity (CUID2).
+  id                          String                @id @default(cuid())
+
+  /// FK into `media_assets.id`. Cascade-delete on parent is a future
+  /// admin-tooling concern (we may need to scrub a senior's photos on
+  /// account closure); today there is no delete path and the cascade is
+  /// a guardrail for the eventual TS-100 trust-safety scrubber.
+  assetId                     String                @map("asset_id")
+  asset                       MediaAsset            @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  /// Pipeline-stage event kind. Mirrors `MediaAssetEventKind`.
+  eventKind                   MediaAssetEventKind   @map("event_kind")
+
+  /// Wall-clock the event was reported. Populated from the
+  /// media-processor's view of the world; the service-layer code
+  /// adopts it verbatim rather than re-stamping at INSERT time so the
+  /// audit trail reflects when the event actually happened.
+  occurredAt                  DateTime              @map("occurred_at") @db.Timestamptz(6)
+
+  /// Magic-byte pass extras (populated on `magic_byte_passed`).
+  detectedMime                String?               @map("detected_mime")
+  sha256                      String?
+  sizeBytes                   BigInt?               @map("size_bytes")
+
+  /// Sharp-pass extras (populated on `process_passed`).
+  width                       Int?
+  height                      Int?
+  deliveryKey                 String?               @map("delivery_key")
+
+  /// Failure reason / scan signature (populated on `*_failed`).
+  reason                      String?
+
+  createdAt                   DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// Powers the "events for this asset" admin read.
+  @@index([assetId, occurredAt(sort: Desc)], map: "media_asset_events_asset_occurred_idx")
+
+  /// UNIQUE on (asset_id, event_kind) — idempotent replay semantics.
+  /// The media-processor MAY re-emit a given stage event (e.g. on
+  /// retry); the second insert hits this constraint and the service
+  /// reports `outcome=replayed`.
+  @@unique([assetId, eventKind], map: "media_asset_events_asset_kind_unique_idx")
+
+  @@map("media_asset_events")
+  @@schema("media")
+}

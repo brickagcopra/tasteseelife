@@ -1,0 +1,101 @@
+# Plan catalog seed (TS-040-followup-3).
+#
+# The twin of `service-identity/rbac-seed-job.yaml` (TS-024-followup-1), and
+# landed with it because leaving one release-critical seed automated and the
+# other in a runbook is worse than leaving both manual — an operator who learns
+# that seeds "run themselves now" will not go looking for the exception.
+#
+# **What breaks without it.** `seedPlanCatalog` loads the PRD §5 plan catalog.
+# A release that adds or reprices a plan and does not re-seed leaves the
+# pricing page and the checkout flow reading a catalog that predates the build
+# serving them — and unlike a missing permission, which fails closed with a
+# 403, a stale plan row fails OPEN: the customer is quoted, and can be charged,
+# the old price.
+#
+# **PreSync**, so the catalog is in place before pods serve it. A failed hook
+# aborts the sync, which is correct: shipping a build against a catalog it does
+# not match is worse than not shipping.
+#
+# **Ordering against migrations**: the seed writes tables the Prisma migrations
+# own. This used to claim migrations ran in CI ahead of the sync per CLAUDE.md
+# §4.4 — no such CI step existed. TS-151-followup-12 added `migrate-job.yaml`,
+# a PreSync hook at `sync-wave: -10`; this Job is at the default wave 0, so the
+# schema lands first.
+#
+# **Safe to re-run.** `seedPlanCatalog` upserts by plan code and preserves row
+# ids — deliberately, because subscriptions reference plans and a seed that
+# recreated rows would orphan them. A sync that changes no plans changes no
+# rows.
+#
+# Image tag comes from the overlays' name-keyed `images:` directive, exactly as
+# for the Deployment; no per-overlay edit.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: service-subscription-plan-seed
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # BeforeHookCreation rather than HookSucceeded — the pod log is the only
+    # record of what the seed created vs updated, and it is the first thing
+    # anyone asks for after a pricing surprise.
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    # kube-linter's probe checks are scoped to DeploymentLike, which includes
+    # Job. A one-shot seed has no steady state to probe: it runs, it exits, and
+    # `backoffLimit` + `activeDeadlineSeconds` are its liveness story. Ignoring
+    # the two checks by name — rather than dropping them from
+    # `.kube-linter.yaml` — keeps the gate intact for every long-running
+    # workload, which is what it exists for.
+    ignore-check.kube-linter.io/no-readiness-probe: "A one-shot Job serves no traffic and has nothing to be ready for."
+    ignore-check.kube-linter.io/no-liveness-probe: "A one-shot Job is bounded by backoffLimit + activeDeadlineSeconds, not by a probe."
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: plan-seed
+    spec:
+      restartPolicy: Never
+      serviceAccountName: service-subscription
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: seed
+          image: ghcr.io/brickagcopra/service-subscription:replace-me
+          imagePullPolicy: IfNotPresent
+          command: ["node", "dist/scripts/seed-plans.js"]
+          envFrom:
+            - configMapRef:
+                name: service-subscription-config
+            - secretRef:
+                name: service-subscription-secrets
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              # Both bounds set, matching the nestjs-service component: the
+              # `unset-cpu-requirements` gate wants a limit as well as a
+              # request, and an unbounded seed sharing a node with the pods it
+              # is about to unblock is not a trade worth making.
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,147 @@
+# Taste & See — Kubernetes manifest validation (TS-151-followup-9).
+#
+# Gates the `infra/kubernetes/` tree on two independent signals:
+#
+#   1. kubeconform — renders every overlay (dev / staging / prod) with
+#      `kubectl kustomize --enable-helm` and schema-validates every rendered
+#      object (`-strict`). This is the guardrail over the whole deployable
+#      surface (~237 objects/overlay across 27 workloads + cluster bases +
+#      the Helm-inflated ingress-nginx / cert-manager charts): a malformed
+#      patch, a typo'd field, or a bad apiVersion fails the build instead of
+#      surfacing at `kubectl apply` time on the cluster.
+#
+#   2. kube-linter — security-posture lint over the per-service bases we
+#      author (`infra/kubernetes/services/*/`, rendered without Helm). The
+#      curated check set lives in `infra/kubernetes/.kube-linter.yaml`; see
+#      that file for why upstream charts are excluded here (kubeconform covers
+#      their schema; their security hygiene is the maintainers' to own).
+#
+# Path-filtered so unrelated PRs don't re-run it (mirrors the companion-
+# workflow split documented in ci.yml). `--enable-helm` is mandatory because
+# `base/ingress-nginx` and `base/cert-manager` use Kustomize's
+# HelmChartInflationGenerator — see infra/kubernetes/README.md.
+#
+# All third-party `uses:` lines are SHA-pinned (TS-009a); CLI tools are
+# version-pinned via the env block below and fetched as release binaries
+# (same discipline as ci.yml's Semgrep step) so a moving upstream tag can't
+# silently change gate behaviour. References: PDD.md §20.4; CLAUDE.md §11.
+name: Kubernetes manifests
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/kubernetes/**"
+      - ".github/workflows/kubernetes-validate.yml"
+  push:
+    branches: [main]
+    paths:
+      - "infra/kubernetes/**"
+      - ".github/workflows/kubernetes-validate.yml"
+
+concurrency:
+  group: k8s-validate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # Pinned tool versions. kubectl matches the operator-documented client
+  # version in infra/kubernetes/README.md; bump in lockstep with a PR note.
+  KUBECTL_VERSION: "v1.32.2"
+  HELM_VERSION: "v3.16.3"
+  KUBECONFORM_VERSION: "v0.6.7"
+  KUBE_LINTER_VERSION: "v0.7.2"
+
+jobs:
+  kubeconform:
+    name: Schema validation (kubeconform)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        overlay: [dev, staging, prod]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install kubectl + helm + kubeconform
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          # kubectl (provides `kubectl kustomize`; calls helm from PATH).
+          curl -fsSL -o "$tmp/kubectl" \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          install -m 0755 "$tmp/kubectl" /usr/local/bin/kubectl
+          # helm — required by Kustomize's HelmChartInflationGenerator.
+          curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+            | tar -xz -C "$tmp"
+          install -m 0755 "$tmp/linux-amd64/helm" /usr/local/bin/helm
+          # kubeconform.
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C "$tmp"
+          install -m 0755 "$tmp/kubeconform" /usr/local/bin/kubeconform
+          kubectl version --client
+          helm version --short
+          kubeconform -v
+      - name: Render + validate overlays/${{ matrix.overlay }}
+        run: |
+          set -euo pipefail
+          kubectl kustomize --enable-helm "infra/kubernetes/overlays/${{ matrix.overlay }}" \
+            > "rendered-${{ matrix.overlay }}.yaml"
+          # -strict          : reject objects with undefined/extra fields.
+          # -summary         : per-run pass/skip/error counts.
+          # -ignore-missing-schemas : a brand-new CRD without a published
+          #   schema is reported as "skipped" rather than failing the build
+          #   (we still fail hard on every core/known-CRD object).
+          # CRD schemas come from the datreeio CRDs-catalog (cert-manager,
+          # ingress-nginx, monitoring CRDs, etc.).
+          # No -kubernetes-version pin: kubeconform defaults to the latest
+          # ("master") schema bundle, avoiding a "schema not found" failure
+          # when a specific patch release isn't published in the schema repo.
+          # Our manifests use current stable apiVersions, so latest is correct.
+          kubeconform \
+            -strict \
+            -summary \
+            -ignore-missing-schemas \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            "rendered-${{ matrix.overlay }}.yaml"
+
+  kube-linter:
+    name: Security lint (kube-linter)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install kubectl + kube-linter
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          curl -fsSL -o "$tmp/kubectl" \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          install -m 0755 "$tmp/kubectl" /usr/local/bin/kubectl
+          curl -fsSL "https://github.com/stackrox/kube-linter/releases/download/${KUBE_LINTER_VERSION}/kube-linter-linux.tar.gz" \
+            | tar -xz -C "$tmp"
+          install -m 0755 "$tmp/kube-linter" /usr/local/bin/kube-linter
+          kubectl version --client
+          kube-linter version
+      - name: Render per-service bases (no Helm)
+        # Each services/*/ base renders standalone — it consumes a reusable
+        # component and needs no Helm inflation. One file per base keeps
+        # kube-linter's findings traceable to a single workload.
+        run: |
+          set -euo pipefail
+          out="rendered-services"
+          mkdir -p "$out"
+          for d in infra/kubernetes/services/*/; do
+            name="$(basename "$d")"
+            kubectl kustomize "$d" > "$out/$name.yaml"
+          done
+          echo "Rendered $(ls "$out" | wc -l) service bases."
+      - name: kube-linter lint
+        run: |
+          set -euo pipefail
+          kube-linter lint \
+            --config infra/kubernetes/.kube-linter.yaml \
+            rendered-services/

@@ -1,0 +1,227 @@
+// Activity bounded context — see PDD §7.2 (service inventory entry
+// #19), PDD §17.2 (user activity log), PDD §17.3 (site-wide activity
+// monitoring), PDD §8.3 (Cassandra keyspace shape for the cold side),
+// and CLAUDE.md §17.7 (mutating audit log entries is an absolute
+// prohibition — applied here defensively even though the activity log
+// is user-visible rather than ops-tamper-evident).
+//
+// Scope so far:
+//   - TS-101 adds the `activity` Postgres schema and the core
+//     `activity_events` row — every notable user-visible event (logins,
+//     profile changes, payment changes, subscription changes, booking
+//     lifecycle, role grants, suspicious-activity flags) lands a row
+//     with userId, kind, occurredAt, IP, UA, device fingerprint,
+//     request id, trace id, and a small adjunct metadata payload. The
+//     90-day "hot" window per PDD §17.1; the indefinite Cassandra
+//     "cold" mirror is captured as TS-101-followup-1.
+//
+// **Why no hash chain?** Unlike service-audit (PDD §17.1), the activity
+// log is user-visible (PRD §6.1 — the "Activity" page on the family
+// portal) and used for self-service review, not tamper-evident ops
+// auditing. The audit-svc owns the chained admin mutation log; the
+// activity-svc owns the user-visible event stream. Two surfaces, two
+// stores — same low-level primitives but distinct purposes.
+//
+// Append-only enforcement (CLAUDE.md §17.7). The companion migration
+// installs Postgres triggers that raise on every UPDATE / DELETE /
+// TRUNCATE against `activity_events` — defence-in-depth against an
+// admin connecting via psql and running a manual mutation. Service-
+// layer code only ever INSERTs.
+//
+// Cross-service references are by id only — never a foreign key into
+// another service schema (CLAUDE.md §2.3, §4.1). `user_id`,
+// `request_id`, `trace_id`, `event_id` are free TEXT — the activity
+// service does not maintain referential integrity with the producer
+// services (a producer stamps the correct ids).
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. The feature has
+  // been production-stable since Prisma 5.0 even though it remains
+  // under the `previewFeatures` umbrella in 5.x.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `activity` Postgres schema. Every other
+  // service gets its own schema in the same database (Phase 1) or its
+  // own database entirely (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["activity"]
+}
+
+/// Categorical kind of activity event (TS-101). The enum is the
+/// authoritative catalog of "things worth surfacing on the user's
+/// Activity page" — adding a new kind is purely additive (CLAUDE.md
+/// §5.3 backward-compatible evolution); never repurpose an existing
+/// value. The Phase-1 set covers PDD §17.2's named categories:
+///
+///   Authentication & session — `login_success`, `login_failure`,
+///     `logout`, `password_changed`, `mfa_enrolled`, `mfa_removed`.
+///
+///   Profile & payments — `profile_changed`, `payment_method_added`,
+///     `payment_method_removed`.
+///
+///   Subscription & booking — `subscription_changed`, `booking_created`,
+///     `booking_canceled`.
+///
+///   Role lifecycle (admin-staff users) — `role_granted`,
+///     `role_revoked`.
+///
+///   Trust & safety — `suspicious_activity_flag` (impossible travel,
+///     mass failures, rapid coupon attempts; surfaced both to the user
+///     and to trust-safety per PDD §17.2).
+enum ActivityEventKind {
+  login_success
+  login_failure
+  logout
+  password_changed
+  mfa_enrolled
+  mfa_removed
+  profile_changed
+  payment_method_added
+  payment_method_removed
+  subscription_changed
+  booking_created
+  booking_canceled
+  role_granted
+  role_revoked
+  suspicious_activity_flag
+
+  @@map("activity_event_kind")
+  @@schema("activity")
+}
+
+/// Activity event — every notable user-visible event lands one row
+/// here (PDD §17.2).
+///
+/// **Append-only.** The companion migration installs Postgres triggers
+/// that reject UPDATE and DELETE at the database level. Service-layer
+/// code only INSERTs. Mutations to the activity log are an absolute
+/// prohibition per CLAUDE.md §17.7 — applied here defensively even
+/// though the activity log is user-visible rather than tamper-evident.
+///
+/// **One row per event.** `eventId` is UNIQUE — the producer assigns
+/// the id at the time of the event (CUID2 / UUID v7) and submits it on
+/// the wire. A retry that hits the same event_id replays into the
+/// existing row (the service returns it) so cross-service callers
+/// don't need to remember a separate `Idempotency-Key`.
+///
+/// **No hash chain.** Unlike `service-audit`, the activity log is
+/// user-visible (PRD §6.1) and used for self-service review, not
+/// tamper-evident ops auditing. The audit-svc owns the chained admin
+/// mutation log; this row is the user's "what happened to my account"
+/// stream.
+///
+/// **Soft fields.**
+///   - `ip` is nullable when the producer can't determine the IP
+///     (system jobs, e.g. a scheduled subscription renewal).
+///   - `userAgent` / `deviceFingerprint` / `requestId` are nullable
+///     for the same reason.
+///   - `traceId` is nullable until `@taste-and-see/tracing` is wired
+///     into every producer service (TS-020-followup-1 cluster).
+///   - `metadata` is nullable — adjunct payload for events that need
+///     it (e.g. `subscription_changed` carries `{from, to}`); events
+///     that don't need it leave the column null.
+///
+/// **Indexes.** Three composite indexes drive the dominant read paths:
+///
+///   1. (userId, occurredAt DESC) — the dominant query. Powers
+///      `GET /api/v1/users/me/activity` (self-view) and
+///      `GET /api/v1/admin/users/:userId/activity` (admin search).
+///      Composite ordering puts the most-recent event first per user
+///      so the planner serves the query as a single backward index
+///      scan with no Sort node.
+///
+///   2. (kind, occurredAt DESC) — kind-filtered scans. Powers ops
+///      questions like "every suspicious_activity_flag in the last
+///      week" (PDD §17.3 trust-safety dashboard).
+///
+///   3. (createdAt) — single-column index on createdAt for the
+///      90-day-retention prune worker (TS-101-followup-3 —
+///      `WHERE created_at < now() - retention`).
+///
+/// The unique index on `eventId` covers the idempotent-replay read
+/// path with a direct hit.
+///
+/// **Retention.** PDD §17.1 ("90 days hot in PostgreSQL, indefinite in
+/// Cassandra") — same retention model as `service-audit`. The 90-day
+/// prune is a BullMQ scheduled worker captured as TS-101-followup-3;
+/// the cold-store sync to Cassandra is TS-101-followup-1.
+model ActivityEvent {
+  /// Surrogate primary key — the row's stable identity inside this
+  /// table. Distinct from `eventId` because the producer's event_id is
+  /// the dedup key (UNIQUE) while the surrogate id is the natural row
+  /// identity Prisma needs for unambiguous PK behaviour.
+  id                String            @id @default(cuid())
+  /// Producer-assigned event id. UNIQUE — the dedup key for retries
+  /// and re-deliveries. Capped at 128 chars at the contract layer.
+  eventId           String            @unique @map("event_id")
+  /// Soft FK into `identity.users.id`. Every activity event has a
+  /// target user.
+  userId            String            @map("user_id")
+  /// Categorical event kind — the catalog the user sees on their
+  /// Activity page.
+  kind              ActivityEventKind
+  /// Wall-clock time the producer recorded the event happened.
+  /// Distinct from `createdAt` because the producer's time may
+  /// differ from the activity service's INSERT time (especially for
+  /// retried submissions).
+  occurredAt        DateTime          @map("occurred_at") @db.Timestamptz(6)
+  /// Actor IP address. Stored as `INET` so Postgres recognises CIDR
+  /// queries (e.g. "every login from this /24"). Nullable when the
+  /// producer can't determine the IP (system jobs).
+  ip                String?           @db.Inet
+  /// Actor User-Agent header. Nullable for system jobs.
+  userAgent         String?           @map("user_agent")
+  /// Producer-stamped opaque device fingerprint (e.g. the
+  /// `userAgent` + `screenHeight` + `tz` hash from the auth surface).
+  /// Used to surface "you logged in from a new device" in the user's
+  /// activity stream. Free TEXT bounded at the contract layer.
+  deviceFingerprint String?           @map("device_fingerprint")
+  /// Incoming request id from the upstream load balancer / gateway
+  /// (the `x-request-id` or `x-trace-id` header). Free TEXT bounded
+  /// at the contract layer.
+  requestId         String?           @map("request_id")
+  /// OpenTelemetry trace id. Nullable until `@taste-and-see/tracing`
+  /// is wired into every producer service (TS-020-followup-1 cluster).
+  traceId           String?           @map("trace_id")
+  /// Adjunct metadata payload. JSONB so we get GIN-indexability for
+  /// future ad-hoc queries; the contract layer caps the serialised
+  /// payload at 8 KiB. Used by events that carry small adjunct
+  /// context (e.g. `subscription_changed` carries `{from, to}`);
+  /// events that don't need it leave the column null.
+  metadata          Json?
+  /// INSERT wall-clock. Distinct from `occurredAt` (producer's time).
+  createdAt         DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// Powers `GET /api/v1/users/me/activity` and the admin search.
+  /// Composite ordering puts the most-recent event first per user so
+  /// the planner serves the dominant query as a single backward index
+  /// scan.
+  @@index([userId, occurredAt(sort: Desc)], map: "activity_events_user_occurred_idx")
+  /// Powers "every suspicious_activity_flag in the last week" —
+  /// kind-filtered scans for the trust-safety dashboard (PDD §17.3).
+  @@index([kind, occurredAt(sort: Desc)], map: "activity_events_kind_occurred_idx")
+  /// Powers the 90-day-retention prune worker (TS-101-followup-3) —
+  /// `WHERE created_at < now() - retention`. Single-column index
+  /// keeps the prune query off the more complex composites.
+  @@index([createdAt], map: "activity_events_created_at_idx")
+
+  @@map("activity_events")
+  @@schema("activity")
+}

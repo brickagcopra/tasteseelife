@@ -1,0 +1,135 @@
+# Per-namespace ResourceQuotas sized for Phase 1 capacity (PDD §27
+# baseline: 1,500 households, 200 providers, 200 daily bookings).
+#
+# Cluster ceiling: 3× Contabo Cloud VPS L = 24 vCPU / 90 GB / ~2.4 TB
+# NVMe combined. We reserve ~20% headroom for system DaemonSets +
+# kubelet + control-plane (k3s server) overhead, leaving ~19 vCPU /
+# ~72 GB for workloads.
+#
+# Per-namespace allocations sum to ~17 vCPU requests / ~52 GB requests
+# at the requests floor (well within the ~19 vCPU / ~72 GB headroom),
+# with burst limits totalling ~38 vCPU / ~104 GB so the cluster can
+# absorb short load spikes by overcommitting headroom across namespaces.
+#
+# When the cluster scales horizontally (TS-150-followup-2 standby +
+# eventual additional worker nodes), bump the quotas via per-env
+# overlays rather than this base.
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: platform-services-quota
+  namespace: platform-services
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 24Gi
+    limits.cpu: "16"
+    limits.memory: 48Gi
+    pods: "60"
+    services: "30"
+    persistentvolumeclaims: "10"
+    secrets: "100"
+    configmaps: "100"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: platform-frontends-quota
+  namespace: platform-frontends
+spec:
+  hard:
+    requests.cpu: "3"
+    requests.memory: 8Gi
+    limits.cpu: "6"
+    limits.memory: 16Gi
+    pods: "20"
+    services: "10"
+    persistentvolumeclaims: "0"
+    secrets: "40"
+    configmaps: "40"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: platform-workers-quota
+  namespace: platform-workers
+spec:
+  hard:
+    requests.cpu: "2"
+    requests.memory: 6Gi
+    limits.cpu: "4"
+    limits.memory: 12Gi
+    pods: "20"
+    services: "5"
+    persistentvolumeclaims: "0"
+    secrets: "40"
+    configmaps: "40"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: platform-data-quota
+  namespace: platform-data
+spec:
+  hard:
+    requests.cpu: "1"
+    requests.memory: 2Gi
+    limits.cpu: "2"
+    limits.memory: 4Gi
+    pods: "10"
+    services: "10"
+    persistentvolumeclaims: "0"
+    secrets: "30"
+    configmaps: "20"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: platform-system-quota
+  namespace: platform-system
+spec:
+  hard:
+    requests.cpu: "1"
+    requests.memory: 2Gi
+    limits.cpu: "2"
+    limits.memory: 4Gi
+    pods: "20"
+    services: "10"
+    persistentvolumeclaims: "5"
+    secrets: "40"
+    configmaps: "40"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: observability-quota
+  namespace: observability
+spec:
+  hard:
+    requests.cpu: "2"
+    requests.memory: 8Gi
+    limits.cpu: "4"
+    limits.memory: 16Gi
+    pods: "30"
+    services: "15"
+    persistentvolumeclaims: "10"
+    secrets: "40"
+    configmaps: "40"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ingress-quota
+  namespace: ingress
+spec:
+  hard:
+    requests.cpu: "1"
+    requests.memory: 2Gi
+    limits.cpu: "4"
+    limits.memory: 8Gi
+    pods: "10"
+    services: "5"
+    persistentvolumeclaims: "0"
+    secrets: "20"
+    configmaps: "20"

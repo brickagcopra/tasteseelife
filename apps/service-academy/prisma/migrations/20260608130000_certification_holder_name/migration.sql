@@ -1,0 +1,23 @@
+-- TS-255 — Cooking Academy certification issuance.
+--
+-- Forward-compatible expand-only migration (CLAUDE.md §4.1): adds a single
+-- nullable `holder_name` column to the existing `academy.academy_certifications`
+-- table (shipped by the TS-250 skeleton). No data backfill, no index, no
+-- constraint change — purely additive.
+--
+-- Why the column (PDD §15.2; PRD §9.3): the certificate PDF and the PUBLIC
+-- `/verify/cert/{token}` verification page must display the holder's name, but
+-- the name lives in `identity.users` (a different service — never joined,
+-- CLAUDE.md §2.3). The issuance path snapshots the holder name at issue time
+-- (alongside the already-captured `title` + `track`) so render + verify need no
+-- cross-service read. It is the only PII the public page surfaces — a
+-- deliberate, diploma-style credential disclosure.
+--
+-- Nullable: the column is expand-only, so any pre-existing row (none in
+-- practice — the issuance surface is new in TS-255) tolerates a NULL holder.
+-- New issuance always populates it.
+--
+-- Reversal plan: `ALTER TABLE "academy"."academy_certifications" DROP COLUMN "holder_name";`
+-- (drops only the additive column; no data loss beyond the snapshot names).
+
+ALTER TABLE "academy"."academy_certifications" ADD COLUMN "holder_name" TEXT;

@@ -1,0 +1,82 @@
+-- TS-042-followup-3b2 — pause / resume of subscription revenue recognition.
+--
+-- service-accounting consumes `subscription.paused` / `subscription.resumed`
+-- (CLAUDE.md §5.3, §6, §17.17; PDD §11.2, Appendix A). Three schema
+-- additions, all expand-only:
+--
+--   1. `paused` on the `accounting.deferred_revenue_status` enum. The
+--      daily sweep filters `WHERE status = 'active'`, so a paused
+--      balance drops out of amortisation for free and
+--      `deferred_revenue_balances_status_period_idx` still applies.
+--      `canceled` is deliberately NOT reused: it documents a halt prior
+--      to full amortisation with the balance staying on the books
+--      pending TS-084, and un-cancelling on resume would contradict it.
+--
+--   2. `paused_at` — the instant the CURRENT pause window opened, null
+--      whenever the row is not paused. The `subscription.resumed` event
+--      carries `resumedAt` but NOT the pause instant, so without this
+--      column the resume cannot compute how long the balance was
+--      suspended.
+--
+--   3. `paused_duration_seconds` — accumulated suspended time across
+--      every completed pause window, NOT NULL DEFAULT 0.
+--
+-- **Why (3) exists, and why the pause is not just a status flip.**
+-- `computeRecognitionDelta` is purely calendar-driven
+-- (`expectedCumulative = original_amount * elapsed / total`) and
+-- deliberately self-healing. Skipping sweeps while paused therefore has
+-- ZERO net effect: the first post-resume tick recomputes from the
+-- calendar and catches up every paused day in one journal. Extending
+-- `service_period_end` alone does not fix it either — it enlarges the
+-- denominator but the paused days stay in the numerator, so resume still
+-- posts a catch-up journal for service never delivered. The recogniser
+-- therefore amortises over `(end - start) - paused_duration_seconds`
+-- with an elapsed of `(as_of - start) - paused_duration_seconds`.
+-- Because resume extends `service_period_end` by exactly the same
+-- integer it adds here, that denominator is *identical* to the original
+-- service duration — which is what makes every daily journal already
+-- posted before the pause still correct, and is why this change owes no
+-- reversal / replacement journal pairs (CLAUDE.md §6, §17.7).
+--
+-- Seconds rather than milliseconds: an `INTEGER` of ms overflows at 24
+-- days and pauses routinely exceed that; `BIGINT` would buy precision
+-- the day-scale amortisation cannot use.
+--
+-- No backfill. Every existing row is un-paused, which is exactly what
+-- `paused_at IS NULL` + `paused_duration_seconds = 0` means, so the
+-- defaults are the correct historical value rather than a placeholder.
+-- No index: neither column is a query predicate — the sweep narrows on
+-- `status`, and the pause columns are read only for the row already
+-- selected by `subscription_id`.
+--
+-- Reversal plan:
+--   ALTER TABLE "accounting"."deferred_revenue_balances"
+--     DROP COLUMN "paused_duration_seconds",
+--     DROP COLUMN "paused_at";
+--   -- Postgres cannot drop a single enum value; reversing the enum
+--   -- addition requires recreating the type:
+--   --   CREATE TYPE "accounting"."deferred_revenue_status_old"
+--   --     AS ENUM ('active', 'fully_recognized', 'canceled');
+--   --   ALTER TABLE "accounting"."deferred_revenue_balances"
+--   --     ALTER COLUMN status DROP DEFAULT,
+--   --     ALTER COLUMN status TYPE "accounting"."deferred_revenue_status_old"
+--   --       USING status::text::"accounting"."deferred_revenue_status_old",
+--   --     ALTER COLUMN status SET DEFAULT 'active';
+--   --   DROP TYPE "accounting"."deferred_revenue_status";
+--   --   ALTER TYPE "accounting"."deferred_revenue_status_old"
+--   --     RENAME TO "deferred_revenue_status";
+--   -- Only runnable when no row carries `paused`. Resume every paused
+--   -- balance first (each resume also restores its `service_period_end`
+--   -- accounting, so a blind reversal mid-pause would strand an
+--   -- unextended period).
+
+-- 1. Enum extension. Postgres requires this as its own statement; PG 12+
+--    permits it inside Prisma's per-migration transaction as long as the
+--    new value is not USED in the same transaction — this migration only
+--    declares it. `IF NOT EXISTS` keeps a rerun idempotent.
+ALTER TYPE "accounting"."deferred_revenue_status" ADD VALUE IF NOT EXISTS 'paused';
+
+-- 2. Pause bookkeeping columns on the balance row.
+ALTER TABLE "accounting"."deferred_revenue_balances"
+  ADD COLUMN "paused_at"               TIMESTAMPTZ(6),
+  ADD COLUMN "paused_duration_seconds" INTEGER NOT NULL DEFAULT 0;

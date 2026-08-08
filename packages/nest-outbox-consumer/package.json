@@ -1,0 +1,54 @@
+{
+  "name": "@taste-and-see/nest-outbox-consumer",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Shared NestJS outbox-consumer SDK for the Taste & See platform (TS-142-followup-2). Consumer side of the outbox pattern (PDD §7.3 / CLAUDE.md §5.3). Subscribes to Redis Streams via XREADGROUP against a per-service consumer group; hands each entry to a typed handler; XACKs on success; tracks consumer-side dedup against an event_id table; retries on transient failure; dead-letters after a configurable cap. Phase-1 wire format matches @taste-and-see/worker-outbox-relay; the Phase-3 Kafka swap (per PDD §29.1) replaces the RedisStreamConsumer without touching handler or scheduler shape.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@taste-and-see/contracts": "workspace:*",
+    "ioredis": "5.4.1",
+    "zod": "3.23.8"
+  },
+  "peerDependencies": {
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/core": "^11.0.0",
+    "reflect-metadata": "^0.2.0",
+    "rxjs": "^7.8.0"
+  },
+  "devDependencies": {
+    "@nestjs/common": "11.0.0",
+    "@nestjs/core": "11.0.0",
+    "@nestjs/testing": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "reflect-metadata": "0.2.2",
+    "rimraf": "6.0.1",
+    "rxjs": "7.8.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

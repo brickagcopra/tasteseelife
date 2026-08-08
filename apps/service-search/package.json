@@ -1,0 +1,66 @@
+{
+  "name": "@taste-and-see/service-search",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Search bounded context (PDD §7.2 service inventory entry #21; §8.5 search indices; §14.1 provider discovery). Phase-1 (TS-111) ships a NestJS 11 skeleton + an in-memory stub backend behind a `SearchBackend` interface so live `@elastic/elasticsearch` wiring can land as TS-111-followup-1 without changing the HTTP contract. Owns the public `POST /api/v1/search/providers` discovery surface plus the internal `PUT|DELETE /api/v1/internal/search/providers/:providerId` upsert / delete endpoints the TS-053 search-indexer worker calls. Cross-domain (content, help center, admin) search lands in subsequent TS-111 follow-ups.",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "start:dev": "tsc -p tsconfig.build.json --watch",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:boot-graph": "vitest run test/app-module-graph.test.ts",
+    "test:watch": "vitest",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate:dev": "prisma migrate dev",
+    "prisma:migrate:deploy": "prisma migrate deploy",
+    "prisma:migrate:status": "prisma migrate status",
+    "prisma:studio": "prisma studio"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.0.0",
+    "@nestjs/core": "11.0.0",
+    "@nestjs/platform-express": "11.0.0",
+    "@prisma/client": "5.22.0",
+    "@taste-and-see/auth-sdk": "workspace:*",
+    "@taste-and-see/contracts": "workspace:*",
+    "@taste-and-see/logger": "workspace:*",
+    "@taste-and-see/nest-auth": "workspace:*",
+    "@taste-and-see/nest-common": "workspace:*",
+    "@taste-and-see/nest-observability": "workspace:*",
+    "@taste-and-see/nest-outbox": "workspace:*",
+    "@taste-and-see/nest-prisma-tenant-scope": "workspace:*",
+    "@taste-and-see/sentry": "workspace:*",
+    "@taste-and-see/tracing": "workspace:*",
+    "jsonwebtoken": "9.0.2",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.1",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/testing": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/express": "5.0.0",
+    "@types/jsonwebtoken": "9.0.7",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "prisma": "5.22.0",
+    "rimraf": "6.0.1",
+    "testcontainers": "10.13.2",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "prisma": {
+    "schema": "prisma/schema.prisma"
+  }
+}

@@ -1,0 +1,16 @@
+# Workers should tolerate disruption — set minAvailable to 0 so a
+# node drain on a single-replica worker doesn't block. When the
+# replica count is bumped above 1 in a per-env overlay, the consumer
+# can patch this to a higher minAvailable.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: bullmq-worker
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: worker
+spec:
+  minAvailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: worker

@@ -1,0 +1,23 @@
+/*
+ * Ladle preview stylesheet.
+ *
+ * Imports the design-tokens layer first so every Tailwind class that
+ * references `var(--paper)` etc. resolves correctly, then layers Tailwind's
+ * base/components/utilities on top. This file is Ladle-only — production
+ * apps wire tokens.css from their own globals.css and rely on
+ * tailwind-preset for theme bridging.
+ */
+
+@import '@taste-and-see/design-tokens/styles/tokens.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: calc(1rem * var(--ts-text-scale));
+}

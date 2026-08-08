@@ -1,0 +1,154 @@
+# Per-service base for service-ads (TS-300-followup-2 - one of the three
+# post-fleet-rollout stragglers no task had owned, so the service had no
+# build workflow and no manifests at all and could not deploy). Mirrors
+# the canonical service-concierge base: consumes the reusable
+# nestjs-service component and overrides every placeholder for this
+# service (port 3024, env-var contract from
+# apps/service-ads/src/config/env.ts).
+#
+# Three required secrets (DATABASE_URL, REDIS_URL, JWT_ACCESS_SECRET)
+# plus ADS_INTERNAL_API_KEY, which the Zod validator also requires - a
+# pod without it will not boot, and that loud failure is only useful if
+# the key is here to be filled in. The matching ADS_INTERNAL_HEADER_NAME
+# is non-secret and rides the ConfigMap.
+#
+# NetworkPolicy: standard backend (component-default admit of
+# platform-services). No platform-workers admit - no worker calls ads.
+#
+# Env overlays in infra/kubernetes/overlays/<env>/ patch image tag,
+# replica count, and a handful of ConfigMap values per env.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-services
+
+components:
+  - ../../components/nestjs-service
+
+resources:
+  - secret-placeholder.yaml
+  # TS-151-followup-12 — ArgoCD PreSync hook (wave -10) that applies this
+  # service's Prisma migrations before anything else in the sync. Listed ahead
+  # of any seed Job below because it must also run ahead of it at apply time.
+  - migrate-job.yaml
+
+commonLabels:
+  app.kubernetes.io/name: service-ads
+  app.kubernetes.io/instance: service-ads
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-ads
+
+  - target:
+      kind: ConfigMap
+      name: nestjs-service-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-ads-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3024"
+          SERVICE_VERSION: dev
+          JWT_ISSUER: taste-and-see/service-identity
+          JWT_AUDIENCE: taste-and-see/api
+          INTERNAL_TRUST_MAX_AGE_SECONDS: "60"
+          IDEMPOTENCY_TTL_SECONDS: "86400"
+          IDEMPOTENCY_IN_FLIGHT_TTL_SECONDS: "60"
+          ADS_INTERNAL_HEADER_NAME: x-internal-api-key
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          # TS-504-followup-2a — Sentry error reporting (CLAUDE.md §10).
+          # EMPTY = off, and the service logs that it is off rather than
+          # staying quiet. The real DSN is supplied per env by the overlay or
+          # the operator; it is not committed, and it is not a Secret
+          # placeholder because a REPLACE_WITH_ value is not a valid URL and
+          # would fail Zod boot on every workload that does not use Sentry.
+          SENTRY_DSN: ""
+
+  - target:
+      kind: Service
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-ads
+      - op: replace
+        path: /spec/ports/0/port
+        value: 3024
+
+  - target:
+      kind: Deployment
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-ads
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: service-ads
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/service-ads:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/ports/0/containerPort
+        value: 3024
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: service-ads-config
+          - secretRef:
+              name: service-ads-secrets
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe/httpGet/port
+        value: 3024
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe/httpGet/port
+        value: 3024
+      - op: replace
+        path: /spec/template/spec/containers/0/livenessProbe/httpGet/port
+        value: 3024
+      - op: replace
+        path: /spec/template/metadata/annotations/prometheus.io~1port
+        value: "3024"
+
+  - target:
+      kind: NetworkPolicy
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-ads
+      - op: replace
+        path: /spec/ingress/0/ports/0/port
+        value: 3024
+
+  - target:
+      kind: PodDisruptionBudget
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-ads
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-ads
+      - op: replace
+        path: /spec/scaleTargetRef/name
+        value: service-ads

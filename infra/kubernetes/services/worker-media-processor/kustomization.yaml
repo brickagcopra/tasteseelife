@@ -1,0 +1,118 @@
+# Per-worker base for worker-media-processor (TS-151-followup-1 rollout,
+# Batch 2 — billing/payments path). Consumes the reusable bullmq-worker
+# component. The worker walks each uploaded media object through the
+# mandatory CLAUDE.md §3.4 pipeline (magic-byte → ClamAV → Sharp/
+# transcode) and reports each stage outcome to service-media's internal
+# scan-event ingest (TS-201). Phase 1 ships stub adapters by default
+# (ADR-0002) — live S3/ClamAV/Sharp/ffmpeg wiring lands behind follow-ups.
+#
+# Lives in `platform-workers`. Headless: the bullmq-worker component
+# ships NO Service / Ingress / HPA — the worker runs on a drain timer and
+# exposes only /healthz + /readyz + /metrics for the k8s probes. PORT is
+# pinned to the component's default 3000 (the probe port) rather than the
+# env schema's 3052 default.
+#
+# The decompression-bomb floor (IMAGE_MAX_INPUT_PIXELS) + the video
+# transcode caps are NON-secret and ride the ConfigMap; they are NEVER
+# disabled (CLAUDE.md §3.4 step 5 / §17.15). The scan-event ingest URL +
+# key wire the worker to service-media — egress-network-policy.yaml opens
+# platform-services:3019 and the service-media base admits ingress from
+# platform-workers.
+#
+# Env overlays in infra/kubernetes/overlays/<env>/ patch image tag + a
+# handful of ConfigMap values per env.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-workers
+
+components:
+  - ../../components/bullmq-worker
+
+resources:
+  - secret-placeholder.yaml
+  - egress-network-policy.yaml
+
+commonLabels:
+  app.kubernetes.io/name: worker-media-processor
+  app.kubernetes.io/instance: worker-media-processor
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-media-processor
+
+  - target:
+      kind: ConfigMap
+      name: bullmq-worker-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-media-processor-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3000"
+          SERVICE_VERSION: dev
+          MEDIA_PROCESSOR_ENABLED: "true"
+          MEDIA_PROCESSOR_INTERVAL_MS: "5000"
+          MEDIA_PROCESSOR_BATCH_SIZE: "20"
+          SCAN_EVENT_INGEST_URL: http://service-media.platform-services.svc.cluster.local:3019
+          SCAN_EVENT_INGEST_API_KEY_HEADER: x-internal-api-key
+          SCAN_EVENT_INGEST_TIMEOUT_MS: "5000"
+          IMAGE_MAX_INPUT_PIXELS: "24000000"
+          MEDIA_VIDEO_MAX_DURATION_SECONDS: "180"
+          MEDIA_VIDEO_MAX_INPUT_PIXELS: "8300000"
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          # TS-504-followup-2a — Sentry error reporting (CLAUDE.md §10).
+          # EMPTY = off, and the service logs that it is off rather than
+          # staying quiet. The real DSN is supplied per env by the overlay or
+          # the operator; it is not committed, and it is not a Secret
+          # placeholder because a REPLACE_WITH_ value is not a valid URL and
+          # would fail Zod boot on every workload that does not use Sentry.
+          SENTRY_DSN: ""
+
+  - target:
+      kind: Deployment
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-media-processor
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: worker-media-processor
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/worker-media-processor:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: worker-media-processor-config
+          - secretRef:
+              name: worker-media-processor-secrets
+
+  - target:
+      kind: NetworkPolicy
+      name: bullmq-worker-ingress-deny
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-media-processor-ingress-deny
+
+  - target:
+      kind: PodDisruptionBudget
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-media-processor

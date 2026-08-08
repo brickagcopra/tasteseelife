@@ -1,0 +1,15 @@
+# Child Applications for dev.
+#
+# `root-dev` (in ../../root/root-dev.yaml) points at THIS directory. The
+# Kustomization here lists each child Application manifest. When a per-service
+# split lands (TS-152-followup-4 — ApplicationSet), this list grows or is
+# replaced by an ApplicationSet generator.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - platform.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: taste-and-see
+  tastesee.io/env: dev

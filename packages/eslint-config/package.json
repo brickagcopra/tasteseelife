@@ -1,0 +1,17 @@
+{
+  "name": "@taste-and-see/eslint-config",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Shared ESLint configurations for the Taste & See monorepo. Apps and services consume the named configs (`base`, plus framework-specific variants added alongside their first consumer).",
+  "main": "base.cjs",
+  "files": [
+    "base.cjs"
+  ],
+  "peerDependencies": {
+    "eslint": ">=8.57.0"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

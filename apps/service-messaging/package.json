@@ -1,0 +1,69 @@
+{
+  "name": "@taste-and-see/service-messaging",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Messaging bounded context (PDD §7.2 service inventory entry #8). Owns thread metadata (PostgreSQL — `messaging.threads`, `messaging.thread_participants`) plus the message body store (Cassandra — `messaging.messages_by_thread`, `messaging.message_inbox` per PDD §8.3). TS-070 ships the NestJS 11 + Prisma + Postgres skeleton with thread + thread-participants metadata tables and `/healthz` + `/readyz`. TS-071 wires the Socket.IO + Redis-adapter real-time delivery layer (PDD §13.1) with JWT-authenticated handshakes, per-thread room gating against the participant table, and a multi-pod fan-out broadcaster service. The Cassandra cold-store wiring (PDD §8.3) is captured as TS-070-followup-1, and the authenticated thread / message HTTP surface arrives in subsequent TS-070-followup slices.",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "start:dev": "tsc -p tsconfig.build.json --watch",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:boot-graph": "vitest run test/app-module-graph.test.ts",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate:dev": "prisma migrate dev",
+    "prisma:migrate:deploy": "prisma migrate deploy",
+    "prisma:migrate:status": "prisma migrate status",
+    "prisma:studio": "prisma studio"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.0.0",
+    "@nestjs/core": "11.0.0",
+    "@nestjs/platform-express": "11.0.0",
+    "@nestjs/platform-socket.io": "11.0.0",
+    "@nestjs/websockets": "11.0.0",
+    "@prisma/client": "5.22.0",
+    "@socket.io/redis-adapter": "8.3.0",
+    "@taste-and-see/auth-sdk": "workspace:*",
+    "@taste-and-see/contracts": "workspace:*",
+    "@taste-and-see/logger": "workspace:*",
+    "@taste-and-see/nest-auth": "workspace:*",
+    "@taste-and-see/nest-common": "workspace:*",
+    "@taste-and-see/nest-idempotency": "workspace:*",
+    "@taste-and-see/nest-observability": "workspace:*",
+    "@taste-and-see/nest-prisma-tenant-scope": "workspace:*",
+    "@taste-and-see/sentry": "workspace:*",
+    "@taste-and-see/tracing": "workspace:*",
+    "ioredis": "5.4.1",
+    "jsonwebtoken": "9.0.2",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.1",
+    "socket.io": "4.8.1",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/testing": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/express": "5.0.0",
+    "@types/jsonwebtoken": "9.0.7",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "prisma": "5.22.0",
+    "rimraf": "6.0.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "prisma": {
+    "schema": "prisma/schema.prisma"
+  }
+}

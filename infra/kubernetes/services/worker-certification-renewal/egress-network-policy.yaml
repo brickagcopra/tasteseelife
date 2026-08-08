@@ -1,0 +1,40 @@
+# Per-worker egress NetworkPolicy for worker-certification-renewal.
+#
+# The namespace default-deny baseline
+# (infra/kubernetes/base/network-policies/default-deny.yaml) denies all
+# egress except DNS (allow-dns-egress) and the external data node
+# (allow-data-node-egress). This worker has no datastore — it only calls
+# three internal HTTP endpoints in the platform-services namespace:
+# service-academy (TCP/3022), service-identity (TCP/3010), and
+# service-notification (TCP/3017) — so this additive policy opens exactly
+# those three paths.
+#
+# The component comment (bullmq-worker/network-policy.yaml) notes that
+# per-worker egress (external CIDRs / in-cluster targets) belongs in the
+# per-worker base, not the reusable component — this is that override. The
+# matching ingress admissions live in those three service bases.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: worker-certification-renewal-egress-services
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: worker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: worker
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: platform-services
+      ports:
+        - protocol: TCP
+          port: 3022
+        - protocol: TCP
+          port: 3010
+        - protocol: TCP
+          port: 3017

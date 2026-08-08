@@ -1,0 +1,287 @@
+// Audit bounded context — see PDD §7.2 (service inventory entry #18),
+// PDD §17.1 (admin audit log) + §17.2 (user activity log) + §17.3
+// (site-wide activity monitoring), PDD §8.3 (Cassandra keyspaces shape
+// for the cold side), and CLAUDE.md §3.6 (append-only + hash chain) +
+// §17.7 (mutating audit log entries is an absolute prohibition).
+//
+// Scope so far:
+//   - TS-100 adds the `audit` Postgres schema and the core `audit_events`
+//     row — every admin / system mutation lands a row with actor,
+//     action, resource, before/after diff, IP, UA, request id, trace id,
+//     and a SHA-256 hash chain across events for the same resource. The
+//     90-day "hot" window per PDD §17.1; the indefinite Cassandra "cold"
+//     mirror is captured as TS-100-followup-1.
+//
+// Append-only enforcement (CLAUDE.md §17.7). The companion migration
+// installs a Postgres trigger that raises on every UPDATE or DELETE
+// against `audit_events` — defence-in-depth against an admin
+// connecting via psql and running a manual mutation. Service-layer
+// code only ever INSERTs; reads project explicit columns via Prisma
+// `select` so a stray read of `chain_prev_hash` / `chain_hash` never
+// leaks unless the request explicitly asks for the field.
+//
+// Cross-service references are by id only — never a foreign key into
+// another service schema (CLAUDE.md §2.3, §4.1). Every column that
+// looks like an id (`actor_user_id`, `resource_id`, `request_id`,
+// `event_id`, etc.) is a free TEXT — service-audit does not maintain
+// referential integrity with the producer services.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. The feature has
+  // been production-stable since Prisma 5.0 even though it remains
+  // under the `previewFeatures` umbrella in 5.x.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `audit` Postgres schema. Every other service
+  // gets its own schema in the same database (Phase 1) or its own
+  // database entirely (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["audit"]
+}
+
+/// Actor tenant-scope kind (TS-100). Mirrors the scope taxonomy from
+/// the identity service's `user_role_scope_type` enum but lives here as
+/// a local TEXT-backed enum because cross-service Prisma imports are
+/// barred (CLAUDE.md §2.3). The producer side stamps the scope; the
+/// audit service writes it verbatim.
+///
+///   - `global`    — actor is acting platform-wide (e.g. super_admin).
+///   - `tenant`    — actor's permission is scoped to a partner / org;
+///                   `actor_tenant_scope_id` carries the tenant id.
+///   - `household` — actor's permission is scoped to a household;
+///                   `actor_tenant_scope_id` carries the household id.
+///   - `system`    — automated / job-driven mutation; no human actor
+///                   (actor_user_id may be null in this case).
+enum ActorTenantScopeType {
+  global
+  tenant
+  household
+  system
+
+  @@map("actor_tenant_scope_type")
+  @@schema("audit")
+}
+
+/// Audit event — every admin / system mutation in the platform lands
+/// one row here (PDD §17.1).
+///
+/// **Append-only.** The companion migration installs Postgres triggers
+/// that reject UPDATE and DELETE at the database level. Service-layer
+/// code only INSERTs. Mutations to the audit log are an absolute
+/// prohibition per CLAUDE.md §17.7.
+///
+/// **One row per event.** `eventId` is UNIQUE — the producer assigns
+/// the id at the time of the mutation (CUID2 / UUID v7) and submits it
+/// on the wire. A retry that hits the same event_id replays into the
+/// existing row (the service returns it) so cross-service callers
+/// don't need to remember a separate `Idempotency-Key`.
+///
+/// **Per-resource hash chain.** Every event stores `chainPrevHash` =
+/// the previous event's `chainHash` for the SAME `(resourceKind,
+/// resourceId)` partition, plus `chainHash` = SHA-256 of the canonical
+/// event content concatenated with `chainPrevHash`. The first event
+/// for a resource has `chainPrevHash = null`. Tampering with a single
+/// event for resource X invalidates every subsequent event for X (the
+/// chain breaks). Cross-resource integrity would force serialised
+/// writes through a single sequencer; per-resource chaining matches
+/// PDD §17.1 + CLAUDE.md §3.6 ("hash chain across events for the same
+/// resource").
+///
+/// **Concurrent writers for the same resource.** The audit service
+/// acquires a per-resource Postgres advisory lock (transaction-scoped)
+/// before reading the chain head + inserting the new row, so two
+/// concurrent writers don't both chain off the same predecessor.
+/// Audit traffic is low enough on any single resource that the
+/// serialised-per-resource write rate is fine.
+///
+/// **Soft fields.**
+///
+///   - `actorUserId` is nullable. System-driven events (scheduled
+///     workers, BullMQ jobs) have no human actor; `actorTenantScopeType`
+///     in that case is `system`.
+///   - `actorRole` is nullable for the same reason.
+///   - `beforeJson` is nullable on a create event (no prior state).
+///   - `afterJson` is nullable on a delete event (no resulting state).
+///   - `traceId` is nullable until `@taste-and-see/tracing` is wired
+///     into every producer service (TS-020-followup-1 cluster).
+///
+/// **Indexes.** Three composite indexes drive the three dominant read
+/// paths from PDD §17.1:
+///
+///   1. (resourceKind, resourceId, occurredAt DESC) — "audit history
+///      for this resource" — drives the admin "view the audit trail
+///      for subscription X" page and the cold-store re-key worker.
+///   2. (actorUserId, occurredAt DESC) — "actions performed by this
+///      admin" — drives the per-admin audit search.
+///   3. (action, occurredAt DESC) — "every coupon-create in the last
+///      week" — drives action-histograms in the trust-safety dashboard.
+///
+/// The unique index on `eventId` covers the idempotent-replay read
+/// path with a direct hit.
+///
+/// **Retention.** PDD §17.1: "90 days hot in PostgreSQL, indefinite in
+/// Cassandra." The 90-day prune is a BullMQ scheduled worker captured
+/// as TS-100-followup-3; the cold-store sync to Cassandra is
+/// TS-100-followup-1.
+model AuditEvent {
+  /// Surrogate primary key — the row's stable identity inside this
+  /// table. Distinct from `eventId` because the producer's event_id is
+  /// the dedup key (UNIQUE) while the surrogate id is the natural row
+  /// identity Prisma needs for unambiguous PK behaviour.
+  id                    String                @id @default(cuid())
+  /// Producer-assigned event id. UNIQUE — the dedup key for retries
+  /// and re-deliveries. Capped at 128 chars at the contract layer.
+  eventId               String                @unique @map("event_id")
+  /// Wall-clock time the producer recorded the event happened.
+  /// Distinct from `createdAt` because the producer's time may
+  /// differ from the audit service's INSERT time (especially for
+  /// retried submissions).
+  occurredAt            DateTime              @map("occurred_at") @db.Timestamptz(6)
+  /// Soft FK into `identity.users.id`. Nullable for system-driven
+  /// events with no human actor.
+  actorUserId           String?               @map("actor_user_id")
+  /// Snapshot of the actor's role at the time of the mutation. Free
+  /// TEXT — service-audit does not validate against the identity
+  /// service's role catalog.
+  actorRole             String?               @map("actor_role")
+  actorTenantScopeType  ActorTenantScopeType  @map("actor_tenant_scope_type")
+  /// Scope id (e.g. partner id, household id) when the scope type is
+  /// `tenant` or `household`; null otherwise.
+  actorTenantScopeId    String?               @map("actor_tenant_scope_id")
+  /// Action name (e.g. `subscription:write`, `coupon:create`,
+  /// `accounting:close_period`). Free TEXT bounded at the contract
+  /// layer; the audit service does not enforce the namespacing —
+  /// producer services own the catalog of action strings.
+  action                String
+  /// Resource kind (e.g. `subscription`, `booking`, `coupon`). Free
+  /// TEXT bounded at the contract layer.
+  resourceKind          String                @map("resource_kind")
+  /// Resource id (e.g. the subscription id, the booking id). Free
+  /// TEXT bounded at the contract layer.
+  resourceId            String                @map("resource_id")
+  /// Before-state JSON diff. JSONB so we get GIN-indexability for
+  /// future ad-hoc queries (e.g. "show me every event where `status`
+  /// was `past_due`"); the contract layer caps the serialised payload.
+  /// Nullable on create events.
+  beforeJson            Json?                 @map("before_json")
+  /// After-state JSON diff. Nullable on delete events.
+  afterJson             Json?                 @map("after_json")
+  /// Actor IP address. Stored as `INET` so Postgres recognises CIDR
+  /// queries (e.g. "every action from this /24"). Nullable when the
+  /// producer can't determine the IP (system jobs).
+  ip                    String?               @db.Inet
+  /// Actor User-Agent header. Nullable for system jobs.
+  userAgent             String?               @map("user_agent")
+  /// Incoming request id from the upstream load balancer / gateway
+  /// (the `x-request-id` or `x-trace-id` header). Free TEXT bounded
+  /// at the contract layer.
+  requestId             String?               @map("request_id")
+  /// OpenTelemetry trace id. Nullable until `@taste-and-see/tracing`
+  /// is wired into every producer service (TS-020-followup-1 cluster).
+  traceId               String?               @map("trace_id")
+  /// SHA-256 hex digest of the previous event's `chainHash` for the
+  /// SAME `(resourceKind, resourceId)` partition. Null for the first
+  /// event for a resource. 64 chars (SHA-256 → 32 bytes → 64 hex).
+  chainPrevHash         String?               @map("chain_prev_hash") @db.Char(64)
+  /// SHA-256 hex digest of the canonical event content concatenated
+  /// with `chainPrevHash`. Always 64 chars; non-null.
+  chainHash             String                @map("chain_hash") @db.Char(64)
+  /// INSERT wall-clock. Distinct from `occurredAt` (producer's time).
+  createdAt             DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// Powers "audit history for this resource" — the admin UI's
+  /// per-resource audit-trail view and the cold-store re-key worker.
+  /// Composite ordering puts the most-recent event first per resource
+  /// so the planner serves the dominant query as a single backward
+  /// index scan.
+  @@index([resourceKind, resourceId, occurredAt(sort: Desc)], map: "audit_events_resource_occurred_idx")
+  /// Powers "actions performed by this admin" — the per-actor audit
+  /// search (PDD §17.1 "Searchable via admin UI by actor"). Excludes
+  /// null `actorUserId` (system events) — admins searching by actor
+  /// don't want the system rows mixed in. Materialised as a partial
+  /// index in the migration SQL (Prisma 5.x's `@@index` cannot
+  /// express the partial predicate). The non-partial index below is
+  /// the Prisma-visible declaration.
+  @@index([actorUserId, occurredAt(sort: Desc)], map: "audit_events_actor_occurred_idx")
+  /// Powers "every coupon-create in the last week" — action histograms
+  /// in the trust-safety dashboard (PDD §17.3).
+  @@index([action, occurredAt(sort: Desc)], map: "audit_events_action_occurred_idx")
+  /// Powers the KIND-WIDE listing (`/by-resource-kind`, TS-295) — "every
+  /// event for these resource kinds, newest first" — the RBAC History
+  /// view's read path (`resource_kind IN (...) ORDER BY occurred_at DESC,
+  /// id DESC LIMIT n`). The existing resource composite can't serve it:
+  /// `resource_id` sits between `resource_kind` and `occurred_at`, so a
+  /// kind-only predicate degenerates to a scan across every resource id.
+  /// `id DESC` is included so the keyset cursor's tie-break rides the
+  /// same index (no re-sort on ties).
+  @@index([resourceKind, occurredAt(sort: Desc), id(sort: Desc)], map: "audit_events_kind_occurred_idx")
+  /// Powers the 90-day-retention prune worker (TS-100-followup-3) —
+  /// `WHERE created_at < now() - retention`. Single-column index on
+  /// `createdAt` keeps the prune query off the more complex composites.
+  @@index([createdAt], map: "audit_events_created_at_idx")
+
+  @@map("audit_events")
+  @@schema("audit")
+}
+
+/// Outbox consumer dedup table (TS-271a-followup-1 / TS-272a-followup-1 /
+/// TS-277a-followup-1; PDD §7.3, CLAUDE.md §5.3, §6). The canonical shape
+/// every CONSUMING service ships — identical to service-accounting /
+/// service-analytics so the schema-agnostic `@taste-and-see/nest-outbox-consumer`
+/// `PgConsumerDedupStore` works unchanged. service-audit consumes the
+/// `audit.action_recorded` Redis Stream and records each event via
+/// `recordEvent`; this table is the SDK's secondary line of defence against
+/// redelivery (the primary is `audit_events.event_id` UNIQUE). One row per
+/// `(consumer_group, event_id)`. Distinct from any producer `outbox_events`
+/// table — "events I have consumed", not "events I will publish".
+model OutboxConsumerDedup {
+  /// Consumer group name (the consuming service's name by convention,
+  /// `service-audit`). Part of the composite PK.
+  consumerGroup    String    @map("consumer_group")
+  /// Event id stamped by the producer at outbox-append time. Part of
+  /// the composite PK; the dedup invariant is enforced at the PK layer.
+  eventId          String    @map("event_id")
+  /// Dot-notation event name (e.g. `audit.action_recorded`). Captured so
+  /// the dedup row is self-describing without joining back to the
+  /// consumer-side handler registry.
+  eventName        String    @map("event_name")
+  /// Three-valued lifecycle: `in_flight` | `processed` | `dead_lettered`.
+  /// The CHECK constraint lives in the migration.
+  state            String
+  /// Monotonic attempt counter. Incremented by the SDK's `recordAttempt`
+  /// on every redelivery.
+  attempts         Int       @default(1)
+  /// Truncated to 2000 chars by the SDK's `recordFailure` /
+  /// `recordDeadLetter` paths.
+  lastError        String?   @map("last_error")
+  /// Wall-clock time the consumer first saw the event. Useful for SLA +
+  /// lag dashboards.
+  firstSeenAt      DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  /// Stamped on every attempt.
+  lastAttemptAt    DateTime  @default(now()) @map("last_attempt_at") @db.Timestamptz(6)
+  /// Stamped on success; NULL until then.
+  processedAt      DateTime? @map("processed_at") @db.Timestamptz(6)
+  /// Stamped when state flips to `dead_lettered`.
+  deadLetteredAt   DateTime? @map("dead_lettered_at") @db.Timestamptz(6)
+
+  @@id([consumerGroup, eventId])
+  @@map("outbox_consumer_dedup")
+  @@schema("audit")
+}

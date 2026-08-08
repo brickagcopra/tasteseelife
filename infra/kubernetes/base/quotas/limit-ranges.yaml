@@ -1,0 +1,71 @@
+# Per-namespace LimitRanges enforce minimum requests + default
+# requests/limits when a pod spec omits them. Belt-and-braces against
+# pods deployed without resources that would otherwise exhaust the
+# namespace quota with a single fork-bomb container.
+#
+# Defaults match the lower-tier sizing in the nestjs-service component
+# (250m / 256Mi requests; 500m / 512Mi limits) so applying a manifest
+# without explicit resources produces a sane Deployment automatically.
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: platform-services-limits
+  namespace: platform-services
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 250m
+        memory: 256Mi
+      min:
+        cpu: 50m
+        memory: 64Mi
+      max:
+        cpu: "2"
+        memory: 2Gi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: platform-frontends-limits
+  namespace: platform-frontends
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 250m
+        memory: 256Mi
+      min:
+        cpu: 50m
+        memory: 64Mi
+      max:
+        cpu: "2"
+        memory: 2Gi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: platform-workers-limits
+  namespace: platform-workers
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 250m
+        memory: 256Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      min:
+        cpu: 25m
+        memory: 32Mi
+      max:
+        cpu: "1"
+        memory: 1Gi

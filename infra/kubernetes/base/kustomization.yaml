@@ -1,0 +1,34 @@
+# Cluster-wide base. Aggregates every namespace-agnostic primitive
+# the platform depends on. Env overlays in
+# infra/kubernetes/overlays/<env>/ consume THIS base plus per-service
+# bases.
+#
+# Order matters for the first apply (namespaces must exist before
+# resources land in them); Kustomize emits all resources in one
+# manifest stream and Kubernetes handles the dependency graph at
+# apply time, but ArgoCD waves (TS-152) make the ordering explicit
+# via `argocd.argoproj.io/sync-wave` annotations on the children.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+components: []
+
+resources:
+  - namespaces
+  - priority-classes
+  - quotas
+  - network-policies
+  - data-access
+  - ingress-nginx
+  - cert-manager
+  # TS-151-followup-2 — must be present before any overlay's SealedSecrets sync,
+  # since the controller is what turns them into Secrets. Listed above
+  # `observability` only for readability; ordering here does not sequence the
+  # apply (ArgoCD sync-waves do that, and the CRD + controller land in the same
+  # stream as the SealedSecrets that need them — ArgoCD retries the CRs until
+  # the CRD is established).
+  - sealed-secrets
+  - observability
+
+commonLabels:
+  app.kubernetes.io/part-of: taste-and-see

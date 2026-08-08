@@ -1,0 +1,135 @@
+# Per-service build pipeline for `api-gateway`.
+#
+# Mirrors service-identity-build.yml (the canonical shape). Triggered on
+# push to `main` when any of the following change:
+#   - apps/api-gateway/**            (the service itself)
+#   - packages/**                     (workspace deps the service imports)
+#   - pnpm-lock.yaml                  (dep graph change anywhere)
+#   - infra/docker/**                 (Dockerfile / README touch)
+#   - .github/workflows/api-gateway-build.yml  (self-update)
+#   - .github/workflows/build-push-image.yml   (reusable workflow update)
+#
+# Build is NOT a PR gate — PRs run the cheap checks in ci.yml. On a push
+# to main that touches this service:
+#   1. build-push-image.yml builds, pushes, signs, and scans a fresh
+#      image tagged `sha-<short-sha>` + `main`.
+#   2. bump-dev-overlay rewrites the api-gateway `newTag:` in
+#      infra/kubernetes/overlays/dev/kustomization.yaml and commits back.
+#   3. ArgoCD's `platform-dev` Application auto-syncs onto the new tag.
+#
+# Staging and prod overlays are NOT auto-bumped — operator-driven
+# promotion PR per CLAUDE.md §11 + PDD §11 (TS-009g-followup-2).
+#
+# References: PDD.md §20.4 (CI/CD), §11 (deployment gates);
+#             CLAUDE.md §11 (CI/CD & branching).
+
+name: api-gateway build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/api-gateway/**"
+      - "packages/**"
+      - "pnpm-lock.yaml"
+      - "infra/docker/**"
+      - ".github/workflows/api-gateway-build.yml"
+      - ".github/workflows/build-push-image.yml"
+
+  # Manual trigger (TS-009g-followup-8). Two cases it exists for:
+  #   - Path filtering is unreliable on a repository FIRST commit, so an
+  #     initial import can land with no image built and no way to ask for one
+  #     short of an empty commit that fakes a path match.
+  #   - Re-running a build after a transient registry or Trivy failure.
+  workflow_dispatch:
+
+concurrency:
+  group: build-api-gateway-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      security-events: write
+    uses: ./.github/workflows/build-push-image.yml
+    with:
+      service-name: api-gateway
+      service-path: apps/api-gateway
+      service-package: "@taste-and-see/api-gateway"
+      image-name: ghcr.io/brickagcopra/api-gateway
+
+  bump-dev-overlay:
+    name: Bump dev overlay `newTag`
+    needs: build
+    # Dispatch can run from any branch; `push` could only ever be main. This
+    # job checks out main, rewrites the dev overlay, and pushes a commit to
+    # main — so without this guard a dispatch from a feature branch would put
+    # an unreviewed build into dev, via the trunk.
+    if: github.ref_name == 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          persist-credentials: true
+
+      - name: Update overlay tag
+        id: bump
+        env:
+          NEW_TAG: ${{ needs.build.outputs.image-sha-tag }}
+        run: |
+          set -euo pipefail
+          overlay='infra/kubernetes/overlays/dev/kustomization.yaml'
+          before="$(grep -A1 '  - name: ghcr.io/brickagcopra/api-gateway$' "${overlay}" | tail -n 1)"
+          awk -v new_tag="${NEW_TAG}" '
+            BEGIN { pending = 0 }
+            /^[[:space:]]*-[[:space:]]*name:[[:space:]]*ghcr\.io\/brickagcopra\/api-gateway[[:space:]]*$/ {
+              pending = 1
+              print
+              next
+            }
+            pending == 1 && /^[[:space:]]*newTag:[[:space:]]*/ {
+              sub(/newTag:[[:space:]]*.*/, "newTag: " new_tag)
+              pending = 0
+              print
+              next
+            }
+            { print }
+          ' "${overlay}" > "${overlay}.next"
+          mv "${overlay}.next" "${overlay}"
+          after="$(grep -A1 '  - name: ghcr.io/brickagcopra/api-gateway$' "${overlay}" | tail -n 1)"
+          echo "before: ${before}"
+          echo "after:  ${after}"
+          if [[ "${before}" == "${after}" ]]; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            echo "Bumper is a no-op (overlay already pins ${NEW_TAG}); skipping commit."
+          else
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Commit & push
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          NEW_TAG: ${{ needs.build.outputs.image-sha-tag }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          git config user.name "${GIT_AUTHOR_NAME}"
+          git config user.email "${GIT_AUTHOR_EMAIL}"
+          git add infra/kubernetes/overlays/dev/kustomization.yaml
+          git commit -m "ci(api-gateway): bump dev overlay to ${NEW_TAG} [skip ci]" \
+                     -m "Source commit: ${GITHUB_SHA}" \
+                     -m "Image digest: ${{ needs.build.outputs.image-digest }}"
+          git push origin HEAD:main

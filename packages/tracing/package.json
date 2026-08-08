@@ -1,0 +1,50 @@
+{
+  "name": "@taste-and-see/tracing",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "OpenTelemetry SDK bootstrap + W3C trace-context propagation primitives (HTTP + BullMQ) + Prometheus metrics surface for Taste & See services. See PDD §20.5, CLAUDE.md §10.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "1.9.0",
+    "@opentelemetry/auto-instrumentations-node": "0.50.0",
+    "@opentelemetry/exporter-prometheus": "0.54.0",
+    "@opentelemetry/exporter-trace-otlp-http": "0.54.0",
+    "@opentelemetry/resources": "1.27.0",
+    "@opentelemetry/sdk-metrics": "1.27.0",
+    "@opentelemetry/sdk-node": "0.54.0",
+    "@opentelemetry/semantic-conventions": "1.27.0"
+  },
+  "devDependencies": {
+    "@opentelemetry/sdk-trace-base": "1.27.0",
+    "@opentelemetry/sdk-trace-node": "1.27.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "rimraf": "6.0.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

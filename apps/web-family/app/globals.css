@@ -1,0 +1,2749 @@
+/*
+ * Taste & See — family portal global styles (TS-121).
+ *
+ * Imports the shared design-tokens CSS variables so the portal renders
+ * in the same warm-textile palette as the marketing site. Layered on
+ * top are a small set of layout / form / button primitives tailored to
+ * the authenticated experience (signup form, dashboard hero cards).
+ *
+ * Senior-mode CSS variables (`--ts-motion-multiplier`, contrast pairs,
+ * tap-target sizes) come from the design-tokens import and are
+ * toggled by a wrapper class once the senior-mode flag ships
+ * (TS-121-followup).
+ */
+
+@import '@taste-and-see/design-tokens/styles/tokens.css';
+
+:root {
+  --serif: var(--font-cormorant), 'Cormorant Garamond', Georgia, serif;
+  --sans: var(--font-dm-sans), 'DM Sans', system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+/* Auth surfaces — login, signup, password reset (later). */
+.auth-shell {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+}
+.auth-card {
+  width: 100%;
+  max-width: 440px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 48px 40px;
+  box-shadow: var(--shadow-card);
+}
+.auth-card h1 {
+  font-family: var(--serif);
+  font-weight: 300;
+  font-size: clamp(28px, 3vw, 38px);
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  margin: 0 0 8px;
+  color: var(--espresso);
+}
+.auth-card p {
+  margin: 0 0 24px;
+  color: var(--ink-soft);
+}
+.auth-form {
+  display: grid;
+  gap: 16px;
+}
+.auth-form label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--espresso);
+  font-weight: 500;
+}
+.auth-form input {
+  font-family: var(--sans);
+  font-size: 15px;
+  padding: 12px 14px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: 4px;
+  outline: none;
+  transition: border-color 0.15s ease;
+  min-height: var(--tap-target-min);
+}
+.auth-form input:focus-visible {
+  border-color: var(--espresso);
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: var(--focus-ring-offset);
+}
+.auth-form .help {
+  font-size: 12px;
+  color: var(--ink-soft);
+  font-weight: 400;
+}
+.auth-form .submit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 14px 22px;
+  border-radius: 999px;
+  background: var(--espresso);
+  color: var(--paper);
+  border: 1px solid var(--espresso);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  min-height: var(--tap-target-min);
+  transition:
+    transform 0.15s ease,
+    background 0.15s ease;
+}
+.auth-form .submit:hover {
+  background: var(--ink);
+  transform: translateY(-1px);
+}
+.auth-form .submit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.auth-alert {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border-radius: 4px;
+  background: rgba(168, 79, 51, 0.08);
+  border: 1px solid var(--clay);
+  color: var(--espresso);
+  font-size: 14px;
+}
+.auth-alert--info {
+  background: rgba(127, 142, 109, 0.12);
+  border-color: var(--sage);
+}
+.auth-foot {
+  margin-top: 24px;
+  font-size: 13.5px;
+  color: var(--ink-soft);
+}
+.auth-foot a {
+  color: var(--espresso);
+  text-decoration: underline;
+}
+
+/* Plan picker for signup. */
+.plan-grid {
+  display: grid;
+  gap: 12px;
+  margin: 0 0 24px;
+}
+.plan-card {
+  display: grid;
+  gap: 6px;
+  padding: 16px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+.plan-card:hover {
+  border-color: var(--espresso);
+}
+.plan-card input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.plan-card.selected {
+  background: var(--espresso);
+  color: var(--paper);
+  border-color: var(--espresso);
+}
+.plan-card .plan-name {
+  font-family: var(--serif);
+  font-size: 20px;
+  font-weight: 400;
+}
+.plan-card .plan-price {
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+.plan-card.selected .plan-price {
+  color: rgba(246, 241, 231, 0.85);
+}
+.plan-card .plan-detail {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  line-height: 1.45;
+}
+.plan-card.selected .plan-detail {
+  color: rgba(246, 241, 231, 0.85);
+}
+
+/* Dashboard shell. */
+.dash-shell {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  min-height: 100vh;
+  background: var(--linen);
+}
+.dash-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 32px;
+  background: var(--paper);
+  border-bottom: 1px solid var(--rule);
+}
+.dash-brand {
+  font-family: var(--serif);
+  font-size: 20px;
+  font-weight: 400;
+  color: var(--espresso);
+}
+.dash-account {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 13.5px;
+  color: var(--ink-soft);
+}
+.dash-logout {
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-size: 13px;
+  color: var(--espresso);
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+.dash-logout:hover {
+  border-color: var(--espresso);
+  background: var(--espresso);
+  color: var(--paper);
+}
+.dash-main {
+  padding: 48px 32px;
+  max-width: 1080px;
+  margin: 0 auto;
+  width: 100%;
+}
+.dash-main h1 {
+  font-family: var(--serif);
+  font-weight: 300;
+  font-size: clamp(34px, 4vw, 52px);
+  letter-spacing: -0.02em;
+  color: var(--espresso);
+  margin: 0 0 16px;
+}
+.dash-main p {
+  color: var(--ink-soft);
+  max-width: 60ch;
+}
+.dash-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px;
+  margin-top: 40px;
+}
+.dash-card {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 24px;
+}
+.dash-card h2 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 20px;
+  color: var(--espresso);
+  margin: 0 0 8px;
+}
+.dash-card p {
+  font-size: 14px;
+  margin: 0;
+}
+
+/* TS-222 — "Your concierge" card (Tier-3 dedicated-concierge perk). A warm
+   callout set apart from the regular dashboard cards with the clay accent. */
+.dash-concierge {
+  margin-top: 32px;
+  padding: 24px;
+  background: var(--linen);
+  border: 1px solid var(--clay);
+  border-radius: 8px;
+}
+.dash-concierge h2 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 22px;
+  color: var(--espresso);
+  margin: 0 0 8px;
+}
+.dash-concierge p {
+  font-size: 15px;
+  margin: 0;
+  color: var(--ink);
+}
+.dash-concierge__backup {
+  margin-top: 8px !important;
+  color: var(--ink-soft) !important;
+  font-size: 14px !important;
+}
+
+/* TS-228 — Tier-3 onboarding (read-only family progress). */
+.dash-onboarding__track {
+  margin: 12px 0;
+  height: 8px;
+  border-radius: var(--radius-full, 999px);
+  background: var(--cream);
+  overflow: hidden;
+}
+.dash-onboarding__fill {
+  height: 100%;
+  background: var(--sage);
+  border-radius: var(--radius-full, 999px);
+}
+.onboarding-card {
+  margin-top: 24px;
+  padding: 24px;
+  background: var(--linen);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+}
+.onboarding-card__progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.onboarding-card__track {
+  flex: 1;
+  height: 10px;
+  border-radius: var(--radius-full, 999px);
+  background: var(--cream);
+  overflow: hidden;
+}
+.onboarding-card__fill {
+  height: 100%;
+  background: var(--sage);
+  border-radius: var(--radius-full, 999px);
+}
+.onboarding-card__label {
+  font-size: 14px;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+.onboarding-card__kickoff {
+  margin: 16px 0 0;
+  font-size: 15px;
+  color: var(--ink);
+}
+.onboarding-card__steps {
+  list-style: none;
+  margin: 20px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+.onboarding-card__step {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 0;
+  border-top: 1px solid var(--rule);
+}
+.onboarding-card__step-mark {
+  font-size: 18px;
+  line-height: 1.4;
+  width: 22px;
+  text-align: center;
+  flex-shrink: 0;
+}
+.onboarding-card__step--done .onboarding-card__step-mark {
+  color: var(--sage);
+}
+.onboarding-card__step--pending .onboarding-card__step-mark {
+  color: var(--ink-soft);
+}
+.onboarding-card__step-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.onboarding-card__step-title {
+  font-size: 15px;
+  color: var(--espresso);
+}
+.onboarding-card__step-status {
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+/* TS-229 — Tier-3 weekly enrichment summaries (family read). */
+.enrichment-card {
+  margin-top: 24px;
+  padding: 24px;
+  background: var(--linen);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+}
+.enrichment-list {
+  list-style: none;
+  margin: 24px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 16px;
+}
+.enrichment-list__item {
+  padding: 20px 24px;
+  background: var(--linen);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  display: grid;
+  gap: 6px;
+}
+.enrichment-list__week {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+}
+.enrichment-list__headline {
+  font-family: var(--serif, serif);
+  font-size: 20px;
+  color: var(--espresso);
+  text-decoration: none;
+}
+.enrichment-list__headline:hover {
+  text-decoration: underline;
+}
+.enrichment-list__teaser {
+  margin: 0;
+  color: var(--ink-soft);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.enrichment-article {
+  margin-top: 8px;
+  max-width: 68ch;
+}
+.enrichment-article__week {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+  margin: 0 0 4px;
+}
+.enrichment-article__headline {
+  font-family: var(--serif, serif);
+  margin: 0 0 16px;
+}
+.enrichment-article__section {
+  margin-top: 20px;
+}
+.enrichment-article__section-title {
+  font-size: 17px;
+  color: var(--espresso);
+  margin: 0 0 6px;
+}
+.enrichment-article__section-body {
+  margin: 0;
+  color: var(--ink);
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+.enrichment-article__meta {
+  margin-top: 24px;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+/* TS-124 — Plan picker on /plans. */
+.plans-list {
+  list-style: none;
+  padding: 0;
+  margin: 32px 0 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 20px;
+}
+.plans-card {
+  display: grid;
+  gap: 16px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 24px;
+  transition: border-color 0.15s ease;
+}
+.plans-card:hover {
+  border-color: var(--espresso);
+}
+.plans-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+.plans-card-head h2 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 22px;
+  color: var(--espresso);
+  margin: 0;
+}
+.plans-price {
+  font-size: 15px;
+  color: var(--espresso);
+  font-weight: 600;
+}
+.plans-desc {
+  margin: 0;
+  font-size: 14px;
+  color: var(--ink-soft);
+  line-height: 1.55;
+}
+.plans-features {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 6px;
+  font-size: 13.5px;
+  color: var(--ink);
+}
+.plans-features li {
+  padding-left: 18px;
+  position: relative;
+}
+.plans-features li::before {
+  content: '·';
+  position: absolute;
+  left: 6px;
+  color: var(--espresso);
+  font-weight: 700;
+}
+.plans-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px dashed var(--rule);
+  padding-top: 16px;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.plans-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 18px;
+  border-radius: 999px;
+  background: var(--espresso);
+  color: var(--paper);
+  font-size: 13.5px;
+  font-weight: 500;
+  border: 1px solid var(--espresso);
+}
+.plans-cta:hover {
+  background: var(--ink);
+}
+.plans-empty {
+  color: var(--ink-soft);
+  font-style: italic;
+  margin-top: 24px;
+}
+
+/* TS-124 — Checkout confirm. */
+.checkout-card {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 32px;
+  margin: 24px 0;
+}
+.checkout-section-heading {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 18px;
+  margin: 0 0 16px;
+  color: var(--espresso);
+}
+.checkout-form {
+  display: grid;
+  gap: 16px;
+}
+.checkout-form label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--espresso);
+  font-weight: 500;
+}
+.checkout-form input[type='email'] {
+  font-family: var(--sans);
+  font-size: 15px;
+  padding: 12px 14px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: 4px;
+  outline: none;
+  transition: border-color 0.15s ease;
+  min-height: var(--tap-target-min);
+}
+.checkout-form input[type='email']:focus-visible {
+  border-color: var(--espresso);
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: var(--focus-ring-offset);
+}
+.checkout-form .submit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 14px 22px;
+  border-radius: 999px;
+  background: var(--espresso);
+  color: var(--paper);
+  border: 1px solid var(--espresso);
+  font-size: 14px;
+  font-weight: 500;
+  min-height: var(--tap-target-min);
+}
+.checkout-form .submit:hover {
+  background: var(--ink);
+}
+.checkout-form .submit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.checkout-form .help {
+  font-size: 12px;
+  color: var(--ink-soft);
+  font-weight: 400;
+}
+.interval-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+.interval-card {
+  display: grid;
+  gap: 6px;
+  padding: 16px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  cursor: pointer;
+  position: relative;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+.interval-card:hover {
+  border-color: var(--espresso);
+}
+.interval-card input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.interval-card.selected {
+  background: var(--espresso);
+  color: var(--paper);
+  border-color: var(--espresso);
+}
+.interval-title {
+  font-family: var(--serif);
+  font-size: 18px;
+}
+.interval-price {
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+.interval-card.selected .interval-price,
+.interval-card.selected .interval-detail {
+  color: rgba(246, 241, 231, 0.85);
+}
+.interval-detail {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+.checkout-fineprint {
+  font-size: 13px;
+  color: var(--ink-soft);
+  max-width: 60ch;
+}
+
+/* Generic CTA / inline link styles used across TS-124 pages. */
+.cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 22px;
+  border-radius: 999px;
+  background: var(--espresso);
+  color: var(--paper);
+  border: 1px solid var(--espresso);
+  font-size: 14px;
+  font-weight: 500;
+  min-height: var(--tap-target-min);
+  margin-top: 16px;
+}
+.cta:hover {
+  background: var(--ink);
+}
+.link-inline {
+  color: var(--espresso);
+  text-decoration: underline;
+}
+.link-inline:hover {
+  text-decoration: none;
+}
+.link-back {
+  display: inline-block;
+  margin-top: 16px;
+  font-size: 13.5px;
+  color: var(--espresso);
+  text-decoration: underline;
+}
+
+/* TS-042-followup-3a3-followup-1 — Billing home. Two plain cards; the
+   surface a family reaches from a dunning email should read as calm and
+   finite, not as a settings screen with a dozen affordances. */
+.billing-card {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 24px;
+  margin-top: 24px;
+}
+.billing-card h2 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+.billing-note {
+  margin: 12px 0 0;
+  font-size: 13.5px;
+  color: var(--espresso);
+}
+.billing-plan-name {
+  margin: 0;
+  font-size: 16px;
+}
+/* The dunning banner. Warm amber rather than red: a card that expired is
+   not an emergency, and alarming a family whose parent is in care makes a
+   hard week worse without making the card work. */
+.billing-alert {
+  margin: 0 0 16px;
+  padding: 14px 16px;
+  border-left: 4px solid #b4762c;
+  background: #fdf6ec;
+  border-radius: 4px;
+  font-size: 14.5px;
+  line-height: 1.6;
+}
+
+/* TS-124 — Invoices list. */
+.invoices-list {
+  list-style: none;
+  padding: 0;
+  margin: 24px 0 0;
+  display: grid;
+  gap: 16px;
+}
+.invoice-card {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 20px;
+  display: grid;
+  gap: 8px;
+}
+.invoice-card-main {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+.invoice-number {
+  font-family: var(--serif);
+  font-size: 18px;
+  color: var(--espresso);
+}
+.invoice-date {
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.invoice-amount {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 14px;
+}
+.invoice-amount strong {
+  font-size: 16px;
+  color: var(--espresso);
+}
+.invoice-status {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--linen);
+  color: var(--ink-soft);
+  border: 1px solid var(--rule);
+}
+.invoice-status--paid {
+  background: rgba(127, 142, 109, 0.15);
+  color: #4a5a3a;
+  border-color: rgba(127, 142, 109, 0.4);
+}
+.invoice-status--open {
+  background: rgba(168, 79, 51, 0.12);
+  color: var(--espresso);
+  border-color: var(--clay);
+}
+.invoice-status--uncollectible {
+  background: rgba(168, 79, 51, 0.2);
+  color: var(--espresso);
+  border-color: var(--clay);
+}
+.invoice-desc {
+  margin: 0;
+  font-size: 13.5px;
+  color: var(--ink-soft);
+}
+.invoice-actions {
+  display: flex;
+  gap: 16px;
+  font-size: 13px;
+}
+
+/* Visually-hidden helper for screen-reader-only legends. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ───── Providers browse + profile (TS-125) ───── */
+.providers-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  margin: 24px 0;
+  padding: 16px;
+  background: var(--linen);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+}
+.providers-filter input[type='search'] {
+  flex: 1 1 240px;
+  min-width: 200px;
+  padding: 10px 14px;
+  font: inherit;
+  background: var(--cream);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+}
+.tier-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.tier-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  background: var(--cream);
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  cursor: pointer;
+  transition:
+    border-color 0.15s,
+    background 0.15s;
+}
+.tier-pill input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.tier-pill.selected,
+.tier-pill:has(input:checked) {
+  background: var(--espresso);
+  color: var(--cream);
+  border-color: var(--espresso);
+}
+.providers-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+.providers-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px;
+  background: var(--cream);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+}
+.providers-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+.providers-card-head h2 {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 22px;
+}
+.providers-tier {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-soft);
+}
+.providers-card-tags {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+/* TS-207 — featured-placement badge. Warm clay fill + cream text keeps the
+   "Featured" pill prominent and on-brand while clearing WCAG AA contrast. */
+.providers-featured {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  background: var(--clay);
+  color: var(--cream);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+/* TS-218b / TS-278 — mandatory "Sponsored" disclosure (PDD §18.3). An
+   outlined, muted pill — deliberately quieter than the clay "Featured"
+   badge so the two read as distinct (a paid placement vs. an organic
+   boost). Ink-soft text + border on the cream card clears WCAG AA. */
+.providers-sponsored {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: var(--radius-full);
+  background: transparent;
+  border: 1px solid var(--ink-soft);
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.providers-headline {
+  margin: 0;
+  font-style: italic;
+  color: var(--ink-soft);
+}
+.providers-bio {
+  margin: 0;
+  font-size: 14px;
+  color: var(--ink);
+}
+.providers-tags {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.providers-tags li {
+  padding: 3px 10px;
+  font-size: 12px;
+  background: var(--linen);
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  color: var(--ink-soft);
+}
+.providers-card-foot {
+  margin-top: auto;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+.providers-empty {
+  margin: 24px 0;
+  padding: 32px;
+  text-align: center;
+  background: var(--cream);
+  border: 1px dashed var(--rule);
+  border-radius: 12px;
+  color: var(--ink-soft);
+}
+
+/* TS-212 — faceted browse layout (sidebar + results). */
+.providers-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 280px) 1fr;
+  gap: 24px;
+  align-items: start;
+}
+@media (max-width: 768px) {
+  .providers-layout {
+    grid-template-columns: 1fr;
+  }
+}
+.providers-sidebar {
+  position: sticky;
+  top: 24px;
+  display: flex;
+  flex-direction: column;
+}
+@media (max-width: 768px) {
+  .providers-sidebar {
+    position: static;
+  }
+}
+.providers-filter-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px;
+  background: var(--linen);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+}
+.providers-sidebar-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--rule);
+}
+.providers-sidebar-head h2 {
+  font-family: var(--serif);
+  font-size: 20px;
+  font-weight: 500;
+  margin: 0;
+  color: var(--espresso);
+}
+.providers-search-row input[type='search'] {
+  width: 100%;
+  padding: 10px 12px;
+  font: inherit;
+  background: var(--cream);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+}
+.providers-facet {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.providers-facet-title {
+  padding: 0;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-soft);
+}
+.providers-facet-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.providers-facet-item label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  font-size: 14px;
+  color: var(--ink);
+  cursor: pointer;
+}
+.providers-facet-item label:hover {
+  background: var(--cream);
+}
+.providers-facet-item input {
+  margin: 0;
+  accent-color: var(--espresso);
+}
+.providers-facet-label {
+  flex: 1;
+}
+.providers-facet-count {
+  font-size: 12px;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+.providers-filter-apply {
+  margin-top: 8px;
+  padding: 10px 14px;
+  font: inherit;
+  background: var(--espresso);
+  color: var(--cream);
+  border: 1px solid var(--espresso);
+  border-radius: 8px;
+}
+.providers-filter-apply:focus-visible {
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: 2px;
+}
+.providers-results {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.providers-summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.providers-summary-text {
+  margin: 0;
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+.providers-summary-text strong {
+  color: var(--ink);
+}
+.providers-rating {
+  margin: 0;
+  font-size: 14px;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.providers-rating-count {
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+.providers-pagination {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--rule);
+}
+.providers-pagination > span:empty {
+  flex: 1;
+}
+
+.provider-profile {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 32px;
+  background: var(--cream);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+}
+.provider-profile h1 {
+  margin: 0 0 8px;
+}
+.provider-headline {
+  margin: 8px 0 0;
+  font-style: italic;
+  color: var(--ink-soft);
+}
+.provider-profile section h2 {
+  font-family: var(--sans);
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-soft);
+  margin: 0 0 8px;
+}
+.provider-profile section p {
+  margin: 0;
+}
+.provider-profile-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--rule);
+}
+.provider-profile-foot p {
+  margin: 0;
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+/* TS-215-followup-1 — heart + CTA row on the provider-detail footer. */
+.provider-profile-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.provider-profile-actions .favorite-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-full);
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+.provider-profile-actions .favorite-toggle[aria-pressed='true'] {
+  color: var(--clay-deep);
+  border-color: var(--clay);
+}
+.provider-profile-actions .favorite-toggle:focus-visible {
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: 2px;
+}
+.provider-profile-actions .favorite-toggle-label {
+  white-space: nowrap;
+}
+
+/* TS-215-followup-2 — hydrated favourite cards on /favorites. */
+.favorites-list {
+  list-style: none;
+  margin: 24px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+.favorites-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px;
+  background: var(--cream);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+}
+.favorites-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+.favorites-card-name {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 22px;
+}
+.favorites-card-headline {
+  margin: 0;
+  font-style: italic;
+  color: var(--ink-soft);
+}
+.favorites-card-placeholder {
+  margin: 0;
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+.favorites-card-foot {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--rule);
+}
+.favorites-meta {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-soft);
+}
+.favorites-notes {
+  margin: 0;
+  font-size: 14px;
+  color: var(--ink);
+}
+.favorites-pagination {
+  margin: 24px 0 0;
+  padding-top: 16px;
+  border-top: 1px solid var(--rule);
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 12px;
+}
+.favorites-pagination [rel='next'] {
+  justify-self: end;
+}
+.favorites-pagination-meta {
+  font-size: 13px;
+  color: var(--ink-soft);
+  text-align: center;
+}
+
+/* ───── Booking-request form (TS-125) ───── */
+.booking-form {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 24px;
+  background: var(--cream);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+}
+.booking-form-context {
+  margin: 0;
+  padding: 12px 16px;
+  background: var(--linen);
+  border-radius: 8px;
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+.service-kind-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+.service-kind-grid legend {
+  font-family: var(--sans);
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-soft);
+  margin-bottom: 12px;
+}
+.service-kind-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px;
+  background: var(--linen);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  cursor: pointer;
+  position: relative;
+}
+.service-kind-card input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.service-kind-card:has(input:checked) {
+  background: var(--espresso);
+  color: var(--cream);
+  border-color: var(--espresso);
+}
+.service-kind-card:has(input:checked) .service-kind-desc {
+  color: var(--cream);
+}
+.service-kind-title {
+  font-weight: 600;
+}
+.service-kind-desc {
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.booking-form-row {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+}
+.booking-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.booking-form input,
+.booking-form textarea {
+  padding: 10px 12px;
+  font: inherit;
+  background: var(--cream);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+}
+.booking-empty-actions {
+  margin-top: 24px;
+}
+
+/* ───── Bookings list + detail (TS-125) ───── */
+.bookings-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+.bookings-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 18px;
+  background: var(--cream);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+}
+.bookings-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+}
+.bookings-card-head h2 {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 20px;
+}
+.bookings-status {
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  background: var(--linen);
+  color: var(--ink-soft);
+  border: 1px solid var(--rule);
+}
+.bookings-status--pending {
+  background: rgba(168, 79, 51, 0.12);
+  color: var(--espresso);
+  border-color: var(--clay);
+}
+.bookings-status--confirmed {
+  background: rgba(127, 142, 109, 0.15);
+  color: #4a5a3a;
+  border-color: rgba(127, 142, 109, 0.4);
+}
+.bookings-status--in_progress {
+  background: var(--espresso);
+  color: var(--cream);
+  border-color: var(--espresso);
+}
+.bookings-status--completed {
+  background: rgba(127, 142, 109, 0.25);
+  color: #3a4729;
+  border-color: rgba(127, 142, 109, 0.5);
+}
+.bookings-status--canceled {
+  background: var(--linen);
+  color: var(--ink-soft);
+}
+.bookings-time {
+  margin: 0;
+  font-weight: 600;
+}
+.bookings-meta {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.bookings-card-foot {
+  margin-top: auto;
+}
+.bookings-more {
+  margin: 24px 0;
+  text-align: center;
+}
+.booking-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 32px;
+  background: var(--cream);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+}
+.booking-thanks {
+  padding: 20px 24px;
+  background: rgba(127, 142, 109, 0.15);
+  border: 1px solid rgba(127, 142, 109, 0.4);
+  border-radius: 8px;
+}
+.booking-thanks h2 {
+  margin: 0 0 8px;
+  font-family: var(--serif);
+  font-size: 22px;
+}
+.booking-thanks p {
+  margin: 0;
+}
+.booking-detail-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 16px;
+}
+.booking-detail-head h1 {
+  margin: 0;
+}
+.booking-detail-meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 12px 24px;
+  margin: 0;
+}
+.booking-detail-meta dt {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-soft);
+}
+.booking-detail-meta dd {
+  margin: 0;
+}
+.booking-canceled {
+  padding: 16px 20px;
+  background: var(--linen);
+  border-radius: 8px;
+  color: var(--ink-soft);
+}
+.booking-detail-foot {
+  padding-top: 16px;
+  border-top: 1px solid var(--rule);
+}
+.booking-detail-foot p {
+  margin: 0;
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+
+/* TS-215-followup-3 — one-shot flash banner (server actions → next render). */
+.flash-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin: 16px auto;
+  max-width: 960px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--rule);
+  background: var(--linen);
+  color: var(--ink);
+  font-size: 14px;
+  box-shadow: var(--shadow-sm);
+}
+.flash-banner--error {
+  background: rgba(168, 79, 51, 0.08);
+  border-color: var(--clay);
+  color: var(--espresso);
+}
+.flash-banner--success {
+  background: rgba(127, 142, 109, 0.15);
+  border-color: rgba(127, 142, 109, 0.4);
+  color: #3a4729;
+}
+.flash-banner--info {
+  background: var(--linen);
+  border-color: var(--rule);
+  color: var(--ink);
+}
+.flash-banner-icon {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-full);
+  background: var(--cream, var(--paper));
+  border: 1px solid currentColor;
+  font-weight: 700;
+  font-size: 13px;
+  line-height: 1;
+}
+.flash-banner-message {
+  flex: 1 1 auto;
+  margin: 0;
+  align-self: center;
+}
+.flash-banner-close {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font-size: 20px;
+  line-height: 1;
+  padding: 0 4px;
+  cursor: pointer;
+  align-self: flex-start;
+}
+.flash-banner-close:focus-visible {
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ── Seniors directory + preference editor (TS-214) ───────────────── */
+
+.seniors-list {
+  list-style: none;
+  margin: 24px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+.seniors-card {
+  padding: 16px 18px;
+  background: var(--linen);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+}
+.seniors-card__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.seniors-card__name {
+  font-family: var(--serif);
+  font-size: 20px;
+  color: var(--espresso);
+}
+/* TS-237 — the directory card name links to the per-senior hub. Styled to
+   read as the card title (serif, espresso) rather than an inline link. */
+.seniors-card__name-link {
+  font-family: var(--serif);
+  font-size: 20px;
+  color: var(--espresso);
+  text-decoration: none;
+}
+.seniors-card__name-link:hover,
+.seniors-card__name-link:focus-visible {
+  text-decoration: underline;
+}
+/* TS-237 — per-senior hub header: name + (optional) status badge baseline-aligned. */
+.senior-hub__head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.seniors-card__status {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-soft);
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: 2px 10px;
+}
+.seniors-card__actions {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.prefs-form {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  margin-top: 24px;
+  max-width: 680px;
+}
+.prefs-section {
+  margin: 0;
+  padding: 18px 20px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--linen);
+}
+.prefs-section__legend {
+  font-family: var(--serif);
+  font-size: 22px;
+  color: var(--espresso);
+  padding: 0 6px;
+}
+.prefs-section__desc {
+  margin: 4px 0 16px;
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+.prefs-field {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 16px;
+}
+.prefs-field:last-child {
+  margin-bottom: 0;
+}
+.prefs-field__label {
+  font-family: var(--sans);
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--espresso);
+}
+.prefs-field__helper {
+  font-size: 12px;
+  color: var(--ink-soft);
+  margin: 2px 0 6px;
+}
+.prefs-field__input {
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+  padding: 10px 12px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: 6px;
+  outline: none;
+  resize: vertical;
+  transition: border-color 0.15s ease;
+}
+.prefs-field__input:focus-visible {
+  border-color: var(--espresso);
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: var(--focus-ring-offset);
+}
+.prefs-actions {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+/* TS-238 — senior family-observability sharing-settings editor. */
+.sharing-form {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  margin-top: 24px;
+  max-width: 680px;
+}
+.sharing-fieldset {
+  margin: 0;
+  padding: 18px 20px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--linen);
+}
+.sharing-fieldset__legend {
+  font-family: var(--serif);
+  font-size: 22px;
+  color: var(--espresso);
+  padding: 0 6px;
+}
+.sharing-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 12px 0;
+  min-height: 48px; /* senior-mode tap target (CLAUDE.md §8.3) */
+  border-bottom: 1px solid var(--rule);
+}
+.sharing-row:last-child {
+  border-bottom: none;
+}
+.sharing-row__toggle {
+  width: 24px;
+  height: 24px;
+  margin-top: 2px;
+  flex: 0 0 auto;
+  accent-color: var(--espresso);
+  cursor: pointer;
+}
+.sharing-row__label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  cursor: pointer;
+}
+.sharing-row__title {
+  font-family: var(--sans);
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--espresso);
+}
+.sharing-row__helper {
+  font-size: 13px;
+  color: var(--ink-soft);
+  line-height: 1.5;
+}
+.sharing-row__note {
+  display: block;
+  margin-top: 4px;
+  font-style: italic;
+  color: var(--clay);
+}
+.sharing-actions {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+.sharing-summary {
+  list-style: none;
+  margin: 24px 0;
+  padding: 0;
+  max-width: 680px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.sharing-summary__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--linen);
+}
+.sharing-summary__row:last-child {
+  border-bottom: none;
+}
+.sharing-summary__title {
+  font-family: var(--sans);
+  font-size: 16px;
+  color: var(--espresso);
+}
+.sharing-summary__state {
+  font-size: 13px;
+  font-weight: 500;
+  padding: 3px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.sharing-summary__state[data-shared='yes'] {
+  background: var(--clay);
+  color: var(--paper);
+}
+.sharing-summary__state[data-shared='no'] {
+  background: var(--paper);
+  color: var(--ink-soft);
+  border: 1px solid var(--rule);
+}
+
+/* TS-232 — consent-gated senior photo gallery. */
+.photo-empty {
+  margin: 24px 0 0;
+  padding: 22px 24px;
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  background: var(--paper);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 680px;
+}
+.photo-grid {
+  list-style: none;
+  margin: 24px 0 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 16px;
+}
+.photo-tile {
+  position: relative;
+  aspect-ratio: 4 / 3;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+}
+.photo-tile__img {
+  object-fit: cover;
+}
+.photo-more {
+  margin-top: 20px;
+}
+
+/* TS-223 — concierge custom-request submission form + request history. */
+.concierge-form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  margin: 24px 0 0;
+  max-width: 680px;
+  padding: 22px 24px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--linen);
+}
+.concierge-field {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+}
+.concierge-field-row {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+.concierge-field__label {
+  font-family: var(--sans);
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--espresso);
+}
+.concierge-field__optional {
+  font-weight: 400;
+  color: var(--ink-soft);
+}
+.concierge-field__helper {
+  font-size: 12px;
+  color: var(--ink-soft);
+  margin: 2px 0 6px;
+}
+.concierge-field__control {
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+  margin-top: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: 6px;
+  outline: none;
+  resize: vertical;
+  transition: border-color 0.15s ease;
+}
+.concierge-field__control:focus-visible {
+  border-color: var(--espresso);
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: var(--focus-ring-offset);
+}
+.concierge-actions {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+.concierge-history {
+  margin-top: 36px;
+  max-width: 680px;
+}
+.concierge-history h2 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 22px;
+  color: var(--espresso);
+  margin: 0 0 12px;
+}
+.concierge-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 14px;
+}
+.concierge-request-card {
+  padding: 16px 18px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--paper);
+}
+.concierge-request-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.concierge-request-card__subject {
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--espresso);
+}
+.concierge-request-card__meta {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.concierge-request-card__body {
+  margin: 8px 0 0;
+  font-size: 14px;
+  color: var(--ink);
+  white-space: pre-wrap;
+}
+.concierge-status {
+  flex: 0 0 auto;
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  background: var(--linen-2);
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+.concierge-status--assigned,
+.concierge-status--in_progress {
+  background: var(--clay);
+  color: var(--paper);
+}
+.concierge-status--resolved {
+  background: var(--sage);
+  color: var(--paper);
+}
+.concierge-status--escalated {
+  background: var(--clay-deep);
+  color: var(--paper);
+}
+.concierge-status--canceled {
+  color: var(--ink-soft);
+  text-decoration: line-through;
+}
+
+/* TS-225 — emergency concierge assistance. A distinct, high-contrast surface
+   set apart from the calmer request flow with the deep-clay accent. */
+.dash-card--urgent {
+  border-color: var(--clay-deep);
+  background: var(--linen);
+}
+.concierge-emergency-911 {
+  margin: 16px 0 0;
+  padding: 14px 16px;
+  border: 1px solid var(--clay-deep);
+  border-left-width: 4px;
+  border-radius: 6px;
+  background: var(--cream);
+  color: var(--ink);
+  font-size: 15px;
+}
+.concierge-emergency-form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  margin: 24px 0 0;
+  max-width: 620px;
+  padding: 22px 24px;
+  border: 1px solid var(--clay-deep);
+  border-radius: 8px;
+  background: var(--paper);
+}
+.concierge-emergency-cta {
+  font-family: var(--sans);
+  font-size: 16px;
+  font-weight: 600;
+  padding: 14px 24px;
+  border: none;
+  border-radius: 6px;
+  background: var(--clay-deep);
+  color: var(--paper);
+  cursor: pointer;
+  transition: filter 0.15s ease;
+}
+.concierge-emergency-cta:hover {
+  filter: brightness(0.93);
+}
+.concierge-emergency-cta:focus-visible {
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: var(--focus-ring-offset);
+}
+.concierge-emergency-after {
+  margin-top: 24px;
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+
+/* TS-213 — senior match-recommendations cards. */
+.recs-list {
+  list-style: none;
+  margin: 24px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 16px;
+}
+.recs-card {
+  padding: 18px 20px;
+  background: var(--linen);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+}
+.recs-card__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.recs-card__name {
+  font-family: var(--serif);
+  font-size: 22px;
+  color: var(--espresso);
+}
+.recs-card__tier {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-soft);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-full);
+  padding: 2px 10px;
+}
+.recs-card__headline {
+  margin: 6px 0 0;
+  color: var(--ink-soft);
+}
+.recs-card__rating {
+  margin: 6px 0 0;
+  color: var(--espresso);
+  font-size: 14px;
+}
+.recs-why {
+  margin-top: 12px;
+}
+.recs-why__label {
+  display: block;
+  font-size: 13px;
+  color: var(--ink-soft);
+  margin-bottom: 6px;
+}
+.recs-why__chips {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.recs-why__chip {
+  font-size: 13px;
+  color: var(--espresso);
+  background: var(--cream);
+  border: 1px solid var(--clay);
+  border-radius: var(--radius-full);
+  padding: 3px 12px;
+}
+.recs-card__actions {
+  margin-top: 14px;
+}
+
+/* TS-230 — Family peace-of-mind dashboard (visits & wellness). */
+.visits-section {
+  margin-top: 32px;
+}
+.visits-section__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.visits-section h2 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 22px;
+  color: var(--espresso);
+  margin: 0 0 12px;
+}
+.visits-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 24px;
+}
+.visits-tab {
+  padding: 6px 14px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--rule);
+  background: var(--linen);
+  color: var(--ink);
+  font-size: 14px;
+  text-decoration: none;
+}
+.visits-tab:hover {
+  border-color: var(--clay);
+}
+.visits-tab--active {
+  background: var(--espresso);
+  border-color: var(--espresso);
+  color: var(--cream);
+}
+.visits-tab:focus-visible,
+.visits-window__opt:focus-visible {
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: 2px;
+}
+.visits-window {
+  display: inline-flex;
+  gap: 4px;
+}
+.visits-window__opt {
+  padding: 4px 10px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--rule);
+  background: var(--cream);
+  color: var(--ink-soft);
+  font-size: 13px;
+  text-decoration: none;
+}
+.visits-window__opt:hover {
+  border-color: var(--clay);
+}
+.visits-window__opt--active {
+  background: var(--sage);
+  border-color: var(--sage);
+  color: var(--cream);
+}
+.visits-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+.visit-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 18px;
+  background: var(--cream);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+}
+.visit-card__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+}
+.visit-card__head h3 {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 19px;
+}
+.visit-card__time {
+  margin: 0;
+  font-weight: 600;
+}
+.visit-card__senior {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+/*
+ * Trust & safety hold notice (TS-304-followup-1). Rule-and-tint rather than a
+ * red alarm: the visit is paused, not cancelled, and the hospitality framing
+ * (CLAUDE.md §12) matters most on the surface where a family reads bad news.
+ * Colour is not the only signal — the sentence carries the meaning on its own.
+ */
+.visit-card__hold {
+  margin: 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--clay);
+  background: rgba(168, 79, 51, 0.08);
+  border-radius: 4px;
+  font-size: 14px;
+  line-height: 1.45;
+}
+.visit-card__no-notes {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--ink-soft);
+  font-style: italic;
+}
+.visit-notes {
+  margin-top: 4px;
+  border-top: 1px solid var(--rule);
+  padding-top: 8px;
+}
+.visit-notes__summary {
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--clay);
+}
+.visit-notes__summary:focus-visible {
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: 2px;
+}
+.visit-notes__body {
+  margin-top: 12px;
+  display: grid;
+  gap: 10px;
+}
+.visit-notes__chips {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.visit-notes__chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 12px;
+  background: var(--linen);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+}
+.visit-notes__chip-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-soft);
+}
+.visit-notes__chip-value {
+  font-size: 14px;
+  color: var(--ink);
+}
+.visit-notes__freeform {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--ink);
+}
+.visit-notes__photos {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+/* Wellness trends (TS-231) — per-senior sparkline cards + window selector. */
+.wellness-windows {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 20px;
+}
+.wellness-window {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 6px 16px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-full);
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 14px;
+  text-decoration: none;
+}
+.wellness-window:hover {
+  border-color: var(--espresso);
+}
+.wellness-window[data-active='true'] {
+  background: var(--espresso);
+  border-color: var(--espresso);
+  color: var(--paper);
+}
+.wellness-window:focus-visible {
+  outline: var(--focus-ring-width) solid var(--clay);
+  outline-offset: 2px;
+}
+.wellness-meta {
+  margin: 0 0 16px;
+  color: var(--ink-soft);
+  font-size: 14px;
+}
+.wellness-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 20px;
+}
+.wellness-card {
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  background: var(--paper);
+  padding: 18px 18px 12px;
+}
+.wellness-card__head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+}
+.wellness-card__title {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 22px;
+  color: var(--espresso);
+}
+.wellness-card__latest {
+  margin: 0;
+  font-size: 14px;
+  color: var(--ink);
+}
+.wellness-card__count {
+  color: var(--ink-soft);
+}
+.wellness-card__empty {
+  margin: 8px 0 6px;
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+.wellness-chart {
+  margin-top: 4px;
+}
+.wellness-tooltip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--paper);
+  box-shadow: var(--shadow-sm);
+  font-size: 13px;
+}
+.wellness-tooltip__date {
+  color: var(--ink-soft);
+}
+.wellness-tooltip__level {
+  color: var(--espresso);
+  font-weight: 600;
+}
+.wellness-foot {
+  margin: 20px 0 0;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+/* TS-236 — early-signal banner (wellness anomaly heads-up). */
+.wellness-signals {
+  margin: 0 0 24px;
+  padding: 16px 18px;
+  border: 1px solid var(--rule);
+  border-left: 4px solid var(--clay);
+  border-radius: 12px;
+  background: var(--linen);
+}
+.wellness-signals__title {
+  margin: 0 0 4px;
+  font-family: var(--serif);
+  font-size: 20px;
+  color: var(--espresso);
+}
+.wellness-signals__lead {
+  margin: 0 0 10px;
+  font-size: 14px;
+  color: var(--ink);
+}
+.wellness-signals__list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wellness-signals__item {
+  font-size: 14px;
+  color: var(--ink);
+}
+.wellness-signals__metric {
+  font-weight: 600;
+  color: var(--espresso);
+}
+
+/* ── Privacy Center (TS-309d) ─────────────────────────────────────────
+   Reuses the concierge form primitives; these are the surface-specific
+   pieces only. Tokens throughout (CLAUDE.md §8.2 — no hardcoded colour or
+   spacing), and every interactive target clears the senior-mode 48px floor
+   via the shared button/control rules. */
+.privacy-section {
+  margin: 32px 0 0;
+  max-width: 720px;
+}
+.privacy-receipt {
+  margin: 18px 0 0;
+  padding: 14px 16px;
+  border-left: 3px solid var(--clay-deep);
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 15px;
+  line-height: 1.6;
+}
+.privacy-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-top: 12px;
+}
+.privacy-card {
+  flex: 1 1 300px;
+  padding: 18px 20px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--paper);
+}
+.privacy-card h3 {
+  margin: 0 0 8px;
+  font-family: var(--sans);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--espresso);
+}
+.privacy-card p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--ink);
+}
+.privacy-fieldset {
+  border: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.privacy-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-height: 48px; /* senior-mode tap target (CLAUDE.md §8.3) */
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--ink);
+}
+.privacy-verify {
+  margin-top: 16px;
+  padding: 18px 20px;
+  border: 1px solid var(--clay-deep);
+  border-radius: 8px;
+  background: var(--paper);
+}
+.privacy-verify h3 {
+  margin: 0 0 8px;
+  font-family: var(--sans);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--espresso);
+}
+.privacy-verify p {
+  margin: 0 0 10px;
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--ink);
+}
+.privacy-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.privacy-list__item {
+  padding: 16px 18px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--paper);
+}
+.privacy-list__head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.privacy-list__kind {
+  font-family: var(--sans);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--espresso);
+}
+.privacy-list__status {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--clay-deep);
+}
+.privacy-list__meta {
+  margin: 6px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+}
+.privacy-list__refusal {
+  margin: 10px 0 0;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--ink);
+}
+.privacy-list__actions {
+  margin: 10px 0 0;
+}
+
+/*
+ * Sign-in security / MFA enrolment (TS-309d-followup-1).
+ *
+ * The setup key and the recovery codes are read off a screen and typed or
+ * copied by hand, often by someone older, so both are monospace, generously
+ * spaced, and allowed to wrap rather than truncate. A truncated setup key is
+ * a customer who cannot finish enrolling.
+ */
+.mfa-step {
+  margin-top: 18px;
+}
+.mfa-step h3 {
+  margin: 0 0 6px;
+  font-family: var(--serif);
+  font-size: 18px;
+}
+.mfa-secret code,
+.mfa-uri {
+  display: inline-block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 17px;
+  letter-spacing: 0.08em;
+  word-break: break-all;
+  background: rgba(0, 0, 0, 0.04);
+  padding: 6px 10px;
+  border-radius: 6px;
+}
+.mfa-uri {
+  font-size: 12.5px;
+  letter-spacing: 0;
+}
+.mfa-hint {
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+.mfa-codes {
+  list-style: none;
+  margin: 12px 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 8px;
+}
+.mfa-codes code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 17px;
+  letter-spacing: 0.08em;
+}
+.mfa-method-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.mfa-method {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+}
+.mfa-method__name {
+  font-weight: 600;
+}
+.mfa-method__meta {
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+.mfa-method__form {
+  margin: 0 0 0 auto;
+}
+
+/* ── Household switcher (TS-505d2-followup-5a1) ──────────────────────────
+ *
+ * Sits in the protected layout, above every page, and renders only for a
+ * member of two or more households. Deliberately quiet: it is a statement of
+ * whose care you are looking at, not a call to action, so it reads as a strip
+ * of context rather than a banner competing with the page.
+ *
+ * `--tap-target-min` on both controls so the senior-mode contract (§8.3) is
+ * honoured here as everywhere; wraps at narrow widths so the label never gets
+ * squeezed away from its control.
+ */
+.household-switcher {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: 16px auto 0;
+  max-width: 960px;
+  padding: 10px 16px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--linen);
+  color: var(--ink);
+}
+.household-switcher-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+.household-switcher-select {
+  flex: 1 1 240px;
+  min-height: var(--tap-target-min);
+  padding: 6px 10px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 15px;
+}
+.household-switcher-submit {
+  min-height: var(--tap-target-min);
+  padding: 6px 18px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.household-switcher-submit:hover {
+  background: var(--linen-deep, var(--linen));
+}

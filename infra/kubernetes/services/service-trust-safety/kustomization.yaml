@@ -1,0 +1,191 @@
+# Per-service base for service-trust-safety (TS-300-followup-2 - one of
+# the three post-fleet-rollout stragglers no task had owned, so the
+# service had no build workflow and no manifests at all and could not
+# deploy). Mirrors the canonical service-concierge base plus the
+# service-booking consumer wiring: port 3026, env-var contract from
+# apps/service-trust-safety/src/config/env.ts.
+#
+# Three required secrets (DATABASE_URL, REDIS_URL, JWT_ACCESS_SECRET).
+# PAGERDUTY_ROUTING_KEY is OPTIONAL and deliberately OMITTED for the
+# Phase-1 posture, exactly as service-concierge does: unset means the
+# critical-severity pager (TS-306) logs a WARN and pages nobody while the
+# incident itself - the durable record - is still written. The operator
+# adds it once the on-call PagerDuty service is provisioned. The
+# PagerDuty endpoint / source / timeout are non-secret and ride the
+# ConfigMap.
+#
+# OUTBOX CONSUMER (TS-302a / TS-307a / TS-308a / TS-308c): this service
+# consumes three detector events, so it carries the OUTBOX_CONSUMER_*
+# cluster, and OUTBOX_CONSUMER_NAME comes from the downward API - see the
+# Deployment patch for why it cannot live in the ConfigMap.
+# OUTBOX_STREAM_PREFIX must match the relay STREAM_NAME_PREFIX; a
+# mismatch means this service reads an empty stream forever and
+# system-detected incidents are silently never opened.
+#
+# NetworkPolicy: standard backend (component-default admit of
+# platform-services). PagerDuty egress (external HTTPS) is not opened
+# here - it is unreachable while PAGERDUTY_ROUTING_KEY is unset, and a
+# per-service egress policy pairs with that key landing.
+#
+# Env overlays in infra/kubernetes/overlays/<env>/ patch image tag,
+# replica count, and a handful of ConfigMap values per env.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-services
+
+components:
+  - ../../components/nestjs-service
+
+resources:
+  - secret-placeholder.yaml
+  # TS-151-followup-12 — ArgoCD PreSync hook (wave -10) that applies this
+  # service's Prisma migrations before anything else in the sync. Listed ahead
+  # of any seed Job below because it must also run ahead of it at apply time.
+  - migrate-job.yaml
+
+commonLabels:
+  app.kubernetes.io/name: service-trust-safety
+  app.kubernetes.io/instance: service-trust-safety
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-trust-safety
+
+  - target:
+      kind: ConfigMap
+      name: nestjs-service-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-trust-safety-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3026"
+          SERVICE_VERSION: dev
+          JWT_ISSUER: taste-and-see/service-identity
+          JWT_AUDIENCE: taste-and-see/api
+          INTERNAL_TRUST_MAX_AGE_SECONDS: "60"
+          IDEMPOTENCY_TTL_SECONDS: "86400"
+          IDEMPOTENCY_IN_FLIGHT_TTL_SECONDS: "60"
+          # Outbox CONSUMER cluster. OUTBOX_CONSUMER_NAME is deliberately
+          # ABSENT here - it comes from the downward API on the container
+          # env below, because it must differ per pod.
+          OUTBOX_STREAM_PREFIX: events
+          OUTBOX_CONSUMER_MAX_ATTEMPTS: "10"
+          OUTBOX_CONSUMER_POLL_BLOCK_MS: "5000"
+          OUTBOX_CONSUMER_RECLAIM_IDLE_MS: "60000"
+          OUTBOX_CONSUMER_POLL_INTERVAL_MS: "1000"
+          PAGERDUTY_EVENTS_URL: https://events.pagerduty.com/v2/enqueue
+          PAGERDUTY_SOURCE: service-trust-safety
+          PAGERDUTY_TIMEOUT_MS: "5000"
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          # TS-504-followup-2a — Sentry error reporting (CLAUDE.md §10).
+          # EMPTY = off, and the service logs that it is off rather than
+          # staying quiet. The real DSN is supplied per env by the overlay or
+          # the operator; it is not committed, and it is not a Secret
+          # placeholder because a REPLACE_WITH_ value is not a valid URL and
+          # would fail Zod boot on every workload that does not use Sentry.
+          SENTRY_DSN: ""
+
+  - target:
+      kind: Service
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-trust-safety
+      - op: replace
+        path: /spec/ports/0/port
+        value: 3026
+
+  - target:
+      kind: Deployment
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-trust-safety
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: service-trust-safety
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/service-trust-safety:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/ports/0/containerPort
+        value: 3026
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: service-trust-safety-config
+          - secretRef:
+              name: service-trust-safety-secrets
+      # OUTBOX_CONSUMER_NAME wired to the pod name via the downward API so
+      # each replica presents a DISTINCT consumer name in the Redis Streams
+      # consumer group. Two pods sharing a name corrupt one another Pending
+      # Entries List, which on this surface means a system-detected incident
+      # can be ACKed by a pod that never opened it. Set on the container
+      # `env` (which wins over the ConfigMap) because a ConfigMap value is
+      # identical across replicas by construction. Same wiring as
+      # service-booking and service-accounting.
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: OUTBOX_CONSUMER_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe/httpGet/port
+        value: 3026
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe/httpGet/port
+        value: 3026
+      - op: replace
+        path: /spec/template/spec/containers/0/livenessProbe/httpGet/port
+        value: 3026
+      - op: replace
+        path: /spec/template/metadata/annotations/prometheus.io~1port
+        value: "3026"
+
+  - target:
+      kind: NetworkPolicy
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-trust-safety
+      - op: replace
+        path: /spec/ingress/0/ports/0/port
+        value: 3026
+
+  - target:
+      kind: PodDisruptionBudget
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-trust-safety
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-trust-safety
+      - op: replace
+        path: /spec/scaleTargetRef/name
+        value: service-trust-safety

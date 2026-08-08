@@ -1,0 +1,156 @@
+# kube-prometheus-stack Helm values. Lean Phase-1 resource asks sized
+# for the Contabo cluster (PDD §27 Year-1 baseline). Author-blind (no
+# local helm) — CI's kubeconform --enable-helm render is the gate.
+
+# Install the Prometheus Operator CRDs (ServiceMonitor / PodMonitor /
+# PrometheusRule / etc.) so the platform can adopt operator-native
+# scrape definitions going forward.
+crds:
+  enabled: true
+
+# ── Alertmanager ───────────────────────────────────────────────────
+# Kept per PDD §20.5. Single replica for Phase 1; routing/receivers
+# (Slack / PagerDuty / email) are wired in a follow-up alongside the
+# ArgoCD notifications work (TS-152-followup-5).
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 25m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+    storage:
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 2Gi
+
+# ── Prometheus ─────────────────────────────────────────────────────
+prometheus:
+  prometheusSpec:
+    replicas: 1
+    retention: 15d
+    retentionSize: 18GB
+    resources:
+      requests:
+        cpu: 250m
+        memory: 1Gi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+    # Discover ServiceMonitors / PodMonitors / Rules cluster-wide, not
+    # just those carrying the chart's own release label. Without these
+    # the operator ignores any CRD a service ships under its own labels.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 20Gi
+    # Annotation-based pod discovery. Honours the prometheus.io/scrape
+    # annotations the nestjs-service + bullmq-worker components already
+    # emit (port 3000, path /metrics). The observability →
+    # platform-services / platform-workers NetworkPolicy carve-out
+    # (cluster-network-policy.yaml) is what lets these scrapes through
+    # the workload namespaces' default-deny baselines.
+    additionalScrapeConfigs:
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            action: replace
+            target_label: app
+
+# ── Grafana ────────────────────────────────────────────────────────
+grafana:
+  enabled: true
+  replicas: 1
+  # No hardcoded admin password (CLAUDE.md §17.12). The operator creates
+  # the `grafana-admin` Secret out-of-band before first apply — same
+  # posture as the per-service secrets (README § First-time bootstrap).
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+  persistence:
+    enabled: true
+    size: 5Gi
+  # The chart's Prometheus datasource is auto-provisioned. Loki + Tempo
+  # are registered here. Service DNS names assume releaseName loki / tempo
+  # in this namespace — confirm against the rendered Services on first
+  # deploy (author-blind).
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      uid: loki
+      access: proxy
+      url: http://loki-gateway.observability.svc.cluster.local
+    - name: Tempo
+      type: tempo
+      uid: tempo
+      access: proxy
+      url: http://tempo.observability.svc.cluster.local:3100
+  # Standalone Ingress ships in grafana-ingress.yaml so the host can be
+  # patched per overlay; disable the chart's own Ingress.
+  ingress:
+    enabled: false
+
+# ── Exporters ──────────────────────────────────────────────────────
+nodeExporter:
+  enabled: true
+kube-state-metrics:
+  enabled: true
+
+# k3s does not expose these control-plane components as scrapeable
+# endpoints (they run embedded in the k3s server process). Disabling
+# their ServiceMonitors avoids permanently-"down" targets that would
+# otherwise pollute alerting. Re-enable per-component if the Phase-3
+# managed-K8s migration exposes them (PDD §20.2).
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubeEtcd:
+  enabled: false

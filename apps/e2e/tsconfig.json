@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "@taste-and-see/tsconfig/node.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    // Playwright loads `playwright.config.ts` and the spec files through its
+    // own esbuild-based transpiler, never through `tsc`. `type-check` here is
+    // purely a correctness gate over the same sources, so the whole package
+    // (config + harness + specs) is in scope rather than just `src`.
+    "types": ["node"]
+  },
+  "include": ["playwright.config.ts", "src/**/*.ts", "tests/**/*.ts"],
+  "exclude": ["node_modules", "test-results", "playwright-report"]
+}

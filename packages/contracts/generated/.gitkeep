@@ -1,0 +1,6 @@
+# Generated OpenAPI artifact lives here.
+#
+# Run `pnpm -F @taste-and-see/contracts generate:openapi` after `pnpm install`
+# to populate `openapi.json`. The CI `check` script (run via `pnpm -F
+# @taste-and-see/contracts check`) compares the committed file against a
+# fresh generation and exits non-zero on drift.

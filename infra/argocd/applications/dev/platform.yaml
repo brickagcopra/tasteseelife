@@ -1,0 +1,93 @@
+# Child Application: dev/platform.
+#
+# Targets the full dev overlay at infra/kubernetes/overlays/dev/. Phase 1 has
+# one canonical service wired (service-identity); when subsequent services
+# (service-subscription, service-booking, etc.) get their per-service Kustomize
+# base (TS-151-followup-1), they land in this same overlay and propagate
+# through this same Application.
+#
+# When a per-service split becomes operationally meaningful (per-service sync
+# windows, per-service health gates, Argo Rollouts canary controllers),
+# this single Application splits into N Application manifests via an
+# ApplicationSet — captured as TS-152-followup-4.
+#
+# kustomize.commonAnnotations applies the ArgoCD instance annotation that
+# the application.resourceTrackingMethod=annotation setting expects.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-dev
+  namespace: argocd
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    tastesee.io/env: dev
+    tastesee.io/role: platform
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: platform-dev
+
+  source:
+    repoURL: https://github.com/brickagcopra/tasteseelife.git
+    path: infra/kubernetes/overlays/dev
+    targetRevision: main
+    kustomize:
+      # The overlay's base inflates two Helm charts (NGINX Ingress + cert-manager).
+      # Without `--enable-helm` on the repo-server's `kustomize build`, the chart-
+      # rendered children never reach the manifest stream. The flag is wired
+      # globally via argocd-cm.kustomize.buildOptions (see install/values.yaml)
+      # so this stanza is informational, not load-bearing — kept here so a future
+      # operator reading the manifest sees the dependency explicit.
+      commonAnnotations:
+        argocd.argoproj.io/tracking-id: platform-dev:argoproj.io/Application:argocd/platform-dev
+
+  destination:
+    # Application controller distributes child resources across cluster namespaces
+    # via the namespace stamped on each manifest. The Application-level destination
+    # is informational here; the overlay's resources carry their own namespaces.
+    server: https://kubernetes.default.svc
+    namespace: platform-services
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      # Do NOT auto-create namespaces from the Application destination — the
+      # overlay's `base/namespaces/` resources are the canonical source of truth.
+      - CreateNamespace=false
+      - ApplyOutOfSyncOnly=true
+      - PrunePropagationPolicy=foreground
+      # ServerSideApply lets a stray field-management annotation on the existing
+      # object survive without churn — recommended for Helm-rendered manifests
+      # like ingress-nginx + cert-manager which carry a lot of upstream defaults.
+      - ServerSideApply=true
+      # Replace defaults to false; this opt-out means rollouts patch in place
+      # rather than replacing entire Deployment specs each sync.
+      - Replace=false
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m
+
+  # Health checks beyond the defaults that ship with ArgoCD. The default checks
+  # cover Deployment, StatefulSet, Service, Ingress, etc.; add custom checks
+  # via configs.cm.resource.customizations in install/values.yaml when a
+  # service-specific health predicate emerges (TS-152-followup-7).
+  ignoreDifferences:
+    # cert-manager mutates the Ingress's tls block at runtime; without this
+    # ignore, every sync sees "OutOfSync" forever.
+    - group: networking.k8s.io
+      kind: Ingress
+      jsonPointers:
+        - /spec/tls/0/hosts
+    # The HPA controller writes status.currentReplicas etc. — these are not
+    # the operator's intent and would cause perpetual drift.
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+      jsonPointers:
+        - /spec/metrics

@@ -1,0 +1,199 @@
+# Per-service base for service-booking (TS-151-followup-1 rollout).
+# Mirrors the canonical service-identity base: consumes the reusable
+# nestjs-service component + overrides every placeholder for the
+# booking service's specifics (port 3015, env-var contract from
+# apps/service-booking/src/config/env.ts, Secret refs for the
+# secret-class envs).
+#
+# Two internal shared-secret header NAMES (non-secret) live in the
+# ConfigMap; their VALUES (the *_API_KEY pair) are required secrets in
+# the Secret object. BOOKING_TIER_GATING_MODE defaults to `advisory`
+# for Phase 1 until the event-driven snapshot cache hydration lands
+# (TS-064-followup / TS-142).
+#
+# TS-304 made this service an outbox CONSUMER for the first time (it
+# consumes `trust_safety.booking_hold.requested` / `.released` so a
+# serious concern suspends a subject's visits). That brings the
+# OUTBOX_CONSUMER_* cluster, and OUTBOX_CONSUMER_NAME from the downward
+# API — see the Deployment patch for why it cannot live in the ConfigMap.
+# The relay already lists `trust_safety.outbox_events` in OUTBOX_SOURCES,
+# so no relay change was needed.
+#
+# Env overlays in infra/kubernetes/overlays/<env>/ patch image tag,
+# replica count, and a handful of ConfigMap values per env.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-services
+
+components:
+  - ../../components/nestjs-service
+
+resources:
+  - secret-placeholder.yaml
+  # TS-151-followup-12 — ArgoCD PreSync hook (wave -10) that applies this
+  # service's Prisma migrations before anything else in the sync. Listed ahead
+  # of any seed Job below because it must also run ahead of it at apply time.
+  - migrate-job.yaml
+
+commonLabels:
+  app.kubernetes.io/name: service-booking
+  app.kubernetes.io/instance: service-booking
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-booking
+
+  - target:
+      kind: ConfigMap
+      name: nestjs-service-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-booking-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3015"
+          SERVICE_VERSION: dev
+          JWT_ISSUER: taste-and-see/service-identity
+          JWT_AUDIENCE: taste-and-see/api
+          INTERNAL_TRUST_MAX_AGE_SECONDS: "60"
+          IDEMPOTENCY_TTL_SECONDS: "86400"
+          IDEMPOTENCY_IN_FLIGHT_TTL_SECONDS: "60"
+          OUTBOX_PRODUCER_SERVICE: service-booking
+          # TS-304 — outbox CONSUMER cluster (service-booking's first; it
+          # consumes the trust & safety hold pair). OUTBOX_CONSUMER_NAME is
+          # deliberately ABSENT here — it comes from the downward API on the
+          # container env below, because it must differ per pod.
+          # OUTBOX_STREAM_PREFIX must match the relay's STREAM_NAME_PREFIX;
+          # a mismatch means this service reads an empty stream forever and
+          # holds silently never apply.
+          OUTBOX_STREAM_PREFIX: events
+          OUTBOX_CONSUMER_MAX_ATTEMPTS: "10"
+          OUTBOX_CONSUMER_POLL_BLOCK_MS: "5000"
+          OUTBOX_CONSUMER_RECLAIM_IDLE_MS: "60000"
+          OUTBOX_CONSUMER_POLL_INTERVAL_MS: "1000"
+          BOOKING_TIER_GATING_MODE: advisory
+          BOOKING_TIER_DISPATCH_HEADER_NAME: x-internal-api-key
+          BOOKING_WELLNESS_SUMMARY_INTERNAL_HEADER_NAME: x-internal-api-key
+          BOOKING_ACCEPT_WINDOW_MINUTES: "120"
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          # TS-504-followup-2a — Sentry error reporting (CLAUDE.md §10).
+          # EMPTY = off, and the service logs that it is off rather than
+          # staying quiet. The real DSN is supplied per env by the overlay or
+          # the operator; it is not committed, and it is not a Secret
+          # placeholder because a REPLACE_WITH_ value is not a valid URL and
+          # would fail Zod boot on every workload that does not use Sentry.
+          SENTRY_DSN: ""
+
+  - target:
+      kind: Service
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-booking
+      - op: replace
+        path: /spec/ports/0/port
+        value: 3015
+
+  - target:
+      kind: Deployment
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-booking
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: service-booking
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/service-booking:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/ports/0/containerPort
+        value: 3015
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: service-booking-config
+          - secretRef:
+              name: service-booking-secrets
+      # TS-304 — OUTBOX_CONSUMER_NAME wired to the pod name via the downward
+      # API so each replica presents a DISTINCT consumer name in the Redis
+      # Streams consumer group. Two pods sharing a name corrupt each other's
+      # Pending Entries List, which on this surface means a trust & safety
+      # hold can be ACKed by a pod that never applied it — a suspended
+      # provider left visiting families with nothing in the queue to show
+      # for it. Set on the container `env` (which wins over the ConfigMap
+      # envFrom) rather than the ConfigMap, which cannot reference the
+      # downward API. Same wiring as service-accounting.
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: OUTBOX_CONSUMER_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe/httpGet/port
+        value: 3015
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe/httpGet/port
+        value: 3015
+      - op: replace
+        path: /spec/template/spec/containers/0/livenessProbe/httpGet/port
+        value: 3015
+      - op: replace
+        path: /spec/template/metadata/annotations/prometheus.io~1port
+        value: "3015"
+
+  - target:
+      kind: NetworkPolicy
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-booking
+      - op: replace
+        path: /spec/ingress/0/ports/0/port
+        value: 3015
+      # worker-wellness-summary (platform-workers) GETs the internal
+      # observation-summary endpoint, so admit that namespace in addition
+      # to the component default (platform-services).
+      - op: add
+        path: /spec/ingress/0/from/-
+        value:
+          namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: platform-workers
+
+  - target:
+      kind: PodDisruptionBudget
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-booking
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: nestjs-service
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: service-booking
+      - op: replace
+        path: /spec/scaleTargetRef/name
+        value: service-booking

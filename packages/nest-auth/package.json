@@ -1,0 +1,53 @@
+{
+  "name": "@taste-and-see/nest-auth",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Shared NestJS authentication + authorization plumbing for the Taste & See platform. Exports AccessTokenGuard (verifies HS256 JWTs minted by service-identity), PermissionGuard + @RequirePermissions (RBAC enforcement against the decoded RequestContext), and NestAuthModule.forRoot(...) to wire the JWT verification options via DI. Lifts the verbatim copies that lived in every service's src/common/guards/. TS-052-followup-11.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@taste-and-see/auth-sdk": "workspace:*",
+    "@taste-and-see/nest-internal-trust": "workspace:*"
+  },
+  "peerDependencies": {
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/core": "^11.0.0",
+    "reflect-metadata": "^0.2.0"
+  },
+  "devDependencies": {
+    "@nestjs/common": "11.0.0",
+    "@nestjs/core": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/express": "5.0.0",
+    "@types/jsonwebtoken": "9.0.7",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "jsonwebtoken": "9.0.2",
+    "reflect-metadata": "0.2.2",
+    "rimraf": "6.0.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

@@ -1,0 +1,85 @@
+# NetworkPolicies that permit workload namespaces to reach the data
+# node on the VLAN. Without these, the default-deny baselines in
+# infra/kubernetes/base/network-policies/ would block egress to the
+# external Postgres + Redis.
+#
+# Because the data node lives OUTSIDE the cluster, the egress target
+# is an IP block, not a pod / namespace selector. The CIDR matches
+# the Contabo private VLAN CIDR documented in TS-150's network
+# module (default 10.40.0.0/24); per-env overlays override the CIDR
+# via a patch when an env uses a different VLAN range.
+#
+# These policies are placed in each WORKLOAD namespace (services /
+# workers / frontends) so any pod in those namespaces can dial the
+# data node. The policies are additive with the default-deny + DNS
+# baselines, not a replacement for them.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-data-node-egress
+  namespace: platform-services
+  annotations:
+    taste-and-see/policy: >-
+      Allow egress to the external data node's Postgres + Redis on
+      the private VLAN. CIDR overridden per-env in
+      infra/kubernetes/overlays/<env>/data-access-patch.yaml.
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.40.0.0/24
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-data-node-egress
+  namespace: platform-workers
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.40.0.0/24
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-data-node-egress
+  namespace: platform-frontends
+  annotations:
+    taste-and-see/policy: >-
+      Most frontends do not touch Postgres directly (BFF pattern via
+      the api-gateway). Redis access is sometimes needed for Next.js
+      session caches / TanStack Query stale revalidation, hence the
+      allow on 6379. Postgres included for completeness — a frontend
+      that does NOT need it should not have credentials in its env
+      anyway, so the policy is defence in depth.
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.40.0.0/24
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 6379

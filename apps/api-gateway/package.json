@@ -1,0 +1,55 @@
+{
+  "name": "@taste-and-see/api-gateway",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Backend-for-Frontend (PDD §7.1, §7.2 service inventory entry #1). NestJS 11 + Node 22 fetch. Phase-1 (TS-140) ships: env validation, AccessTokenGuard verifying service-identity-minted JWTs once at the edge, signed internal-trust headers (HMAC-SHA256) propagated to every downstream service so the trust boundary collapses from N services to 1, Redis-backed sliding-window rate limiter with per-route policy, ZodValidationPipe + RFC 7807 filter, ServiceRegistry + DownstreamHttpClient with AbortController-backed timeouts, /healthz + /readyz (readyz pings Redis + downstream /healthz endpoints), one verified-from-token /api/v1/me endpoint that demonstrates the auth context propagation, and one proxy endpoint /api/v1/plans that exercises the downstream HTTP client end-to-end. Owns NO database — pure routing + auth + rate-limit + aggregation surface. Downstream-side verification of the trust headers + per-service permission gating + OpenTelemetry tracing land as TS-140 follow-ups.",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "start:dev": "tsc -p tsconfig.build.json --watch",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:boot-graph": "vitest run test/app-module-graph.test.ts",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.0.0",
+    "@nestjs/core": "11.0.0",
+    "@nestjs/platform-express": "11.0.0",
+    "@taste-and-see/auth-sdk": "workspace:*",
+    "@taste-and-see/contracts": "workspace:*",
+    "@taste-and-see/logger": "workspace:*",
+    "@taste-and-see/nest-auth": "workspace:*",
+    "@taste-and-see/nest-common": "workspace:*",
+    "@taste-and-see/nest-internal-trust": "workspace:*",
+    "@taste-and-see/nest-observability": "workspace:*",
+    "@taste-and-see/nest-prisma-tenant-scope": "workspace:*",
+    "@taste-and-see/sentry": "workspace:*",
+    "@taste-and-see/tracing": "workspace:*",
+    "ioredis": "5.4.1",
+    "jsonwebtoken": "9.0.2",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.1",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/testing": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/express": "5.0.0",
+    "@types/jsonwebtoken": "9.0.7",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "rimraf": "6.0.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

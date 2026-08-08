@@ -1,0 +1,28 @@
+# cert-manager via Kustomize Helm-inflation. Installs cert-manager
+# itself + the issuer/cluster-issuer CRDs at chart version 1.16.x,
+# then layers the Let's Encrypt ClusterIssuer + an internal CA
+# issuer (used for in-cluster mTLS in TS-152+).
+#
+# `installCRDs: true` lands the CRDs into the same release so a
+# `kustomize build | kubectl apply` is sufficient — no separate
+# `kubectl apply -f crds.yaml` step required.
+#
+# Email + ACME server URL are placeholders here; each env overlay
+# patches the ClusterIssuer.spec.acme.email + acme.server to its
+# environment (dev / staging point at LE staging; prod points at
+# LE production to avoid rate-limit pollution during iteration).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-system
+
+helmCharts:
+  - name: cert-manager
+    repo: https://charts.jetstack.io
+    version: v1.16.2
+    releaseName: cert-manager
+    namespace: platform-system
+    valuesFile: values.yaml
+
+resources:
+  - cluster-issuer-letsencrypt.yaml

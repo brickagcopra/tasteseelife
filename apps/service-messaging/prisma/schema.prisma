@@ -1,0 +1,221 @@
+// Messaging bounded context — see PDD §7.2 (service inventory entry
+// #8), PDD §8.2 (Postgres metadata column inventory for `threads` and
+// `thread_participants`), PDD §8.3 (Cassandra keyspaces for the message
+// body store), PDD §9.x + §13 (real-time delivery), PRD §6.7 (family
+// messaging surface), and CLAUDE.md §12 ("hospitality, not clinical" —
+// the messaging copy + UX must lean into warmth + dignity).
+//
+// Scope so far:
+//   - TS-070 adds the `messaging` Postgres schema and the two metadata
+//     tables: `threads` (one row per conversation) and
+//     `thread_participants` (one row per user-in-thread membership,
+//     with `last_read_message_id` driving read receipts). The actual
+//     message bodies live in Cassandra (`messages_by_thread` keyspace —
+//     PDD §8.3); the wiring lands as TS-070-followup-1 so the new
+//     `cassandra-driver` dependency arrives in isolation.
+//
+//   - TS-071 (sibling task) wires real-time delivery via Socket.IO with
+//     the Redis adapter for multi-pod fan-out (PDD §13.1).
+//
+// Cross-service references are by id only — never a foreign key into
+// another service schema (CLAUDE.md §2.3, §4.1). Every column that
+// looks like an id (`household_id`, `booking_id`, `user_id`, etc.) is a
+// free TEXT — service-messaging does not maintain referential integrity
+// with the producer services (household, booking, identity). The
+// producer service is the source of truth; service-messaging's row is
+// the read-side cache + the routing handle for the thread.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. The feature has
+  // been production-stable since Prisma 5.0 even though it remains
+  // under the `previewFeatures` umbrella in 5.x.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `messaging` Postgres schema. Every other
+  // service gets its own schema in the same database (Phase 1) or its
+  // own database entirely (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["messaging"]
+}
+
+/// Thread kind (TS-070). One thread is rooted in exactly one of these
+/// origins; the join keys differ by kind:
+///
+///   - `household`    — a household-wide thread (no specific booking).
+///                      `household_id` is set; `booking_id` is null. The
+///                      "family chat" thread per PDD §13.1.
+///   - `booking`      — a thread scoped to a single booking — provider
+///                      + senior + family observers per PRD §6.7.
+///                      `booking_id` is set; `household_id` may also be
+///                      set as a denormalised hint for the dominant
+///                      household-side read path but is not required.
+///   - `concierge`    — a Tier-3 Concierge thread routed to the dedicated
+///                      culinary concierge per PRD §6.6. `household_id`
+///                      is set; `booking_id` is null.
+///   - `peer_thread`  — a provider-to-provider community / best-practice
+///                      forum thread per PRD §7.7 (TS-209). Neither
+///                      `household_id` nor `booking_id` applies — both
+///                      are null. Participants are providers (`member`),
+///                      optional read-only `observer`s, and staff
+///                      `moderator`s. Posting is gated by the pure
+///                      `thread-posting-policy` matrix; moderation
+///                      (flag → trust-safety queue) lands with TS-300
+///                      (TS-209-followup-1). The per-participant inbox
+///                      index already covers the "my community threads"
+///                      read path, and `threads_kind_created_idx` covers
+///                      the admin "all peer threads" view — no new index.
+enum ThreadKind {
+  household
+  booking
+  concierge
+  peer_thread
+
+  @@map("thread_kind")
+  @@schema("messaging")
+}
+
+/// Thread-participant role (TS-070). Members can post + read; observers
+/// can read only (the family-observer surface per CLAUDE.md §12 family
+/// observability boundaries — over-sharing is the default-deny stance).
+/// Concierge staff act on behalf of the household.
+///
+///   - `member`    — full read + write (senior, primary payer, provider
+///                   on a booking thread, provider on a peer thread).
+///   - `observer`  — read-only (family observer; remote adult child).
+///   - `concierge` — concierge staff on a Tier-3 thread.
+///   - `moderator` — trust-safety / provider-ops staff on a `peer_thread`
+///                   (TS-209). May post (to intervene) and moderate;
+///                   has no standing outside peer threads in Phase 1.
+///
+/// The authoritative posting / moderation grid keyed on
+/// (kind, role) lives in `src/realtime/thread-posting-policy.ts`; this
+/// enum is the persistence mirror of its `ThreadParticipantRole` union.
+enum ThreadParticipantRole {
+  member
+  observer
+  concierge
+  moderator
+
+  @@map("thread_participant_role")
+  @@schema("messaging")
+}
+
+/// Thread — one row per conversation (PDD §8.2).
+///
+/// **One thread per origin.** Per PDD §13.1, threads are "created on
+/// booking creation, household onboarding, or concierge ticket
+/// creation." TS-070 ships the metadata row; the on-create automation
+/// (subscribe to `booking.created` / `household.created` / similar) is
+/// captured for a follow-up alongside TS-142 outbox wiring.
+///
+/// **Soft archive.** `archived_at` is the soft-archive timestamp;
+/// archived threads still surface in audit + admin search but disappear
+/// from the family-portal default view. Hard delete is out — PDD §17.1
+/// + CLAUDE.md §3.6 audit-trail discipline.
+///
+/// **Soft fields.**
+///
+///   - `household_id` is nullable on a pure-booking thread where the
+///     booking carries the household-membership info directly.
+///   - `booking_id` is set only for `kind = booking`.
+///
+/// **Indexes.** Two composite indexes drive the two dominant read paths
+/// from PRD §6.7 / PDD §13.1:
+///
+///   1. (household_id, created_at DESC) — "every thread for my
+///      household, newest first" — the family-portal inbox.
+///   2. (booking_id, created_at DESC) — "the thread for this booking" —
+///      the booking-detail panel. Booking ids are unique per booking so
+///      the index is effectively a covering lookup.
+model Thread {
+  /// Surrogate primary key — the row's stable identity inside this
+  /// table.
+  id          String     @id @default(cuid())
+  kind        ThreadKind
+  /// Soft FK into `household.households.id`. Nullable on a pure-booking
+  /// thread (rare; today every booking carries a household id, but the
+  /// schema is forward-compatible).
+  householdId String?    @map("household_id")
+  /// Soft FK into `booking.bookings.id`. Set only when `kind = booking`.
+  bookingId   String?    @map("booking_id")
+  /// Wall-clock thread creation.
+  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Last-modified-of-metadata. Per PDD §8.2 the column is implicit on
+  /// `threads`; we surface it here for the (rare) admin metadata edit
+  /// (rename, change kind, ...) and for Prisma's `@updatedAt`.
+  updatedAt   DateTime   @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-archive timestamp. Null means active.
+  archivedAt  DateTime?  @map("archived_at") @db.Timestamptz(6)
+
+  participants ThreadParticipant[]
+
+  /// Powers "every thread for my household, newest first" — the
+  /// family-portal inbox. Partial-predicate `WHERE archived_at IS
+  /// NULL` is the natural follow-up once the proportion of archived
+  /// threads grows enough to matter; today the non-partial composite
+  /// is correct + cheap.
+  @@index([householdId, createdAt(sort: Desc)], map: "threads_household_created_idx")
+  /// Powers "the thread for this booking" — booking ids are unique per
+  /// booking, so the index is effectively a covering lookup.
+  @@index([bookingId, createdAt(sort: Desc)], map: "threads_booking_created_idx")
+  /// Powers the admin "show me every thread by kind" surface.
+  @@index([kind, createdAt(sort: Desc)], map: "threads_kind_created_idx")
+  @@map("threads")
+  @@schema("messaging")
+}
+
+/// Thread participant — one row per user-in-thread membership (PDD
+/// §8.2).
+///
+/// **Composite PK** on `(thread_id, user_id)` — one membership per user
+/// per thread. Re-joining a thread after a soft-leave reuses the row
+/// (the soft-leave column is captured as a follow-up; TS-070 ships the
+/// metadata shape only).
+///
+/// **`last_read_message_id`** is the cursor into the Cassandra
+/// `messages_by_thread` partition. TS-070 ships the column as a free
+/// TEXT — once Cassandra is wired (TS-070-followup-1) the producer will
+/// stamp the Cassandra TimeUUID here. Read-receipt computation is a
+/// pure "is this message id > my last_read_message_id?" comparison on
+/// the client; no server-side join across data stores is required (and
+/// CLAUDE.md §2.3 would forbid it anyway).
+///
+/// **Cross-service references** (`user_id`) are TEXT — no foreign key
+/// into `identity.users.id` per CLAUDE.md §2.3.
+model ThreadParticipant {
+  threadId          String                @map("thread_id")
+  userId            String                @map("user_id")
+  role              ThreadParticipantRole
+  /// Wall-clock join timestamp.
+  joinedAt          DateTime              @default(now()) @map("joined_at") @db.Timestamptz(6)
+  /// Cursor into the Cassandra `messages_by_thread` partition for read-
+  /// receipt computation. Nullable until the participant has read at
+  /// least one message. TimeUUID string per PDD §8.3.
+  lastReadMessageId String?               @map("last_read_message_id")
+
+  thread Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@id([threadId, userId], map: "thread_participants_pkey")
+  /// Powers "every thread I'm in, newest first" — the per-user inbox
+  /// (a sibling read path to `threads_household_created_idx`).
+  @@index([userId, joinedAt(sort: Desc)], map: "thread_participants_user_joined_idx")
+  @@map("thread_participants")
+  @@schema("messaging")
+}

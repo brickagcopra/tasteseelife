@@ -1,0 +1,31 @@
+# Reusable Kustomize Component for a stateless NestJS backend service.
+#
+# Consumers (per-service bases in infra/kubernetes/services/<svc>/)
+# include this component via `components:` + override the placeholders
+# using `namePrefix` / `commonLabels` / `commonAnnotations` /
+# `replacements` / `images`.
+#
+# Required overrides per consumer:
+# - app.kubernetes.io/name label  (e.g. "service-identity")
+# - app.kubernetes.io/component label  (e.g. "backend")
+# - container `image`              (e.g. "ghcr.io/brickagcopra/service-identity:<sha>")
+# - container `port`               (the per-service default from src/config/env.ts)
+# - ConfigMap `data.PORT`          (matching the same port)
+# - any extra env vars / Secret refs the service needs
+#
+# Optional overrides:
+# - replica count               (defaults to 2 — overridden per-env)
+# - resources requests/limits   (defaults: 250m / 256Mi req, 500m / 512Mi limit)
+# - HPA min/max + target CPU
+# - PDB minAvailable
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - service-account.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - network-policy.yaml
+  - pod-disruption-budget.yaml
+  - horizontal-pod-autoscaler.yaml

@@ -1,0 +1,116 @@
+# Cluster namespace topology per PDD §20.2.
+#
+# Pod Security Standards (PSS) labels follow the Kubernetes 1.25+
+# standard. The four workload namespaces — `platform-services`,
+# `platform-frontends`, `platform-workers`, `platform-data` — enforce
+# the `restricted` profile (TS-151-followup-3). All three reusable
+# components (nestjs-service / web-app / bullmq-worker) satisfy the
+# restricted bar end-to-end: runAsNonRoot + runAsUser 1000,
+# allowPrivilegeEscalation=false, capabilities drop ALL,
+# seccompProfile=RuntimeDefault, emptyDir-only volumes (no host*),
+# and no host ports/namespaces. Every per-service base composes one
+# of those components unmodified, so the flip rejects no Phase-1 pod.
+#
+# `platform-system` and `observability` and `ingress` host system /
+# operator workloads (cert-manager, NGINX Ingress, Prometheus, Loki,
+# Tempo, Grafana) — some of these charts have not been hardened to
+# the restricted level upstream, so they stay at `baseline` indefinitely.
+#
+# `platform-data` enforces `restricted` but in Phase 1 carries only
+# ExternalName Services + Secrets pointing at the off-cluster Postgres
+# + Redis on the data node — i.e. zero pods, so the enforce level is a
+# no-op today that documents intent. When the in-cluster Cassandra /
+# Elasticsearch StatefulSets land (TS-151-followup-4 / -5), those
+# upstream images must be made restricted-clean (per-pod securityContext
+# overrides) OR `platform-data` drops back to `baseline` — re-evaluate
+# the enforce level as part of that work; it cannot be assumed clean.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform-system
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform-data
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform-services
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform-workers
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform-frontends
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ingress
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest

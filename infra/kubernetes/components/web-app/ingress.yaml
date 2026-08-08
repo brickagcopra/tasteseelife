@@ -1,0 +1,38 @@
+# Ingress template. Consumers MUST patch:
+# - metadata.name              (e.g. "web-marketing")
+# - spec.tls[0].hosts          (e.g. ["www.tasteseelife.com"])
+# - spec.tls[0].secretName     (cert-manager-managed; tied to LE issuer)
+# - spec.rules[0].host         (same value as tls.hosts[0])
+# - spec.rules[0].http.paths[0].backend.service.name  (matches Service)
+#
+# cert-manager.io/cluster-issuer annotation patched per-env (staging
+# → letsencrypt-staging, prod → letsencrypt-prod) to dodge LE rate
+# limits during iteration.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-app
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: frontend
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-staging
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: 25m
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - example.invalid
+      secretName: web-app-tls
+  rules:
+    - host: example.invalid
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-app
+                port:
+                  name: http

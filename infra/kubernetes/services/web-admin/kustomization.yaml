@@ -1,0 +1,153 @@
+# Per-app base for web-admin (TS-151-followup-1 rollout, Batch 5 — final
+# web/worker fleet). Consumes the reusable web-app component (Next.js 15
+# standalone), like web-family / web-provider.
+#
+# Lives in `platform-frontends`. No Secret object — the web-app component's
+# Deployment `envFrom` is ConfigMap-only, and web-admin's server env
+# (apps/web-admin/lib/env.ts) is all non-secret: the in-cluster gateway URL
+# + cookie-name constants. The console never holds JWT secrets or DB creds —
+# it proxies every privileged call through the api-gateway over an HttpOnly
+# session cookie.
+#
+# Distinct `tas_admin_*` cookie names (incl. the MFA-challenge cookie that
+# bridges login → verify) keep the admin / family / provider portals from
+# colliding cookie jars when deployed to sibling subdomains
+# (admin. / app. / pros.).
+#
+# The app runs on container port 3000 (Next standalone default); the
+# component Service maps 80 → 3000 and the Ingress routes public traffic in
+# via ingress-nginx. The Ingress host + TLS are placeholders here and are
+# patched per-env in the overlays (admin.<env>.tasteseelife.com +
+# letsencrypt-staging/prod issuer).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-frontends
+
+components:
+  - ../../components/web-app
+
+commonLabels:
+  app.kubernetes.io/name: web-admin
+  app.kubernetes.io/instance: web-admin
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: web-app
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-admin
+
+  - target:
+      kind: ConfigMap
+      name: web-app-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-admin-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          # LOG_LEVEL is intentionally NOT set here. It was copied from the service
+          # ConfigMap template, and no Next portal reads it: no schema declares it, no
+          # source reads it off process.env, and `next start` has no such setting. A key
+          # that configures nothing while looking like configuration is the
+          # TS-306-followup-1c defect, and `k8s-required-env-coverage.test.ts` now fails
+          # on it. Portal-side log level arrives with portal observability
+          # (TS-504-followup-2a-1); wire it up there rather than re-adding it here.
+          PORT: "3000"
+          NEXT_TELEMETRY_DISABLED: "1"
+          SERVICE_VERSION: dev
+          # EMPTY = off, and the portal simply does not initialise Sentry rather
+          # than failing to boot. Same posture as the 24 Nest workloads: the real
+          # DSN is supplied per env by the overlay or the operator, it is not
+          # committed, and it is not a Secret placeholder because a REPLACE_WITH_
+          # value is not a valid DSN.
+          #
+          # Only the SERVER and EDGE runtimes report. There is no browser SDK
+          # here — session replay and DOM breadcrumbs over a named senior's care
+          # schedule is a §12 / PDD §16.3 consent question, not a default
+          # (TS-504-followup-2a-1).
+          SENTRY_DSN: ""
+          API_GATEWAY_BASE_URL: http://api-gateway.platform-services.svc.cluster.local:3000
+          SESSION_COOKIE_NAME: tas_admin_access
+          REFRESH_COOKIE_NAME: tas_admin_refresh
+          MFA_CHALLENGE_COOKIE_NAME: tas_admin_mfa_challenge
+
+  - target:
+      kind: Service
+      name: web-app
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-admin
+
+  - target:
+      kind: Deployment
+      name: web-app
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-admin
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: web-admin
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/web-admin:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: web-admin-config
+
+  - target:
+      kind: NetworkPolicy
+      name: web-app
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-admin
+
+  - target:
+      kind: PodDisruptionBudget
+      name: web-app
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-admin
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: web-app
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-admin
+      - op: replace
+        path: /spec/scaleTargetRef/name
+        value: web-admin
+
+  - target:
+      kind: Ingress
+      name: web-app
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: web-admin
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: admin.tasteseelife.com
+      - op: replace
+        path: /spec/tls/0/secretName
+        value: web-admin-tls
+      - op: replace
+        path: /spec/rules/0/host
+        value: admin.tasteseelife.com
+      - op: replace
+        path: /spec/rules/0/http/paths/0/backend/service/name
+        value: web-admin

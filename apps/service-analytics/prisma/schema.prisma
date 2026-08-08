@@ -1,0 +1,535 @@
+// Analytics & reporting bounded context — see PDD §7.2 (service inventory
+// entry #17, analytics-svc) and §23 (Analytics & Reporting: product
+// analytics event taxonomy, SaaS metrics, operational reports).
+//
+// Scope so far:
+//   - TS-217-prep-2 ships the skeleton: the `analytics` Postgres schema and
+//     ONE placeholder model — `analytics_aggregation_runs` (a record of each
+//     nightly aggregation worker run). No HTTP surface beyond `/healthz` +
+//     `/readyz` yet, and no event consumers (PDD §23.1 raw-event ingest +
+//     the nightly aggregation marts land in TS-217-prep-3).
+//
+// Why a placeholder model rather than an empty schema: the TS-141 tenant-scope
+// Prisma extension + the `wrapWithTenantScope` Proxy route every model accessor
+// through the gate, so the skeleton carries one real (if minimal) model to
+// exercise that wiring + give `prisma generate` a non-empty client. The model
+// is honest foundational infra — TS-217-prep-3's aggregation worker stamps a
+// row per run (job name, window, status, counts) — not a throwaway.
+//
+// Scope additions:
+//   - TS-217-prep-3a — registers service-analytics as an outbox consumer for
+//     `search.performed` (TS-217-prep-1) + `booking.created` via the
+//     `@taste-and-see/nest-outbox-consumer` SDK, idempotent on `event_id`,
+//     persisting raw events into the interim Postgres landing tables
+//     `analytics.search_events` + `analytics.booking_created_events` (the
+//     Cassandra `analytics.events` keyspace per PDD §8.3 replaces these once
+//     the keyspace lands — TS-217-prep-3a-followup-1). Adds the canonical
+//     `analytics.outbox_consumer_dedup` table the SDK uses as its secondary
+//     line of defence against redelivery.
+//
+//   - TS-217-prep-3b — the nightly aggregation. An internal shared-secret
+//     compute endpoint (+ an admin back-fill trigger) reads the raw landing
+//     tables for a UTC-day window and writes the search-relevance marts
+//     `search_relevance_daily` (daily summary → zero-result rate + the
+//     approximate conversion funnel), `search_query_daily` (per query text →
+//     top queries), and `search_sort_daily` (per sort → searches-per-sort).
+//     Each run stamps one `analytics_aggregation_runs` row. Driven nightly by
+//     the `apps/workers/analytics-aggregator` scheduler (PDD §5).
+//
+// Each addition is a forward-compatible expand → migrate → contract migration
+// per CLAUDE.md §4.1; enum value sets evolve additively (`ALTER TYPE … ADD
+// VALUE`) per the TS-205 / TS-220 convention.
+//
+// Cross-service references are by id only — never a foreign key into another
+// service schema (CLAUDE.md §2.3, §4.1). Analytics is a read-side projection
+// built from domain events; it never joins another service's tables in SQL.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. The feature has been
+  // production-stable since Prisma 5.0 even though it remains under the
+  // `previewFeatures` umbrella in 5.x — see Prisma migration notes.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `analytics` Postgres schema. Every other service
+  // gets its own schema in the same database (Phase 1) or its own database
+  // entirely (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["analytics"]
+}
+
+/// Outcome of a single nightly-aggregation worker run (TS-217-prep-2
+/// placeholder). The aggregation worker (TS-217-prep-3) stamps one row per run
+/// so ops can see when the marts were last rebuilt, over which window, and
+/// whether the run succeeded — the foundational observability record the mart
+/// tables hang off.
+///
+///   `running`   = the worker started this run and has not yet finished.
+///   `succeeded` = the run completed and the marts for its window are current.
+///   `failed`    = the run errored; `error_summary` carries a redacted reason.
+///
+/// Additive only — new states arrive via `ALTER TYPE … ADD VALUE`.
+enum AnalyticsAggregationRunStatus {
+  running
+  succeeded
+  failed
+
+  @@map("analytics_aggregation_run_status")
+  @@schema("analytics")
+}
+
+/// Record of a nightly aggregation worker run (TS-217-prep-2 placeholder; PDD
+/// §23.1 "aggregated nightly to PostgreSQL marts"). Platform-wide read-side
+/// metadata — there is NO tenant axis here (analytics aggregates across every
+/// household), so this model is listed in `unscopedModels` in `app.module.ts`
+/// and the TS-141 gate treats it as an explicit unscoped catalog (mirrors
+/// service-subscription's `Plan` / `Coupon`).
+///
+/// `job_name` identifies which aggregation produced the row (e.g.
+/// `search-relevance-daily`); the same worker can run several distinct jobs.
+/// `window_start` / `window_end` bound the event window the run aggregated.
+/// `event_count` is a best-effort tally of source events processed (null while
+/// `running`). `error_summary` is a short, redacted failure reason (CLAUDE.md
+/// §3.9 — never log unredacted PII), null unless `status = failed`.
+model AnalyticsAggregationRun {
+  id           String                        @id @default(cuid())
+  /// Which aggregation job produced this run (e.g. `search-relevance-daily`).
+  jobName      String                        @map("job_name")
+  status       AnalyticsAggregationRunStatus @default(running)
+  /// Inclusive lower bound of the event window this run aggregated.
+  windowStart  DateTime                      @map("window_start") @db.Timestamptz(6)
+  /// Exclusive upper bound of the event window this run aggregated.
+  windowEnd    DateTime                      @map("window_end") @db.Timestamptz(6)
+  /// Best-effort count of source events processed. Null while `running`.
+  eventCount   Int?                          @map("event_count")
+  /// Short, redacted failure reason. Null unless `status = failed`.
+  errorSummary String?                       @map("error_summary")
+  startedAt    DateTime                      @default(now()) @map("started_at") @db.Timestamptz(6)
+  /// Set when the run reaches a terminal state (`succeeded` / `failed`).
+  completedAt  DateTime?                     @map("completed_at") @db.Timestamptz(6)
+  createdAt    DateTime                      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime                      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Dominant ops read: "latest runs for this job, newest first". Composite so
+  /// one index scan filters by job AND returns rows ordered by start time.
+  @@index([jobName, startedAt(sort: Desc)], map: "analytics_aggregation_runs_job_started_idx")
+  /// Status-filtered ops view ("which runs are still running / failed").
+  @@index([status], map: "analytics_aggregation_runs_status_idx")
+  @@map("analytics_aggregation_runs")
+  @@schema("analytics")
+}
+
+/// Consumer-side outbox dedup table (TS-217-prep-3a; PDD §7.3,
+/// CLAUDE.md §5.3). The canonical shape every consuming service ships in
+/// its own schema — documented on the `@taste-and-see/nest-outbox-consumer`
+/// `PgConsumerDedupStore` doc-comment. service-analytics is a consumer of
+/// `search.performed` (TS-217-prep-1) + `booking.created`; this table is the
+/// SDK's SECONDARY line of defence against redelivery. The PRIMARY line is
+/// each raw landing table's `event_id` PK (`SearchEvent` / `BookingCreatedEvent`
+/// below) — an idempotent `createMany({ skipDuplicates: true })` no-ops a
+/// redelivered event even if this dedup row were wiped.
+///
+/// The SDK writes this table via raw SQL (`$executeRaw` / `$queryRaw`), which
+/// lands in the tenant-scope gate's `DEFAULT_UNSCOPED_OPERATIONS` allow-list,
+/// so the model is deliberately NOT listed in `unscopedModels` (mirrors
+/// service-accounting's wiring). The handler dispatch is additionally wrapped
+/// in `runWithoutTenantContext` so the explicit-exempt frame belt-and-braces a
+/// future SDK switch to typed model accessors.
+model OutboxConsumerDedup {
+  /// Consumer group name (the consuming service's name by convention,
+  /// `service-analytics`). Part of the composite PK.
+  consumerGroup  String    @map("consumer_group")
+  /// Event id stamped by the producer at outbox-append time. Part of the
+  /// composite PK; the dedup invariant is enforced at the PK layer.
+  eventId        String    @map("event_id")
+  /// Dot-notation event name (`search.performed` | `booking.created`).
+  /// Captured so the dedup row is self-describing.
+  eventName      String    @map("event_name")
+  /// Three-valued lifecycle: `in_flight` | `processed` | `dead_lettered`.
+  /// The CHECK constraint lives in the migration.
+  state          String
+  /// Monotonic attempt counter; incremented by the SDK's `recordAttempt`.
+  attempts       Int       @default(1)
+  /// Truncated to 2000 chars by the SDK's `recordFailure` / `recordDeadLetter`.
+  lastError      String?   @map("last_error")
+  /// Wall-clock time the consumer first saw the event (SLA + lag dashboards).
+  firstSeenAt    DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  /// Stamped on every attempt.
+  lastAttemptAt  DateTime  @default(now()) @map("last_attempt_at") @db.Timestamptz(6)
+  /// Stamped on success; NULL until then.
+  processedAt    DateTime? @map("processed_at") @db.Timestamptz(6)
+  /// Stamped when state flips to `dead_lettered`.
+  deadLetteredAt DateTime? @map("dead_lettered_at") @db.Timestamptz(6)
+
+  @@id([consumerGroup, eventId])
+  @@map("outbox_consumer_dedup")
+  @@schema("analytics")
+}
+
+/// Raw `search.performed` landing table (TS-217-prep-3a; PDD §23.1 — "raw
+/// retention", interim Postgres store for the Cassandra `analytics.events`
+/// keyspace per PDD §8.3 / TS-217-prep-3a-followup-1). One row per
+/// `search.performed` event consumed from the outbox relay. The TS-217-prep-3b
+/// nightly aggregation reads this table by `occurredAt` window to compute the
+/// search-relevance marts (top queries, zero-result rate, searches-per-sort).
+///
+/// **`eventId` is the PK** — the same dedup key the relay stamps. An idempotent
+/// `createMany({ skipDuplicates: true })` no-ops a redelivered event (count=0),
+/// so the handler stays idempotent on `event_id` at the persistence layer
+/// (CLAUDE.md §5.3). Mirrors service-webhook's `StripeProcessedEvent` /
+/// `CheckrProcessedEvent` append-only event-mirror shape (`eventId @id`, no
+/// `created_at`/`updated_at` — rows are strictly immutable; `consumedAt`
+/// records ingest time for lag analysis).
+///
+/// Platform-wide read-side projection with NO tenant axis (search telemetry
+/// aggregates across every household), so the model is listed in
+/// `unscopedModels` in `app.module.ts` exactly like `AnalyticsAggregationRun`.
+///
+/// Field shape mirrors `SearchPerformedSchema`
+/// (`packages/contracts/src/events/search.ts`). `sort` / `page` are stored as
+/// TEXT (not Postgres enums) so the additive-only event enums never force an
+/// `ALTER TYPE` on this read-side table; `appliedFilters` / `filterTiers` are
+/// `text[]`. No senior PII (`queryText` is provider-discovery text — cuisine /
+/// dish / language / chef name — per the contract's PII note; CLAUDE.md §3.9).
+model SearchEvent {
+  /// Producer-stamped event id (the relay dedup key). Idempotency PK.
+  eventId       String   @id @map("event_id")
+  /// Producer wall-clock timestamp. The time axis the prep-3b aggregation
+  /// windows on.
+  occurredAt    DateTime @map("occurred_at") @db.Timestamptz(6)
+  /// Who searched — server-stamped from the access-token context (never
+  /// client-supplied; CLAUDE.md §3.2). The conversion-join anchor for prep-3b.
+  actorUserId   String   @map("actor_user_id")
+  /// Verbatim free-text query; NULL for a no-text discovery browse.
+  queryText     String?  @map("query_text")
+  /// Sort the user chose (`relevance` | `rating` | `distance`).
+  sort          String
+  /// Whether a geo center was supplied.
+  hasGeo        Boolean  @map("has_geo")
+  /// Active filter-facet keys (stable order; may be empty).
+  appliedFilters String[] @map("applied_filters")
+  /// Requested tier VALUES (empty when the tier filter was not set).
+  filterTiers   String[] @map("filter_tiers")
+  /// Hits returned on this page.
+  resultCount   Int      @map("result_count")
+  /// Total matches (backend best-effort estimate).
+  totalEstimate Int      @map("total_estimate")
+  /// `totalEstimate === 0`. Carried so the hottest aggregation predicate is an
+  /// indexed boolean, not a derived count comparison.
+  zeroResults   Boolean  @map("zero_results")
+  /// `first` (fresh query) vs `paged` (pagination follow-up).
+  page          String
+  /// Stub vs live-Elasticsearch backend, so prep-3b can segment Phase-1 stub
+  /// data from live-ES data once TS-111-followup-1 lands.
+  liveMode      Boolean  @map("live_mode")
+  /// Producer service name (`service-search`) — lineage trail for tracing.
+  producerService String @map("producer_service")
+  /// Ingest time (consumer wall-clock). Drives consumer-lag analysis
+  /// (`consumedAt - occurredAt`).
+  consumedAt    DateTime @default(now()) @map("consumed_at") @db.Timestamptz(6)
+
+  /// prep-3b windows on `occurred_at`; the index keeps the nightly window scan
+  /// cheap (CLAUDE.md §7.3 — index every column used in a `where` predicate at
+  /// scale).
+  @@index([occurredAt], map: "search_events_occurred_at_idx")
+  @@map("search_events")
+  @@schema("analytics")
+}
+
+/// Raw `booking.created` landing table (TS-217-prep-3a; PDD §23.1). One row per
+/// `booking.created` event consumed from the outbox relay. The TS-217-prep-3b
+/// nightly aggregation reads this table for the query→booking conversion mart.
+///
+/// **`eventId` is the PK** — same idempotency rationale as `SearchEvent`.
+///
+/// **Conversion caveat (prep-3b / prep-4):** `booking.created` carries
+/// `householdId` but NOT `actorUserId` (see
+/// `packages/contracts/src/events/booking.ts` — `BookingCreatedSchema`), so an
+/// exact `actorUserId` join against `SearchEvent` is impossible in the interim.
+/// prep-3b computes an approximate household/time-window conversion; the precise
+/// per-search attribution lands with TS-217-prep-4 (search-correlation id
+/// threaded into `booking.created`).
+///
+/// Field shape mirrors `BookingCreatedSchema`. Money fields are integer USD
+/// minor units (CLAUDE.md §17.6 — no float math for money); they are NOT a
+/// monetary source-of-truth here (accounting owns that — PDD §11.2) but are
+/// carried for the conversion mart's GMV-by-search overlay. No PII beyond
+/// identifiers (the contract carries none).
+model BookingCreatedEvent {
+  /// Producer-stamped event id (the relay dedup key). Idempotency PK.
+  eventId             String   @id @map("event_id")
+  /// Producer wall-clock timestamp. The conversion-window time axis.
+  occurredAt          DateTime @map("occurred_at") @db.Timestamptz(6)
+  /// Soft FK into service-booking (CLAUDE.md §2.3 — id only, never a cross-
+  /// service FK).
+  bookingId           String   @map("booking_id")
+  /// Soft FK into service-household. The interim conversion-join key (the best
+  /// available anchor until prep-4's search-correlation id).
+  householdId         String   @map("household_id")
+  /// The originating search-correlation token (TS-217-prep-4c). NULL when the
+  /// booking did not arrive from a provider-discovery search (concierge manual
+  /// booking, direct-link visit). When present it equals the originating
+  /// `search.performed` event's `event_id` (== `SearchEvent.event_id`), so the
+  /// precise per-search query→booking attribution mart joins
+  /// `booking_created_events.search_id == search_events.event_id` — replacing
+  /// prep-3b's approximate `(household_id, time-window)` funnel.
+  searchId            String?  @map("search_id")
+  /// Soft FK into service-household.
+  seniorId            String   @map("senior_id")
+  /// Soft FK into service-provider.
+  providerId          String   @map("provider_id")
+  /// Bookable service kind (e.g. `companion_dining`). Stored as TEXT so the
+  /// additive-only event enum never forces an `ALTER TYPE` on this table.
+  serviceKind         String   @map("service_kind")
+  scheduledStart      DateTime @map("scheduled_start") @db.Timestamptz(6)
+  scheduledEnd        DateTime @map("scheduled_end") @db.Timestamptz(6)
+  /// ISO-4217 currency (Phase 1: always `USD`).
+  currency            String
+  /// Integer USD minor units (cents) — CLAUDE.md §17.6.
+  basePriceMinor      Int      @map("base_price_minor")
+  /// Basis points (0.30 → 3000).
+  commissionRateBps   Int      @map("commission_rate_bps")
+  commissionAmountMinor Int    @map("commission_amount_minor")
+  finalPriceMinor     Int      @map("final_price_minor")
+  /// Producer service name (`service-booking`) — lineage trail for tracing.
+  producerService     String   @map("producer_service")
+  /// Ingest time (consumer wall-clock) — consumer-lag analysis.
+  consumedAt          DateTime @default(now()) @map("consumed_at") @db.Timestamptz(6)
+
+  /// prep-3b windows on `occurred_at` for the conversion mart.
+  @@index([occurredAt], map: "booking_created_events_occurred_at_idx")
+  /// The interim conversion-join key — prep-3b correlates searches to bookings
+  /// by `(household_id, occurred_at window)` until prep-4's correlation id.
+  @@index([householdId, occurredAt], map: "booking_created_events_household_occurred_at_idx")
+  /// TS-217-prep-4c — the PRECISE conversion-join key. The attribution mart
+  /// (TS-217-prep-4c-followup-1) windows on `occurred_at` and joins on
+  /// `search_id`; this index keeps that join cheap (CLAUDE.md §7.3). Only
+  /// attributed bookings carry a non-null token; null-token rows index to a
+  /// single dead-end key, harmless at Phase-1 scale.
+  @@index([searchId], map: "booking_created_events_search_id_idx")
+  @@map("booking_created_events")
+  @@schema("analytics")
+}
+
+/// Raw `search.result_clicked` landing table (TS-217-prep-4b; PDD §23.1). One
+/// row per click reported by the family-portal on a `/providers` result. The
+/// CTR-by-position aggregation mart (TS-217-prep-4b-followup-1) reads this table
+/// by `occurred_at` window, joining to `SearchEvent` on `search_id` ==
+/// `SearchEvent.event_id` (the search-correlation token, TS-217-prep-4a) to
+/// derive click-through-rate per result position.
+///
+/// **`eventId` is the PK** — same idempotency rationale as `SearchEvent`: an
+/// idempotent `createMany({ skipDuplicates: true })` no-ops a redelivered click
+/// (CLAUDE.md §5.3). Each click carries its OWN producer-minted `event_id`
+/// (one row per click), distinct from the `search_id` correlation token.
+///
+/// Platform-wide read-side projection with NO tenant axis (click telemetry
+/// aggregates across every household), so the model is listed in
+/// `unscopedModels` in `app.module.ts` exactly like the other raw landing
+/// tables. Field shape mirrors `SearchResultClickedSchema`
+/// (`packages/contracts/src/events/search.ts`). No PII — `provider_id` /
+/// `actor_user_id` are opaque soft-FKs (CLAUDE.md §2.3, §3.9).
+model SearchClickEvent {
+  /// Producer-stamped event id (the relay dedup key). Idempotency PK.
+  eventId         String   @id @map("event_id")
+  /// Producer wall-clock timestamp. The time axis the CTR aggregation windows
+  /// on.
+  occurredAt      DateTime @map("occurred_at") @db.Timestamptz(6)
+  /// The search-correlation token (= the originating `search.performed` event's
+  /// `event_id`, TS-217-prep-4a). The CTR-funnel join key.
+  searchId        String   @map("search_id")
+  /// Who clicked — server-stamped from the access-token context (never
+  /// client-supplied; CLAUDE.md §3.2).
+  actorUserId     String   @map("actor_user_id")
+  /// The clicked provider's index doc id (soft-FK; CLAUDE.md §2.3).
+  providerId      String   @map("provider_id")
+  /// Zero-based rank of the clicked result within the page the user saw. The
+  /// CTR-by-position bucket key.
+  position        Int
+  /// Producer service name (`service-search`) — lineage trail for tracing.
+  producerService String   @map("producer_service")
+  /// Ingest time (consumer wall-clock) — consumer-lag analysis.
+  consumedAt      DateTime @default(now()) @map("consumed_at") @db.Timestamptz(6)
+
+  /// The CTR aggregation windows on `occurred_at`.
+  @@index([occurredAt], map: "search_click_events_occurred_at_idx")
+  /// The CTR-funnel join key back to `search_events` (search_id ==
+  /// SearchEvent.event_id).
+  @@index([searchId], map: "search_click_events_search_id_idx")
+  @@map("search_click_events")
+  @@schema("analytics")
+}
+
+/// Daily search-relevance summary mart (TS-217-prep-3b; PDD §23.1 "aggregated
+/// nightly to PostgreSQL marts"). ONE row per UTC calendar day, recomputed
+/// idempotently by the nightly aggregation (delete-and-reinsert keyed by
+/// `metric_date`). Powers the TS-217 dashboard's zero-result RATE
+/// (`zeroResultSearches / totalSearches`), the PRECISE per-search query→booking
+/// conversion (`attributedBookings / totalSearches`, TS-217-prep-4c-followup-1),
+/// and the retained APPROXIMATE conversion funnel
+/// (`bookingsCreated / distinctSearchers`).
+///
+/// **Raw counts, not rates.** The mart stores durable count primitives; the
+/// dashboard (and the compute response's ppm fields) derive the ratios. This
+/// keeps the mart recomputable + lets the UI re-derive rates without a stored
+/// rounding artifact (CLAUDE.md §6 money-math discipline applied to ratios).
+///
+/// **Aggregation grain.** Counts are over FIRST-PAGE searches
+/// (`search_events.page = 'first'`) so a deep-scroll pagination follow-up is
+/// not double-counted as a new search (the `SearchPagePosition` contract note).
+///
+/// **Conversion (precise + approximate).** `attributedBookings` is the PRECISE
+/// numerator (TS-217-prep-4c-followup-1): `booking_created_events` rows in the
+/// window whose `search_id` joins a same-window `search_events.event_id` (the
+/// correlation token threaded by TS-217-prep-4c). `bookingsCreated` is the raw
+/// count for the same day and `distinctSearchers` distinct `actor_user_id` —
+/// their ratio is the COARSE platform-wide funnel, RETAINED for continuity + as
+/// a coverage cross-check (a booking that did not arrive from a search carries
+/// no `search_id`, so it is in `bookingsCreated` but not `attributedBookings`).
+///
+/// Platform-wide read-side mart with NO tenant axis → listed in
+/// `unscopedModels` in `app.module.ts` like the raw landing tables.
+model SearchRelevanceDaily {
+  /// The UTC calendar date this summary covers. Single-column PK — one row
+  /// per day, recomputed in place.
+  metricDate         DateTime @id @map("metric_date") @db.Date
+  /// First-page searches in the window (the distinct-search denominator).
+  totalSearches      Int      @map("total_searches")
+  /// First-page searches that returned nothing (`zero_results = true`).
+  zeroResultSearches Int      @map("zero_result_searches")
+  /// Distinct `actor_user_id`s who ran a first-page search in the window.
+  distinctSearchers  Int      @map("distinct_searchers")
+  /// `booking.created` events in the window (the approximate numerator).
+  bookingsCreated    Int      @map("bookings_created")
+  /// Bookings whose `search_id` joins a same-window `search_events.event_id`
+  /// (the PRECISE per-search attribution numerator, TS-217-prep-4c-followup-1).
+  /// A subset of `bookings_created`.
+  attributedBookings Int      @map("attributed_bookings")
+  /// When the nightly aggregation last (re)computed this row.
+  computedAt         DateTime @map("computed_at") @db.Timestamptz(6)
+
+  @@map("search_relevance_daily")
+  @@schema("analytics")
+}
+
+/// Per-query daily mart (TS-217-prep-3b). ONE row per `(metric_date,
+/// query_text)`, recomputed idempotently by the nightly aggregation. Powers
+/// the TS-217 dashboard's "top queries" (ORDER BY `search_count` DESC) and the
+/// per-query zero-result diagnostic.
+///
+/// Only NON-NULL `query_text` searches land here — a no-text discovery browse
+/// has no query to rank. Counts are over FIRST-PAGE searches (see
+/// `SearchRelevanceDaily`). `query_text` is part of the composite PK; the
+/// 256-char `search_events.query_text` cap keeps the PK index well under
+/// Postgres' b-tree row-size limit.
+///
+/// Platform-wide read-side mart, NO tenant axis → `unscopedModels`.
+model SearchQueryDaily {
+  /// The UTC calendar date this row covers. Part of the composite PK.
+  metricDate      DateTime @map("metric_date") @db.Date
+  /// The verbatim free-text query (provider-discovery text — cuisine / dish /
+  /// language / chef name, NOT senior PII per the event contract; CLAUDE.md
+  /// §3.9). Part of the composite PK.
+  queryText       String   @map("query_text")
+  /// First-page searches with this query text in the window.
+  searchCount     Int      @map("search_count")
+  /// Of those, how many returned nothing (`zero_results = true`).
+  zeroResultCount Int      @map("zero_result_count")
+  /// When the nightly aggregation last (re)computed this row.
+  computedAt      DateTime @map("computed_at") @db.Timestamptz(6)
+
+  @@id([metricDate, queryText])
+  /// "Top queries for this day, busiest first" — the dashboard's dominant read.
+  @@index([metricDate, searchCount(sort: Desc)], map: "search_query_daily_date_count_idx")
+  @@map("search_query_daily")
+  @@schema("analytics")
+}
+
+/// Per-sort daily mart (TS-217-prep-3b). ONE row per `(metric_date, sort)`,
+/// recomputed idempotently by the nightly aggregation. Powers the TS-217
+/// dashboard's "searches-per-sort" breakdown (`relevance` / `rating` /
+/// `distance`).
+///
+/// `sort` is stored as TEXT (mirroring the raw `search_events.sort` column) so
+/// the additive-only sort enum never forces an `ALTER TYPE` on this read-side
+/// mart. Counts are over FIRST-PAGE searches (see `SearchRelevanceDaily`).
+///
+/// Platform-wide read-side mart, NO tenant axis → `unscopedModels`.
+model SearchSortDaily {
+  /// The UTC calendar date this row covers. Part of the composite PK.
+  metricDate      DateTime @map("metric_date") @db.Date
+  /// Sort the user chose (`relevance` | `rating` | `distance`). Part of the
+  /// composite PK; TEXT so the additive sort enum never `ALTER TYPE`s here.
+  sort            String
+  /// First-page searches using this sort in the window.
+  searchCount     Int      @map("search_count")
+  /// Of those, how many returned nothing (`zero_results = true`).
+  zeroResultCount Int      @map("zero_result_count")
+  /// When the nightly aggregation last (re)computed this row.
+  computedAt      DateTime @map("computed_at") @db.Timestamptz(6)
+
+  @@id([metricDate, sort])
+  @@map("search_sort_daily")
+  @@schema("analytics")
+}
+
+/// Per-position CTR mart (TS-217-prep-4b-followup-1; PRD §10.1, PDD §23.1).
+/// ONE row per `(metric_date, position)`, recomputed idempotently by the
+/// nightly aggregation (delete-and-reinsert keyed by `metric_date`, folded into
+/// the same run + transaction as the prep-3b marts). Powers the TS-217
+/// dashboard's "CTR by result position" panel.
+///
+/// **Click grain.** Only positions that received at least one click that day
+/// land here (mirroring `SearchQueryDaily` / `SearchSortDaily`, which only emit
+/// rows for query texts / sorts that actually occurred). `click_count` is the
+/// per-position click tally from `analytics.search_click_events` (TS-217-prep-4b).
+///
+/// **Impression denominator.** `impression_count` is the number of FIRST-PAGE
+/// searches that rendered this position — a first-page search returning `r`
+/// hits showed positions `0 .. r-1`, so position `p` was an impression when
+/// `result_count > p` (derived from the existing `SearchEvent` table; see
+/// `impressionsForPositions`). The dashboard derives CTR = `click_count /
+/// impression_count`, guarding a zero denominator (an undefined CTR — e.g. a
+/// click whose originating search fell on a previous day, so no same-day
+/// first-page impression backs it). Raw COUNTS are stored, never the rate, so
+/// the UI re-derives ratios without a stored rounding artifact (the prep-3b
+/// discipline).
+///
+/// Platform-wide read-side mart with NO tenant axis → listed in
+/// `unscopedModels` in `app.module.ts` like the other marts.
+model SearchClickPositionDaily {
+  /// The UTC calendar date this row covers. Part of the composite PK.
+  metricDate      DateTime @map("metric_date") @db.Date
+  /// Zero-based result position (rank within the page the user saw). Part of
+  /// the composite PK; bounded by `SEARCH_RESULT_CLICKED_POSITION_MAX`.
+  position        Int
+  /// Clicks on this position in the window (the CTR numerator).
+  clickCount      Int      @map("click_count")
+  /// First-page searches that rendered this position (the CTR denominator).
+  impressionCount Int      @map("impression_count")
+  /// When the nightly aggregation last (re)computed this row.
+  computedAt      DateTime @map("computed_at") @db.Timestamptz(6)
+
+  @@id([metricDate, position])
+  /// "Most-clicked positions for this day, busiest first" — the dashboard's
+  /// dominant read (CLAUDE.md §7.3).
+  @@index([metricDate, clickCount(sort: Desc)], map: "search_click_position_daily_date_clicks_idx")
+  @@map("search_click_position_daily")
+  @@schema("analytics")
+}

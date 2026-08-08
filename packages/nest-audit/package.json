@@ -1,0 +1,52 @@
+{
+  "name": "@taste-and-see/nest-audit",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Shared admin-mutation audit emission for the Taste & See platform. `buildAuditActorContext` derives the actor + request metadata from a VERIFIED token (never the body), and `AuditEmitter` appends `audit.action_recorded` to the caller's transactional outbox INSIDE the mutation transaction, so a mutation that cannot be audited does not commit (CLAUDE.md §3.6, §5.3). Extracted verbatim from the three copies that had accumulated in service-ads, service-content, and service-trust-safety. TS-303b-followup-1.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@taste-and-see/auth-sdk": "workspace:*",
+    "@taste-and-see/contracts": "workspace:*",
+    "@taste-and-see/nest-outbox": "workspace:*"
+  },
+  "peerDependencies": {
+    "@nestjs/common": "^11.0.0",
+    "reflect-metadata": "^0.2.0"
+  },
+  "devDependencies": {
+    "@nestjs/common": "11.0.0",
+    "@nestjs/core": "11.0.0",
+    "@nestjs/testing": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "reflect-metadata": "0.2.2",
+    "rimraf": "6.0.1",
+    "rxjs": "7.8.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

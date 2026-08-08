@@ -1,0 +1,29 @@
+# Per-worker egress NetworkPolicy for worker-stripe-reconciliation.
+#
+# The namespace default-deny baseline denies all egress except DNS and
+# the external data node. This worker needs neither Postgres nor Redis —
+# it only calls service-accounting's internal reconciliation endpoint in
+# the platform-services namespace — so this additive policy opens exactly
+# that one path: TCP/3015 to platform-services. The matching ingress
+# admission lives in the service-accounting base.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: worker-stripe-reconciliation-egress-accounting
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: worker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: worker
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: platform-services
+      ports:
+        - protocol: TCP
+          port: 3015

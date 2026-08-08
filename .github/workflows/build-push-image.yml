@@ -1,0 +1,296 @@
+# Reusable workflow for building, pushing, signing, and scanning a Taste & See
+# NestJS service image.
+#
+# Invoked by per-service trigger workflows (e.g.
+# `.github/workflows/service-identity-build.yml`) via `workflow_call`. The
+# caller passes:
+#   - service-name:    canonical kebab-case name (used in tags / labels / cache scope)
+#   - service-path:    repo-relative service directory (build-arg)
+#   - service-package: pnpm filter target (build-arg)
+#   - image-name:      ghcr.io/owner/<image>; matches the kustomize `images:` entry
+#
+# What this workflow does:
+#   1. Build via `infra/docker/nestjs.Dockerfile` with `--build-arg` for the
+#      service path + package; BuildKit GHA cache scoped per-service so two
+#      services don't pollute each other's layer cache.
+#   2. Push to ghcr.io with two tags:
+#        - sha-<short-sha>     immutable; this is what the GitOps overlay pins
+#        - <branch-or-ref-slug> mutable; debugging aid only ("give me main")
+#      Provenance + SBOM attestations are attached as OCI artifacts.
+#   3. Sign the pushed digest with cosign in keyless mode (Sigstore/Fulcio +
+#      Rekor; OIDC identity binding from GitHub Actions). The signature lives
+#      next to the image in the registry as `sha256-<digest>.sig`.
+#   4. Trivy scan the pushed image at HIGH/CRITICAL severity, fail the job on
+#      findings, upload SARIF to GitHub Security. Mirrors the filesystem scan
+#      in `.github/workflows/ci.yml`.
+#
+# Outputs (the bumper step in the caller consumes these):
+#   - image-digest:   the sha256:... reference for the freshly pushed image
+#   - image-sha-tag:  the `sha-<short-sha>` tag (without the registry prefix)
+#
+# Permissions are declared on the job so the caller workflow does not need
+# to repeat them; GitHub merges callee and caller permissions taking the
+# minimum, so the caller must ALSO declare these on the dispatched job.
+#
+# Third-party `uses:` lines are SHA-pinned per the TS-009a discipline — the
+# trailing `# vX.Y.Z` comment carries the human-readable version. Bumping
+# requires updating both the SHA and the comment in lockstep. The four pins
+# this workflow introduced (docker/setup-buildx-action, docker/login-action,
+# docker/build-push-action, sigstore/cosign-installer) landed as version
+# tags initially and were converted to SHA pins by TS-009g-followup-1
+# (2026-05-18).
+#
+# References:
+#   PDD.md §20.1 (container strategy), §20.4 (CI/CD)
+#   CLAUDE.md §3 (security), §11 (CI/CD & branching), §3.5 (secrets)
+
+name: Build & push service image (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: Canonical service name (kebab-case)
+        required: true
+        type: string
+      service-path:
+        description: Repo-relative path to the service workspace
+        required: true
+        type: string
+      service-package:
+        description: pnpm filter target (e.g. @taste-and-see/service-identity)
+        required: true
+        type: string
+      image-name:
+        description: Container image name (e.g. ghcr.io/brickagcopra/service-identity)
+        required: true
+        type: string
+      dockerfile:
+        description: >-
+          Dockerfile to build with. Defaults to the NestJS service template;
+          Next.js web apps pass infra/docker/nextjs.Dockerfile. Both consume
+          the same SERVICE_PATH / SERVICE_PACKAGE build-args.
+        required: false
+        type: string
+        default: infra/docker/nestjs.Dockerfile
+      migrator-image-name:
+        description: >-
+          Container image name for this service's one-shot `prisma migrate
+          deploy` image (e.g. ghcr.io/brickagcopra/service-identity-migrator).
+          Set ONLY by the 20 services that own a `prisma/schema.prisma`; left
+          empty by the api-gateway, the workers, and the web apps, which own no
+          schema and for which the `migrator` stage would fail to COPY.
+          Empty (the default) skips the migrator build entirely.
+        required: false
+        type: string
+        default: ""
+    outputs:
+      image-digest:
+        description: sha256:... digest of the freshly pushed image
+        value: ${{ jobs.build-push.outputs.image-digest }}
+      image-sha-tag:
+        description: sha-<short-sha> tag (no registry prefix)
+        value: ${{ jobs.build-push.outputs.image-sha-tag }}
+
+jobs:
+  build-push:
+    name: Build, push, sign, scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Permissions are declared at the job level. Callers MUST grant the same
+    # set on the job that dispatches this workflow, or `permissions:` is the
+    # intersection of caller + callee and the cosign sign / SARIF upload steps
+    # will silently lose privilege.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      security-events: write
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-sha-tag: ${{ steps.tags.outputs.sha-tag }}
+    steps:
+      - name: Compute image tags
+        id: tags
+        # Two tags per push:
+        #   sha-<short-sha> — immutable; what the GitOps overlay pins to
+        #   <branch-slug>   — mutable; useful for `docker pull ...:main`
+        # We deliberately do NOT publish `:latest` — mutable latest tags are an
+        # anti-pattern that surprises consumers when the underlying digest moves.
+        # Branch slug normalises GITHUB_REF_NAME (`feat/foo/bar` → `feat-foo-bar`)
+        # so it survives as a Docker tag (slashes are forbidden in tag names).
+        run: |
+          short_sha="${GITHUB_SHA:0:7}"
+          branch_slug="$(echo "${GITHUB_REF_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "sha-tag=sha-${short_sha}"
+            echo "branch-tag=${branch_slug}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push
+        id: build
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          push: true
+          # Pinned explicitly. `nestjs.Dockerfile` grew a `migrator` stage
+          # after `runner`, and BuildKit's default target is the LAST stage —
+          # without this line every service image would silently become a
+          # one-shot migrator. `nextjs.Dockerfile` names its final stage
+          # `runner` too, so the pin is correct for both templates.
+          target: runner
+          # Provenance generates an SLSA-format build attestation; SBOM
+          # generates a CycloneDX/SPDX bill-of-materials. Both ship as OCI
+          # artifacts in the image index and are signed alongside the image
+          # by the cosign step below. mode=max attaches reproducibility-grade
+          # provenance (full build context hash, base image references, etc.).
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            SERVICE_PATH=${{ inputs.service-path }}
+            SERVICE_PACKAGE=${{ inputs.service-package }}
+          tags: |
+            ${{ inputs.image-name }}:${{ steps.tags.outputs.sha-tag }}
+            ${{ inputs.image-name }}:${{ steps.tags.outputs.branch-tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+            org.opencontainers.image.title=${{ inputs.service-name }}
+            org.opencontainers.image.description=Taste & See — ${{ inputs.service-name }}
+          # GHA cache scoped per-service so layer cache for service-identity
+          # doesn't evict layer cache for service-booking, etc. mode=max writes
+          # all intermediate layers including the deps + builder stages, not
+          # just the final runner — pays off massively on warm builds (~45s
+          # → ~10s for service-identity).
+          cache-from: type=gha,scope=${{ inputs.service-name }}
+          cache-to: type=gha,scope=${{ inputs.service-name }},mode=max
+
+      - name: Install cosign
+        # sigstore/cosign-installer ships annotated tags; the SHA below is the
+        # commit the tag points to (resolved via `git ls-remote ... "v3.7.0^{}"`),
+        # not the tag object SHA. GHA accepts either, but the repo convention
+        # is the commit SHA.
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+        with:
+          cosign-release: v2.4.1
+
+      - name: Sign image (keyless via OIDC)
+        # `--yes` confirms the keyless flow (skips the interactive Sigstore
+        # TUF root-of-trust prompt that has no place in CI). The signature
+        # lands in ghcr.io next to the image (tag shaped like
+        # `sha256-<digest>.sig`) and a transparency-log entry lands in Rekor
+        # so verification later can prove the signature came from this exact
+        # GitHub Actions workflow.
+        #
+        # Verification recipe (run from a workstation):
+        #   cosign verify \
+        #     --certificate-identity-regexp \
+        #       '^https://github\.com/${{ github.repository_owner }}/.+/\.github/workflows/build-push-image\.yml@refs/heads/main$' \
+        #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        #     ${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
+        #
+        # The full verification runbook lives in `infra/docker/README.md`.
+        run: |
+          cosign sign --yes "${{ inputs.image-name }}@${{ steps.build.outputs.digest }}"
+
+      - name: Trivy image scan
+        # Scans the pushed digest (not the tag) so the scan target is exactly
+        # what landed in the registry — defends against a tag-flip race.
+        # Fails the job on HIGH/CRITICAL; lower severities are reported via
+        # the SARIF upload but don't block.
+        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2 # v0.28.0
+        with:
+          image-ref: ${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-image-results.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@1521896cd211af95be3f02edf6f436e10b819c27 # v3.35.4
+        with:
+          sarif_file: trivy-image-results.sarif
+          # Per-service category so the Security tab groups findings the way
+          # ops + on-call expect them (one row per service, not one row per scan).
+          category: trivy-image-${{ inputs.service-name }}
+
+      # -- Migrator image (TS-151-followup-12) ------------------------------
+      #
+      # Built from the same context and the same commit as the service image
+      # above, and pushed with the SAME `sha-<short-sha>` tag. That shared tag
+      # is the whole point: the promotion workflow bumps every image declared
+      # in an overlay to one SHA, so the migration that a release needs and the
+      # code that needs it can never be promoted apart.
+      #
+      # Skipped wholesale for the 14 workloads that own no Prisma schema.
+
+      - name: Build & push migrator image
+        id: build-migrator
+        if: inputs.migrator-image-name != ''
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+        with:
+          context: .
+          file: infra/docker/nestjs.Dockerfile
+          push: true
+          target: migrator
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            SERVICE_PATH=${{ inputs.service-path }}
+            SERVICE_PACKAGE=${{ inputs.service-package }}
+          tags: |
+            ${{ inputs.migrator-image-name }}:${{ steps.tags.outputs.sha-tag }}
+            ${{ inputs.migrator-image-name }}:${{ steps.tags.outputs.branch-tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+            org.opencontainers.image.title=${{ inputs.service-name }}-migrator
+            org.opencontainers.image.description=Taste & See — ${{ inputs.service-name }} Prisma migrate deploy
+          # Separate cache scope. The migrator shares only the `upstream-node`
+          # stage with the service image; giving it the service's scope would
+          # have two unrelated layer sets evicting each other.
+          cache-from: type=gha,scope=${{ inputs.service-name }}-migrator
+          cache-to: type=gha,scope=${{ inputs.service-name }}-migrator,mode=max
+
+      - name: Sign migrator image (keyless via OIDC)
+        if: inputs.migrator-image-name != ''
+        run: |
+          cosign sign --yes "${{ inputs.migrator-image-name }}@${{ steps.build-migrator.outputs.digest }}"
+
+      - name: Trivy migrator image scan
+        # Scanned on the same terms as the service image, and deliberately not
+        # on softer ones: this image holds a database superuser-grade
+        # `DATABASE_URL` for the length of a migration.
+        if: inputs.migrator-image-name != ''
+        uses: aquasecurity/trivy-action@915b19bbe73b92a6cf82a1bc12b087c9a19a5fe2 # v0.28.0
+        with:
+          image-ref: ${{ inputs.migrator-image-name }}@${{ steps.build-migrator.outputs.digest }}
+          format: sarif
+          output: trivy-migrator-results.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload migrator Trivy SARIF to GitHub Security
+        if: always() && inputs.migrator-image-name != ''
+        uses: github/codeql-action/upload-sarif@1521896cd211af95be3f02edf6f436e10b819c27 # v3.35.4
+        with:
+          sarif_file: trivy-migrator-results.sarif
+          category: trivy-image-${{ inputs.service-name }}-migrator

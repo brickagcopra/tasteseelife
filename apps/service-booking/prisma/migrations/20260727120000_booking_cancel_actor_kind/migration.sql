@@ -1,0 +1,77 @@
+-- TS-308c-followup-3 — record WHAT KIND of actor cancelled a booking.
+--
+-- One expand-only change: a new enum and a new nullable column. No
+-- existing row is touched, no existing read path changes, and every
+-- current write path continues to work (the column is nullable and the
+-- service treats null as "unknown").
+--
+-- ─────────────────────────────────────────────────────────────────────
+-- Why
+-- ─────────────────────────────────────────────────────────────────────
+--
+-- TS-308c's mass-cancellation detector has one known false-positive
+-- mode, and it was documented at the time rather than fixed: when a
+-- provider leaves the platform, ops cancels their remaining bookings.
+-- That is ONE admin acting ONCE, and it trips the provider threshold
+-- immediately — opening a `conduct` / `medium` incident on somebody who
+-- has already gone. It is visible in triage (`distinctActorCount: 1`),
+-- but it is still an incident nobody needed, and it has to be closed
+-- BEFORE the threshold is ever tuned downward or the tuning will be
+-- fitted to noise.
+--
+-- TS-308c already added `canceled_by_user_id`, but an id alone cannot
+-- answer this: service-booking cannot resolve whether a user id belongs
+-- to a provider, a family member or an admin, because those directories
+-- live in service-provider and service-household and CLAUDE.md §2.3
+-- forbids reaching across. The fix records the ONE thing that IS known
+-- authoritatively at the request boundary — the verified access token's
+-- `roles` claim answers "is this caller platform staff" via the same
+-- `holdsAdminRole` predicate service-identity uses for the staff MFA
+-- gate.
+--
+-- ─────────────────────────────────────────────────────────────────────
+-- Why only two values
+-- ─────────────────────────────────────────────────────────────────────
+--
+-- `staff` and `customer`, and the coarseness is deliberate. A third
+-- value distinguishing provider from household would be a claim the
+-- token cannot support: an RBAC role name says what someone may do, not
+-- whether they are the provider ON THIS BOOKING. Two honest values beat
+-- three where one is guesswork.
+--
+-- ─────────────────────────────────────────────────────────────────────
+-- Why NULL is not "customer"
+-- ─────────────────────────────────────────────────────────────────────
+--
+-- Every row cancelled before this column landed is NULL and cannot be
+-- backfilled, for the same reason `canceled_by_user_id` could not be.
+-- The detector therefore excludes only rows explicitly marked `staff`.
+-- An unknown row still counts — which errs toward opening an incident
+-- rather than toward missing one, the correct direction on a safety
+-- surface.
+--
+-- ─────────────────────────────────────────────────────────────────────
+-- Index
+-- ─────────────────────────────────────────────────────────────────────
+--
+-- None. The detector already filters on the partial
+-- `bookings_canceled_at_idx` (`WHERE canceled_at IS NOT NULL`) and this
+-- column is only read from within that already-narrow set; a separate
+-- index would cost writes on every cancellation to serve a predicate
+-- applied to a handful of rows per sweep.
+--
+-- ─────────────────────────────────────────────────────────────────────
+-- Rollback
+-- ─────────────────────────────────────────────────────────────────────
+--
+--   ALTER TABLE booking.bookings DROP COLUMN canceled_by_actor_kind;
+--   DROP TYPE booking.booking_cancel_actor_kind;
+--
+-- Safe at any time: no read path outside the detector consults the
+-- column, and the detector treats its absence as "every row counts",
+-- which is exactly the pre-TS-308c-followup-3 behaviour.
+
+CREATE TYPE "booking"."booking_cancel_actor_kind" AS ENUM ('staff', 'customer');
+
+ALTER TABLE "booking"."bookings"
+  ADD COLUMN "canceled_by_actor_kind" "booking"."booking_cancel_actor_kind";

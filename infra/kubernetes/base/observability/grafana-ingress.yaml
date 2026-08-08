@@ -1,0 +1,42 @@
+# Standalone Grafana Ingress (TS-151-followup-6).
+#
+# The kube-prometheus-stack Grafana subchart's own Ingress is disabled
+# (values-kube-prometheus-stack.yaml grafana.ingress.enabled=false) so
+# the host + LE issuer can be patched per overlay exactly the way the
+# web-app Ingresses are — mirror of components/web-app/ingress.yaml.
+#
+# Each env overlay patches:
+#   - metadata.annotations.cert-manager.io/cluster-issuer (prod →
+#     letsencrypt-prod)
+#   - spec.tls[0].hosts[0] + spec.rules[0].host → grafana.<env>.tasteseelife.com
+#
+# Backend Service is the chart's Grafana Service:
+# `kube-prometheus-stack-grafana` (releaseName-prefixed) on port 80.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: observability
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: observability
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-staging
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - grafana.example.invalid
+      secretName: grafana-tls
+  rules:
+    - host: grafana.example.invalid
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kube-prometheus-stack-grafana
+                port:
+                  number: 80

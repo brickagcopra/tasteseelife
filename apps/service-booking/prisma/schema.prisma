@@ -1,0 +1,1494 @@
+// Booking bounded context — see PDD §7.2 (service inventory entry #6)
+// and §8.2 (`booking` schema column inventory) plus PDD §9.2 for the
+// lifecycle sequence and PRD §6.3 for the family-portal booking flow.
+//
+// Scope so far:
+//   - TS-060 adds the `booking` Postgres schema and the core `bookings`
+//     row — the row that records every chef visit, companion dining
+//     session, concierge service request, or grocery coordination
+//     booking on the platform. Two enums (`booking_status`,
+//     `service_kind`) bound the lifecycle state machine (PDD §9.2 +
+//     PRD §6.3) and the catalog of bookable service types.
+//
+// Deliberately deferred — each follow-up arrives as an *additive*
+// expand → migrate → contract migration (CLAUDE.md §4.1) so existing
+// rows stay readable:
+//
+//   - TS-061 — `booking_recurrence`. Sibling table keyed by
+//     `booking_id`, carrying an RFC 5545 RRULE plus optional `end_date`.
+//     A recurring "weekly companion dinner" creates one bookings row
+//     per planned visit (so the visit-level state machine retains
+//     per-visit granularity) and one booking_recurrence row that
+//     records the planning intent.
+//
+//   - TS-065 — `booking_disputes` ships in this iteration (sibling
+//     table keyed by `booking_id` capturing opener, reason, status,
+//     resolution_notes, resolved_at).
+//
+//   - `service_catalog`. The bookable-service catalog with PRD §5.4
+//     pricing bands (base_rate_min / base_rate_max), default
+//     duration, and admin-editable descriptions. Today the
+//     `service_kind` enum below is the source of truth for which
+//     service types exist; the catalog adds pricing / duration
+//     metadata and lands as a TS-060-followup (admin tooling owns
+//     the catalog table — TS-127/TS-128).
+//
+//   - `provider_metrics` (cross-service read projection — sits in
+//     service-provider). Refreshed off `booking.completed` events,
+//     not a write-side master row owned here.
+//
+// Cross-service references are by id only — never a foreign key into
+// another service schema (CLAUDE.md §2.3, §4.1). Specifically:
+//
+//   - `bookings.household_id` is a soft FK into `household.households.id`.
+//   - `bookings.senior_id`    is a soft FK into `household.seniors.id`.
+//   - `bookings.provider_id`  is a soft FK into `provider.providers.id`.
+//
+// Joins across these boundaries happen via the gateway BFF (TS-140)
+// or via events (TS-142), never via SQL JOIN.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. The feature has
+  // been production-stable since Prisma 5.0 even though it remains
+  // under the `previewFeatures` umbrella in 5.x.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `booking` Postgres schema. Every other
+  // service gets its own schema in the same database (Phase 1) or
+  // its own database entirely (Phase 3 — see PDD §7.2 final
+  // paragraph).
+  schemas  = ["booking"]
+}
+
+/// Booking lifecycle status — PRD §6.3 + PDD §9.2.
+///
+/// The full transition table lives in
+/// `src/modules/lifecycle/booking-status.ts` (pure TS, unit-tested).
+/// The summary:
+///
+/// ```
+/// pending      ──┬──▶ confirmed     ──┬──▶ in_progress  ──┬──▶ completed   (terminal)
+///                │                    │                   │
+///                └──▶ canceled        └──▶ canceled       └──▶ canceled    (terminal)
+/// ```
+///
+/// State semantics:
+///
+/// `pending`     = family submitted the booking; provider has not yet
+///                 accepted. Awaiting provider response (accept / decline)
+///                 within the `accept_window_expires_at` window
+///                 (TS-205; PRD §7.3 inbound booking requests with
+///                 accept/decline window).
+/// `confirmed`   = provider accepted; visit is on the calendar. The
+///                 dominant steady state between accept and the visit
+///                 day. Both family and provider can still cancel
+///                 subject to the cancellation policy.
+/// `in_progress` = provider has geo-checked-in on the visit day
+///                 (TS-063). The visit is happening; check-out
+///                 transitions to `completed`.
+/// `completed`   = provider checked out and submitted visit notes
+///                 (TS-062). Terminal state. Drives `booking.completed`
+///                 domain event consumed by accounting (commission
+///                 recognition), payouts (provider payable accrual),
+///                 notification (wellness summary email to family),
+///                 analytics (booking funnel).
+/// `canceled`    = booking canceled before completion. Terminal state.
+///                 The accounting service applies the cancellation
+///                 policy at the time of transition (refund vs.
+///                 forfeit) — TS-084.
+/// `declined`    = provider rejected the inbound booking request
+///                 before accepting (TS-205). Terminal state. Distinct
+///                 from `canceled` because the lifecycle position
+///                 differs — a decline happens BEFORE any commitment,
+///                 so the cancellation-policy refund/forfeit gate
+///                 (TS-084) intentionally does NOT fire. Drives
+///                 `booking.declined` domain event consumed by
+///                 notification (family-facing decline notice + route
+///                 back to concierge), analytics (provider decline-
+///                 rate trends), and TS-221 concierge requeue.
+///
+/// The terminal states (`completed`, `canceled`, `declined`) intentionally
+/// have no outgoing transitions. A "re-open completed booking" need
+/// maps to a dispute (TS-065 / `booking_disputes`), not a state-
+/// machine transition, so the audit trail of the original completion
+/// is preserved.
+enum BookingStatus {
+  pending
+  confirmed
+  in_progress
+  completed
+  canceled
+  declined
+
+  @@map("booking_status")
+  @@schema("booking")
+}
+
+/// Bookable service kind — PRD §6.3.
+///
+/// The fixed Phase-1 catalog of services a family can book. Each kind
+/// has its own pricing band, default duration, and matching-rules in
+/// service-provider's search index (TS-053). The
+/// (eventually-additively-added) `service_catalog` table holds the
+/// admin-editable pricing / duration metadata; this enum bounds the
+/// set of permissible values at the database level so a stray write
+/// can't introduce an unknown kind.
+///
+/// `companion_dining`       = Chef prepares and shares a meal with the
+///                            senior. The flagship service. PRD §16
+///                            glossary.
+/// `personal_chef_visit`    = Chef visits to prepare meals without
+///                            sharing the table. Lower-touch than
+///                            companion dining; suits seniors who
+///                            prefer to dine alone or with family.
+/// `grocery_coordination`   = Provider coordinates a grocery order or
+///                            shops on behalf of the household.
+/// `transportation`         = Provider transports the senior to a
+///                            medical appointment, social event, or
+///                            errand. PRD §2: "Loss of driving
+///                            privileges severs seniors from social,
+///                            cultural, and medical engagement."
+/// `social_outing`          = Provider accompanies the senior to a
+///                            museum, concert, restaurant, etc.
+///                            (PRD §6.6 concierge service request).
+/// `event_dining`           = Provider runs a holiday dinner or
+///                            birthday meal for the household
+///                            (PRD §6.6).
+/// `emergency_concierge`    = Rapid-response concierge for an urgent
+///                            household need. Tier 3 surface
+///                            (PRD §5.1 — "Concierge Lifestyle").
+///
+/// The trailing six are the Tier-3 concierge experiences (PRD §6.6,
+/// TS-220). Each is a curated, Elite-provider-only experience — the
+/// `service_catalog.required_provider_tier` column carries the gate
+/// (`elite`) per CLAUDE.md §12.
+///
+/// `holiday_dinner`         = Curated multi-course holiday dinner.
+/// `birthday_experience`    = Concierge-arranged birthday celebration.
+/// `tea_social`             = An afternoon tea social at home.
+/// `museum_outing`          = Curated museum / cultural outing with an
+///                            Elite companion (the Tier-3 counterpart of
+///                            the basic `social_outing`).
+/// `memory_meal`            = A biographically-meaningful "memory meal"
+///                            experience (PRD §16 glossary).
+/// `custom_request`         = A bespoke experience routed to the
+///                            household's dedicated concierge (PRD §6.6).
+enum ServiceKind {
+  companion_dining
+  personal_chef_visit
+  grocery_coordination
+  transportation
+  social_outing
+  event_dining
+  emergency_concierge
+  holiday_dinner
+  birthday_experience
+  tea_social
+  museum_outing
+  memory_meal
+  custom_request
+
+  @@map("service_kind")
+  @@schema("booking")
+}
+
+/// Provider marketplace tier (TS-220) — mirrors the contract
+/// `ProviderTierSchema` and service-provider's `ProviderTier` enum
+/// (basic / certified / elite). Service-booking holds its own copy
+/// because cross-service Prisma imports are barred (CLAUDE.md §2.3).
+///
+/// Used by `service_catalog.required_provider_tier` to express the
+/// minimum tier a household must book to fulfil a service kind.
+/// `elite` is the only tier eligible to fulfil a Tier-3 Concierge
+/// experience (CLAUDE.md §12).
+///
+/// NOTE: `ProviderTierSnapshotTier` (TS-064) covers the same value
+/// domain for the per-booking provider-tier cache. The two enums are
+/// intentionally separate today (distinct DB type names, distinct
+/// concerns); consolidating them into one shared enum is a carved
+/// follow-up (TS-220-followup-2).
+enum ProviderTier {
+  basic
+  certified
+  elite
+
+  @@map("provider_tier")
+  @@schema("booking")
+}
+
+/// Service catalog (TS-060-followup-2) — the admin-editable pricing /
+/// duration metadata layer that sits beside the `service_kind` enum
+/// (PRD §5.4 / §6.3; PDD §8.2 booking-schema column inventory).
+///
+/// TS-060 shipped the `service_kind` enum + the `bookings.service_kind`
+/// column (the catalog of *which* services exist). This table adds the
+/// *metadata* for each kind: a per-kind rate band (`base_rate_min` /
+/// `base_rate_max`), a default visit duration, an operator-editable
+/// display name + description, and an `active` flag.
+///
+/// **One row per kind.** `kind` is UNIQUE — the admin upsert
+/// (`PUT /api/v1/admin/service-catalog/:kind`) keys on it. Per-region /
+/// per-tier band overrides are a Phase-3 concern that lands additively
+/// (a nullable `region_code` column + a composite unique key) without
+/// breaking the one-row-per-kind read.
+///
+/// **Money columns** (`base_rate_min`, `base_rate_max`). Stored as
+/// `Decimal(12,2)` with an explicit `currency` `Char(3)` per
+/// CLAUDE.md §4.1 — **never floats** (CLAUDE.md §17.6). The wire shape
+/// is integer minor units; `src/common/money.ts` crosses the boundary.
+///
+/// **Soft retirement.** `active = false` removes a kind from pickers
+/// without deleting the row, so historical bookings stay readable. The
+/// `service_kind` enum still bounds the set of permissible values at
+/// the DB level; the catalog row is the soft-editable layer on top.
+///
+/// **Seeded** idempotently by `pnpm seed:catalog`
+/// (`src/modules/catalog/seed.ts`) with the seven Phase-1 service kinds.
+/// Reseeds refresh only the operator-editable columns (never `id` /
+/// `created_at`), so a hand-edited row's identity is preserved.
+model ServiceCatalogEntry {
+  id                   String        @id @default(cuid())
+  /// The bookable service kind this row describes. UNIQUE — exactly one
+  /// catalog row per kind in Phase 1 (the upsert key).
+  kind                 ServiceKind   @unique
+  /// Operator-editable display name for the family-portal picker.
+  name                 String
+  /// Operator-editable description rendered next to the picker.
+  description          String
+  /// Rate-band floor — the bottom of the expected price window for this
+  /// kind, in the row's `currency`. `Decimal(12,2)`, never a float.
+  baseRateMin          Decimal       @map("base_rate_min") @db.Decimal(12, 2)
+  /// Rate-band ceiling. Guaranteed ≥ `base_rate_min` at the service
+  /// layer (the contract `superRefine` + the service upsert both reject
+  /// an inverted band).
+  baseRateMax          Decimal       @map("base_rate_max") @db.Decimal(12, 2)
+  /// Default visit length in minutes — the booking-create quote will
+  /// multiply the band by this once TS-060-followup-2a wires it.
+  durationMinutes      Int           @map("duration_minutes")
+  /// ISO 4217 currency code (e.g. `USD`). Phase 1 launches USD-only
+  /// (PDD §11.4); the column is forward-compatible with the Phase-3
+  /// multi-currency rollout.
+  currency             String        @db.Char(3)
+  /// Soft-retirement flag — `false` hides the kind from pickers without
+  /// deleting the row.
+  active               Boolean       @default(true)
+  /// Minimum provider tier required to fulfil this kind (TS-220).
+  /// `null` = any tier (the basic-marketplace default); the Tier-3
+  /// concierge experiences (PRD §6.6) carry `elite` per CLAUDE.md §12.
+  /// Metadata only in TS-220 — the booking-create enforcement that
+  /// reads it is the carved follow-up TS-220-followup-1.
+  requiredProviderTier ProviderTier? @map("required_provider_tier")
+  /// Zero-based UI sort order within the catalog.
+  sortPosition         Int           @map("sort_position")
+  createdAt            DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Powers the dominant read: "list the active catalog in sort order"
+  /// (`GET /api/v1/service-catalog`). Partial-by-`active` is the natural
+  /// follow-up once retired kinds accumulate; today the catalog is tiny
+  /// (seven rows) so the composite index suffices.
+  @@index([active, sortPosition], map: "service_catalog_active_sort_idx")
+  @@map("service_catalog")
+  @@schema("booking")
+}
+
+/// Booking — the row that records every chef visit, companion dining
+/// session, concierge service request, or grocery coordination booking
+/// on the platform.
+///
+/// **One row per planned visit**. A recurring "weekly companion
+/// dinner" (TS-061) explodes into one bookings row per planned visit
+/// plus one `booking_recurrence` row that records the planning
+/// intent. The visit-level state machine retains per-visit
+/// granularity so the accounting service can recognize commission
+/// revenue per completed visit, not per recurring series.
+///
+/// **Tier gating** (TS-064 / CLAUDE.md §12 / PRD §5.1). The booking
+/// service enforces "Tier 3 Concierge households can only book Elite
+/// Concierge providers" at the SERVICE LAYER, not the controller —
+/// the row carries `householdId` + `providerId` and the orchestration
+/// service consults service-household for the tier and
+/// service-provider for the tier-gating decision via gateway
+/// aggregation or events. The column shape here is forward-compatible
+/// with that gate.
+///
+/// **Money columns** (`base_price`, `commission_rate`,
+/// `commission_amount`, `final_price`). Stored as `Decimal(12,2)` with
+/// an explicit `currency` column per CLAUDE.md §4.1. **Never floats**
+/// (CLAUDE.md §17.6). The cents-grade precision matches PDD §11.2 /
+/// Appendix A. Rate is stored as a 0..1 Decimal (e.g. 0.30 for the
+/// 30% basic-tier commission); the absolute commission_amount is
+/// recomputed on each price change and stored to avoid drift between
+/// rate and amount in historical reads. `final_price` = `base_price`
+/// minus discounts / plus tax / etc. — the row that the customer
+/// is charged for, which can drift from base + commission at
+/// settlement time (TS-084 contra-revenue / refunds).
+///
+/// **Soft FKs** — `householdId` → `household.households.id`,
+/// `seniorId` → `household.seniors.id`, `providerId` →
+/// `provider.providers.id`. No Prisma relations because cross-service
+/// FKs are barred by CLAUDE.md §2.3 / §4.1. Joins via the gateway BFF
+/// (TS-140) or via events (TS-142).
+///
+/// **`scheduledStart` / `scheduledEnd`** — both `Timestamptz(6)` for
+/// timezone-aware reads. The provider's `time_zone` (lives on the
+/// providers row) is used at presentation time; the row stores UTC
+/// + offset so the booking calendar renders correctly regardless of
+/// where the family viewer is located.
+///
+/// **`canceledAt` / `completedAt`** — denormalised stamps that mirror
+/// the lifecycle transition timestamps. Repeated in the row (rather
+/// than only on the corresponding check-in / dispute row) so the
+/// dominant "show me this provider's recent completed bookings" query
+/// avoids a JOIN. Stamped exactly once on the transition into the
+/// matching terminal state by the lifecycle orchestration service
+/// (TS-060-followup-1).
+///
+/// **`cancellationReason`** — free-form for ops triage. Bounded at
+/// the contract layer; the column accepts up to 2000 chars.
+model Booking {
+  id                     String        @id @default(cuid())
+  /// Soft FK into `household.households.id`. Never declare a Prisma
+  /// relation here — cross-service relations would couple the two
+  /// services' Prisma clients and violate CLAUDE.md §2.3 / §4.1.
+  householdId            String        @map("household_id")
+  /// Soft FK into `household.seniors.id`. Identifies the senior the
+  /// visit is for (a household can have multiple seniors — e.g. a
+  /// married couple — and bookings target one of them).
+  seniorId               String        @map("senior_id")
+  /// Soft FK into `provider.providers.id`. Identifies the provider
+  /// fulfilling the booking. Set at create time after match logic
+  /// (manual matching by ops in Phase 1 — PRD §6.3 + PDD §28 Phase 1
+  /// item #4).
+  providerId             String        @map("provider_id")
+  serviceKind            ServiceKind   @map("service_kind")
+  status                 BookingStatus @default(pending)
+  scheduledStart         DateTime      @map("scheduled_start") @db.Timestamptz(6)
+  scheduledEnd           DateTime      @map("scheduled_end") @db.Timestamptz(6)
+  /// ISO 4217 currency code (e.g. `USD`). Phase 1 launches USD-only
+  /// (PDD §11.4 / PRD §1); the column is forward-compatible with the
+  /// multi-currency rollout in Phase 3.
+  currency               String        @db.Char(3)
+  /// Provider's quoted price for the visit, before commission, before
+  /// any discount, in the row's `currency`. Stored as
+  /// `Decimal(12,2)` — never floats.
+  basePrice              Decimal       @map("base_price") @db.Decimal(12, 2)
+  /// Commission rate at booking time. Captured as a 0..1 Decimal
+  /// (e.g. 0.30 = 30%). Stored alongside `commissionAmount` so
+  /// historical reads don't drift from the snapshot taken at booking
+  /// confirmation. Rate is derived from the provider's tier at
+  /// confirmation time per PRD §5.4.
+  commissionRate         Decimal       @map("commission_rate") @db.Decimal(5, 4)
+  /// Absolute commission amount = `basePrice * commissionRate`,
+  /// rounded once per CLAUDE.md §6 ("Round once, at presentation").
+  /// Persisted to avoid recomputing on every read.
+  commissionAmount       Decimal       @map("commission_amount") @db.Decimal(12, 2)
+  /// Final charged amount = `basePrice` minus discounts / plus tax.
+  /// The number the customer is charged. Can drift from `basePrice`
+  /// once TS-043 coupon redemptions / TS-084 tax + refund handling
+  /// land.
+  finalPrice             Decimal       @map("final_price") @db.Decimal(12, 2)
+  /// Free-text notes from the family at create time (allergies,
+  /// preferences, door code instructions, etc.). Bounded at the
+  /// contract layer; never logged in plaintext (CLAUDE.md §3.9
+  /// PII discipline).
+  bookingNotes           String?       @map("booking_notes")
+  /// Stamped exactly once on the transition into `completed` by the
+  /// lifecycle orchestration service (TS-060-followup-1). Drives
+  /// `booking.completed` event timing for accounting / payouts /
+  /// notification consumers.
+  completedAt            DateTime?     @map("completed_at") @db.Timestamptz(6)
+  /// Stamped exactly once on the transition into `canceled`. Paired
+  /// with `cancellationReason` for ops triage. Drives the cancellation
+  /// policy decision in TS-084.
+  canceledAt             DateTime?     @map("canceled_at") @db.Timestamptz(6)
+  /// Categorical cancellation reason — validated against the
+  /// `BookingCancellationReason` enum at the contract layer
+  /// (`packages/contracts/src/events/booking.ts`). The column stays
+  /// TEXT in DB so adding a new categorical value doesn't require a
+  /// `CREATE TYPE` migration; the contract is the source of truth.
+  /// Persisted so `GET /api/v1/bookings/:id` returns it without
+  /// joining to the cancellation event row.
+  cancellationReason     String?       @map("cancellation_reason")
+  /// Free-form ops-triage detail accompanying a cancellation. Bounded
+  /// at the contract layer (≤2000 chars). Never logged in plaintext
+  /// (CLAUDE.md §3.9 PII discipline).
+  cancellationReasonText String?       @map("cancellation_reason_text")
+  /// Actor that drove the cancellation — the authenticated `userId`
+  /// from `PATCH /api/v1/bookings/:id/status` (TS-308c).
+  ///
+  /// **Why this column exists.** The `booking.canceled` event has
+  /// always carried `canceledByUserId`, but the row did not, so the
+  /// only durable record of who cancelled a visit was an outbox entry
+  /// that gets relayed and pruned. The decline path has recorded its
+  /// actor since TS-205 (`declined_by_user_id`, directly below); this
+  /// closes the same gap on the cancel path, and gives the TS-308c
+  /// mass-cancellation detector the one signal that separates "one
+  /// person walked away from a day of visits" from "eight families
+  /// independently cancelled on the same provider".
+  ///
+  /// **Null on every row cancelled before this column landed**, and
+  /// backfill is impossible — the actor is not recoverable from the
+  /// row. Anything reading it must treat null as "unknown", never as
+  /// "system": the detector counts those separately and puts the
+  /// number on its event so a reviewer knows the actor count is a
+  /// floor rather than a fact.
+  ///
+  /// Deliberately NOT exposed on `BookingResponse`. Who cancelled a
+  /// visit is a disclosure decision per audience (the same call
+  /// TS-304-followup-1 carries for holds), not a mapper default.
+  canceledByUserId       String?       @map("canceled_by_user_id")
+  /// WHAT KIND of actor cancelled, derived at the controller boundary
+  /// from the verified access token's `roles` claim (TS-308c-followup-3).
+  ///
+  /// **Why a kind and not a role.** CLAUDE.md §2.3 forbids service-booking
+  /// from resolving who a user id belongs to — those directories live in
+  /// service-provider and service-household. But the token already
+  /// answers one question authoritatively, and it is the only one this
+  /// column needs: is the caller platform STAFF. `holdsAdminRole` from
+  /// `@taste-and-see/auth-sdk` is the same predicate identity uses for
+  /// the staff MFA gate, so there is one definition of "staff" across
+  /// issuer and verifier.
+  ///
+  /// **Why it exists.** When a provider leaves the platform, ops cancels
+  /// their remaining bookings — one admin acting once, which tripped the
+  /// TS-308c provider threshold immediately and opened a `conduct`
+  /// incident on somebody who had already gone. That noise is legible in
+  /// triage but it is still an incident nobody needed, and tuning the
+  /// threshold down while it exists would fit the threshold to noise.
+  ///
+  /// **Null means unknown, never "customer"** — every row cancelled
+  /// before this column landed, and backfill is impossible for the same
+  /// reason `canceled_by_user_id` cannot be backfilled. The detector
+  /// therefore excludes only rows explicitly marked `staff`; an unknown
+  /// row still counts, which errs toward opening an incident rather than
+  /// toward missing one.
+  ///
+  /// Deliberately NOT on `BookingResponse`, for the same reason as
+  /// `canceled_by_user_id`.
+  canceledByActorKind    BookingCancelActorKind? @map("canceled_by_actor_kind")
+  /// Provider accept window (TS-205; PRD §7.3). Stamped at create time
+  /// as `createdAt + BOOKING_ACCEPT_WINDOW_MINUTES` (env-configurable,
+  /// default 30 min). After this moment, the auto-decline worker
+  /// (TS-205-followup-1) transitions the booking to `declined` with
+  /// `decline_kind = 'window_expired'`; the accept endpoint refuses
+  /// past-window accepts even without the worker (Phase-1 stop-gap).
+  /// Nullable to support back-fill of pre-TS-205 rows and future
+  /// admin-created bookings (TS-128) that bypass the window.
+  acceptWindowExpiresAt  DateTime?     @map("accept_window_expires_at") @db.Timestamptz(6)
+  /// Stamped exactly once on the transition into `declined` (TS-205).
+  /// Paired with the `decline_kind` / `decline_reason` / `decline_reason_text`
+  /// / `declined_by_user_id` quartet so the audit trail of WHO
+  /// declined and WHY is preserved on the row.
+  declinedAt             DateTime?     @map("declined_at") @db.Timestamptz(6)
+  /// Categorical kind of decline (`provider_declined` / `window_expired`
+  /// / `admin_declined`) — see `BookingDeclineKindSchema` at the
+  /// contract layer for the full doc. Stays TEXT in DB so adding a
+  /// future categorical value doesn't require a `CREATE TYPE` migration.
+  declineKind            String?       @map("decline_kind")
+  /// Categorical decline reason — validated against the
+  /// `BookingDeclineReason` enum at the contract layer. Null when the
+  /// `decline_kind` is `window_expired` (the worker has no input
+  /// reason from a human). TEXT in DB for the same reason as
+  /// `decline_kind`.
+  declineReason          String?       @map("decline_reason")
+  /// Free-form ops-triage detail accompanying a decline. Bounded at
+  /// the contract layer (≤2000 chars). Never logged in plaintext
+  /// (CLAUDE.md §3.9 PII discipline).
+  declineReasonText      String?       @map("decline_reason_text")
+  /// Actor that drove the decline. For `provider_declined`, the
+  /// provider's `userId`. For `admin_declined`, the admin's `userId`.
+  /// For `window_expired`, a synthetic system-actor id stamped by the
+  /// worker (e.g. `sys:booking-window-watcher`).
+  declinedByUserId       String?       @map("declined_by_user_id")
+  /// Recurring-series id (TS-061). When set, this row is a member of
+  /// a recurring series materialised by `POST /api/v1/bookings/recurring`;
+  /// every sibling occurrence carries the same value. Null on
+  /// one-off (non-recurring) bookings created via
+  /// `POST /api/v1/bookings`. Soft FK into `booking.booking_recurrence.series_id`.
+  /// Lives on this row (rather than only on the recurrence row) so the
+  /// dominant "show me this household's upcoming series" query is a
+  /// single index range rather than a JOIN.
+  seriesId               String?       @map("series_id")
+  /// Zero-based position of this occurrence within the recurring
+  /// series (TS-061). 0 = first occurrence (the anchor the caller
+  /// supplied), 1 = next per the RRULE, etc. Null when `seriesId` is
+  /// null. The (`seriesId`, `seriesIndex`) pair is unique within the
+  /// series — enforced at the database layer for additional defence.
+  seriesIndex            Int?          @map("series_index")
+  /// Trust & safety hold (TS-304). Non-null means this visit is
+  /// SUSPENDED pending the review committee's closure of the named
+  /// incident; the value is a soft reference to
+  /// `trust_safety.incidents.id`.
+  ///
+  /// **Why a column and not a `BookingStatus` value.** `held` is not
+  /// mutually exclusive with what the booking already is — a held
+  /// booking is still `pending` (awaiting the provider) or `confirmed`
+  /// (accepted, now frozen), and it returns to exactly that state when
+  /// the hold lifts. Modelling it as a status would also mean editing
+  /// `BOOKING_STATUS_TRANSITIONS`, whose exhaustive from×to matrix and
+  /// derived `TERMINAL_BOOKING_STATUSES` are deliberately frozen. A
+  /// suspension is an orthogonal axis, so it gets an orthogonal column.
+  ///
+  /// Carrying the incident id (rather than a boolean) is what makes the
+  /// hold auditable and reversible: the release path finds exactly the
+  /// rows a given incident stopped, and an operator looking at one
+  /// booking can answer "held by what?" without a scan.
+  ///
+  /// When two open incidents cover the same booking this records the
+  /// one that held it FIRST; on release the row is re-evaluated against
+  /// every still-active hold and either re-stamped with the survivor or
+  /// cleared. See `SubjectHoldsService` for that logic.
+  heldByIncidentId       String?       @map("held_by_incident_id")
+  /// When the hold was applied — the incident's `openedAt`, not the
+  /// consumer's processing time, so a redelivered or backfilled hold
+  /// does not appear to have started late. Always set together with
+  /// `heldByIncidentId`; a DB CHECK enforces the pairing so a
+  /// half-written hold is unrepresentable.
+  heldAt                 DateTime?     @map("held_at") @db.Timestamptz(6)
+  createdAt              DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Defence-in-depth uniqueness on the (series, position) pair so a
+  /// concurrent re-explode of the same series can't double-write a
+  /// position. The service guarantees uniqueness at the transaction
+  /// layer; the DB unique index is belt-and-braces.
+  @@unique([seriesId, seriesIndex], map: "bookings_series_index_unique_idx")
+  /// Powers "show me this household's upcoming bookings" — the
+  /// dominant family-portal read path. Composite ordering is
+  /// (householdId, scheduledStart) so the planner-style UI gets a
+  /// scan, not a sort.
+  @@index([householdId, scheduledStart], map: "bookings_household_scheduled_idx")
+  /// Powers "show me this provider's upcoming bookings" — the
+  /// dominant provider-portal read path.
+  @@index([providerId, scheduledStart], map: "bookings_provider_scheduled_idx")
+  /// Powers the ops queue ("show me every booking still in `pending`
+  /// awaiting provider response"). Selective at scale because the
+  /// long-lived states are `confirmed` / `completed` (most rows) and
+  /// `pending` is short-lived by design.
+  @@index([status], map: "bookings_status_idx")
+  /// Powers "show me this senior's bookings" for the family wellness
+  /// summary aggregations (PRD §6.4 / §6.9).
+  @@index([seniorId, scheduledStart], map: "bookings_senior_scheduled_idx")
+  /// Powers "show me every occurrence in this recurring series",
+  /// ordered chronologically. Partial-index-by-`seriesId IS NOT NULL`
+  /// is the natural follow-up once non-recurring bookings dominate
+  /// (TS-061-followup); the index is materialised in the migration SQL
+  /// since Prisma's `@@index` can't express the predicate.
+  @@index([seriesId, scheduledStart], map: "bookings_series_scheduled_idx")
+  /// Powers the TS-205-followup-1 auto-decline scheduler — the worker
+  /// scans for `status = 'pending' AND accept_window_expires_at <= now()`.
+  /// The partial index expression (`WHERE status = 'pending' AND
+  /// accept_window_expires_at IS NOT NULL`) is materialised in the
+  /// companion migration SQL — Prisma's `@@index` cannot express the
+  /// partial predicate.
+  @@index([acceptWindowExpiresAt], map: "bookings_accept_window_pending_idx")
+  /// Powers the TS-304 release sweep ("clear every booking this incident
+  /// held") and the ops "what is currently suspended" read. Steady state
+  /// is overwhelmingly NULL, so the migration materialises this as a
+  /// PARTIAL index on `held_by_incident_id IS NOT NULL` — Prisma's
+  /// `@@index` cannot express the predicate (CLAUDE.md §7.3).
+  @@index([heldByIncidentId], map: "bookings_held_by_incident_idx")
+  /// Powers the TS-308c mass-cancellation sweep, which scans every
+  /// booking cancelled inside a rolling window. Cancellations are a
+  /// small minority of rows in steady state, so the migration
+  /// materialises this as a PARTIAL index on `canceled_at IS NOT NULL`
+  /// — Prisma's `@@index` cannot express the predicate (CLAUDE.md
+  /// §7.3). Without it the sweep is a full sequential scan of
+  /// `bookings` every tick; see the migration for the EXPLAIN.
+  @@index([canceledAt], map: "bookings_canceled_at_idx")
+  @@map("bookings")
+  @@schema("booking")
+}
+
+/// What kind of actor cancelled a booking (TS-308c-followup-3).
+///
+/// **Two values, and the coarseness is the point.** The verified access
+/// token can answer "is this caller platform staff" authoritatively —
+/// that is the same predicate identity uses for the staff MFA gate — but
+/// it cannot tell service-booking whether a non-staff caller is the
+/// provider on this visit or a member of the household, because that is a
+/// lookup in another service's schema (CLAUDE.md §2.3). A third value
+/// pretending otherwise would be a claim we cannot support.
+///
+/// `staff` is the value with teeth: the mass-cancellation detector
+/// excludes those rows, because ops closing out a departed provider's
+/// calendar is one admin acting once and must not read as that provider
+/// abandoning their clients.
+enum BookingCancelActorKind {
+  staff
+  customer
+
+  @@map("booking_cancel_actor_kind")
+  @@schema("booking")
+}
+
+/// Trust & safety subject-hold kinds (TS-304).
+///
+/// Which of the three independent subjects an incident named. A hold row
+/// exists per (incident, subject) pair, so one incident naming a provider,
+/// a senior, and a household produces three rows — each independently
+/// matched when a new booking is screened.
+enum BookingSubjectHoldKind {
+  provider
+  senior
+  household
+
+  @@map("booking_subject_hold_kind")
+  @@schema("booking")
+}
+
+/// Trust & safety subject hold (TS-304; PRD §10.14; PDD §16.1;
+/// CLAUDE.md §12).
+///
+/// **Why this table exists alongside `bookings.held_by_incident_id`.** The
+/// two answer different questions and neither can answer the other's:
+///
+///   - The `bookings` columns answer "is THIS visit suspended, and why" —
+///     the per-row marker the family portal, the provider portal, and the
+///     check-out gate read.
+///   - This table answers "is this SUBJECT under a hold right now" — which
+///     is what `createBooking` must ask BEFORE any row exists. Deriving it
+///     from the `bookings` rows would silently allow a brand-new booking
+///     for a suspended provider whose existing visits had all completed,
+///     or for a household that had none at all. That is precisely the case
+///     the hold exists to stop.
+///
+/// **Query the design starts from** (CLAUDE.md §4.1): "give me every active
+/// hold covering any of {providerId, seniorId, householdId}", run once per
+/// booking-create and once per recurring-series create. Served by the
+/// partial index on `(subject_kind, subject_id) WHERE released_at IS NULL`
+/// materialised in the migration — active holds are a tiny fraction of the
+/// table's lifetime rows.
+///
+/// **Idempotency (CLAUDE.md §5.3).** `sourceEventId` is UNIQUE: the
+/// domain-level guard against redelivery, independent of the consumer
+/// SDK's `outbox_consumer_dedup` table. The `(incidentId, subjectKind,
+/// subjectId)` UNIQUE is the second: a re-delivered hold request under a
+/// *different* event id still cannot double-hold the same subject. Rows
+/// are never deleted — a release stamps `releasedAt`, so the history of
+/// what was suspended and for how long survives the closure.
+model BookingSubjectHold {
+  id             String                 @id @default(cuid())
+  /// Soft FK into `trust_safety.incidents.id` — the hold's reason. Never
+  /// a Prisma relation: cross-service relations are barred
+  /// (CLAUDE.md §2.3 / §4.1).
+  incidentId     String                 @map("incident_id")
+  subjectKind    BookingSubjectHoldKind @map("subject_kind")
+  /// The subject's id — a `provider.providers.id`,
+  /// `household.seniors.id`, or `household.households.id` depending on
+  /// `subjectKind`. Soft reference, same reasoning as `incidentId`.
+  subjectId      String                 @map("subject_id")
+  /// The incident severity that triggered the hold, snapshotted. Kept for
+  /// the ops read and the family-facing copy decision; the PREDICATE that
+  /// produced the hold is trust & safety's and is never re-derived here
+  /// (see `trust_safety/booking-hold-policy.ts`).
+  severity       String
+  /// Incident category, snapshotted for the same reason as `severity`.
+  category       String
+  /// The incident's `openedAt`, carried on the event — not the
+  /// consumer's processing time.
+  heldAt         DateTime               @map("held_at") @db.Timestamptz(6)
+  /// Null while the hold is ACTIVE. Stamped from the release event's
+  /// `releasedAt` (the committee's decision moment) when the incident
+  /// closes. Never cleared back to null: a re-opened concern is a new
+  /// incident with a new hold, not a resurrected row.
+  releasedAt     DateTime?              @map("released_at") @db.Timestamptz(6)
+  /// `eventId` of the `trust_safety.booking_hold.requested` that created
+  /// this row. Part of the domain-level redelivery guard — see the
+  /// `(sourceEventId, subjectKind)` UNIQUE below for why the kind is in
+  /// the key.
+  sourceEventId  String                 @map("source_event_id")
+  /// `eventId` of the `.released` that lifted it. Null while active.
+  releaseEventId String?                @map("release_event_id")
+  createdAt      DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime               @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// The domain idempotency key — a redelivered request is a no-op.
+  ///
+  /// Keyed on (event, KIND) rather than the event alone because ONE
+  /// `.requested` legitimately produces up to three rows: an incident may
+  /// name a provider, a senior, and a household, and each is held
+  /// independently. A bare `sourceEventId` UNIQUE would reject the second
+  /// and third rows of a perfectly valid hold order.
+  @@unique([sourceEventId, subjectKind], map: "booking_subject_holds_source_event_kind_unique_idx")
+  /// Second guard: one hold per (incident, subject) regardless of how
+  /// many times the request arrives or under what event id.
+  @@unique([incidentId, subjectKind, subjectId], map: "booking_subject_holds_incident_subject_unique_idx")
+  /// Powers the release sweep ("every hold this incident placed").
+  @@index([incidentId], map: "booking_subject_holds_incident_idx")
+  /// The hot read — "is this subject held?". Materialised in the
+  /// migration as a PARTIAL index on `released_at IS NULL`; Prisma's
+  /// `@@index` cannot express the predicate (CLAUDE.md §7.3).
+  @@index([subjectKind, subjectId], map: "booking_subject_holds_active_subject_idx")
+  @@map("booking_subject_holds")
+  @@schema("booking")
+}
+
+/// Consumer-side redelivery guard for events this service CONSUMES
+/// (TS-304; PDD §7.3; CLAUDE.md §5.3).
+///
+/// Canonical shape shared by every consuming service (service-accounting,
+/// service-analytics, service-audit, service-trust-safety) — the
+/// `@taste-and-see/nest-outbox-consumer` SDK is schema-agnostic and owns
+/// every write to this table via `PgConsumerDedupStore`. Service code
+/// should never read or write it directly.
+///
+/// Service-booking was producer-only through TS-303: it appends
+/// `booking.*` events and listened to nothing. TS-304 makes it a consumer
+/// for the first time, so it gains this table.
+///
+/// This is the SDK's SECONDARY line of defence. The primary is the
+/// domain-level `booking_subject_holds.source_event_id` UNIQUE, so a
+/// truncated dedup table still cannot double-apply a hold.
+model OutboxConsumerDedup {
+  consumerGroup  String    @map("consumer_group")
+  eventId        String    @map("event_id")
+  eventName      String    @map("event_name")
+  /// `in_flight` | `processed` | `dead_lettered` — a DB CHECK pins the
+  /// vocabulary (the SDK owns the transitions).
+  state          String
+  attempts       Int       @default(1)
+  lastError      String?   @map("last_error")
+  firstSeenAt    DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  lastAttemptAt  DateTime  @default(now()) @map("last_attempt_at") @db.Timestamptz(6)
+  processedAt    DateTime? @map("processed_at") @db.Timestamptz(6)
+  deadLetteredAt DateTime? @map("dead_lettered_at") @db.Timestamptz(6)
+
+  @@id([consumerGroup, eventId])
+  /// The ops "what is stuck in the dead-letter queue" read. Materialised
+  /// in the migration as a PARTIAL index on `dead_lettered_at IS NOT
+  /// NULL` — steady state is overwhelmingly `processed` rows.
+  @@index([consumerGroup, deadLetteredAt], map: "booking_outbox_consumer_dedup_dead_lettered_idx")
+  @@map("outbox_consumer_dedup")
+  @@schema("booking")
+}
+
+/// Booking recurrence (TS-061) — captures the planning intent for a
+/// recurring series. One row per series, keyed by `series_id` (the
+/// same value that lands on every child `bookings.series_id`).
+///
+/// **Schema design rationale.** The series materialises a finite set
+/// of child `bookings` rows at create time (one row per planned
+/// visit) so the lifecycle state machine retains per-visit
+/// granularity. The recurrence row records the RRULE + the
+/// termination clause so a future "edit the series" surface
+/// (TS-061-followup) has a single source of truth without scanning
+/// the child rows.
+///
+/// **Phase-1 RRULE subset.** The expander in
+/// `src/modules/recurrence/rrule-expander.ts` supports FREQ=WEEKLY or
+/// MONTHLY with optional INTERVAL=N, terminated by COUNT or UNTIL.
+/// Unsupported clauses surface as a typed `unsupported_rrule_clause`
+/// failure at the service boundary; the column stays TEXT so future
+/// RFC 5545 coverage can land without a schema change.
+///
+/// **Termination columns.** Exactly one of `end_date` (resolved UNTIL)
+/// and `count` (resolved COUNT) is non-null per row; both nullable so
+/// adding a future open-ended (no termination) variant — gated by a
+/// product policy decision — lands additively. The Phase-1 expander
+/// rejects RRULEs that carry neither.
+///
+/// **`occurrence_count`** records how many child rows the expander
+/// materialised. Stored at create time so reads avoid a COUNT(*) over
+/// the bookings table — non-trivial in time-shifted reads where
+/// individual child rows may have been canceled.
+model BookingRecurrence {
+  /// Recurring series identifier — the value every child booking
+  /// carries on `bookings.series_id`. Generated by the service at
+  /// create time; never client-supplied (CLAUDE.md §3.3).
+  seriesId        String    @id @map("series_id")
+  /// Raw RFC 5545 RRULE string (e.g. `FREQ=WEEKLY;INTERVAL=2;COUNT=12`).
+  /// Bounded at the contract layer; stored verbatim so a future full
+  /// RFC 5545 expander can re-parse without information loss.
+  rrule           String    @db.VarChar(500)
+  /// Resolved UNTIL timestamp from the RRULE (if specified). UTC.
+  /// Nullable when the termination is COUNT-based.
+  endDate         DateTime? @map("end_date") @db.Timestamptz(6)
+  /// Resolved COUNT from the RRULE (if specified). Nullable when the
+  /// termination is UNTIL-based. Bounded 1..52 at the contract layer.
+  count           Int?
+  /// Number of child bookings the expander materialised. Bounded
+  /// 1..RECURRENCE_MAX_OCCURRENCES. Stored to keep read paths off the
+  /// bookings table for the series-size query.
+  occurrenceCount Int       @map("occurrence_count")
+  /// Soft FK into `household.households.id` — same shape as
+  /// `Booking.householdId`. Captured here too so the recurrence row
+  /// is self-contained for ops audit (and for the family-portal
+  /// "list my series" query, which doesn't need a JOIN to bookings).
+  householdId     String    @map("household_id")
+  /// Soft FK into `household.seniors.id` — same shape as
+  /// `Booking.seniorId`.
+  seniorId        String    @map("senior_id")
+  /// Soft FK into `provider.providers.id` — same shape as
+  /// `Booking.providerId`.
+  providerId      String    @map("provider_id")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Powers "list this household's recurring series" — the family-
+  /// portal's series-management surface (TS-121).
+  @@index([householdId, createdAt], map: "booking_recurrence_household_created_idx")
+  /// Powers "list this provider's recurring series" — the provider
+  /// portal's calendar surface (TS-122).
+  @@index([providerId, createdAt], map: "booking_recurrence_provider_created_idx")
+  @@map("booking_recurrence")
+  @@schema("booking")
+}
+
+/// Outbox row — booking domain events emitted transactionally with
+/// the booking-row mutation per the outbox pattern (PDD §7.3,
+/// CLAUDE.md §5.3). Shape is identical to every other producer
+/// service's `outbox_events` table; the `@taste-and-see/nest-outbox`
+/// SDK is schema-agnostic and consumes this table via raw SQL inside
+/// the caller's Prisma `$transaction`.
+///
+/// The relay worker (`apps/workers/outbox-relay`) polls
+/// `WHERE dispatched_at IS NULL ORDER BY created_at` via its own
+/// `pg` pool — NOT through this Prisma client — so cross-service
+/// reads stay outside the service's Prisma boundary
+/// (CLAUDE.md §2.3 / §4.1).
+model OutboxEvent {
+  /// Dedup key — consumers must idempotency-check on this. UUID v4
+  /// generated by the SDK by default; producers may pass an explicit
+  /// id for cross-boundary exactly-once-effective delivery.
+  eventId         String    @id @map("event_id")
+  /// Dot-notation event name from `packages/contracts/events`. The
+  /// SDK validates the name against the registry before inserting
+  /// — unknown names are rejected at the producer boundary.
+  eventName       String    @map("event_name")
+  /// Validated domain payload (validated by the SDK against the
+  /// matching `eventRegistry` schema before insert).
+  payload         Json
+  /// Producer wall-clock time the event semantically happened. May
+  /// differ from `created_at` for backfilled events.
+  occurredAt      DateTime  @map("occurred_at") @db.Timestamptz(6)
+  /// Service name that produced the row (`service-booking`). Useful
+  /// for relay observability + per-service throughput metrics.
+  producerService String    @map("producer_service")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Stamped by the relay when the row has been successfully
+  /// forwarded onto the bus. Null means undispatched + eligible for
+  /// the next poll cycle.
+  dispatchedAt    DateTime? @map("dispatched_at") @db.Timestamptz(6)
+  /// Failed dispatch counter. The relay stops retrying once this
+  /// reaches `MAX_ATTEMPTS` — those rows are dead-lettered for ops
+  /// attention (surfaced via metrics + an admin endpoint).
+  attempts        Int       @default(0)
+  /// Stamped by the relay on the most recent failed attempt.
+  lastAttemptAt   DateTime? @map("last_attempt_at") @db.Timestamptz(6)
+  /// Most recent failure message — capped at 2000 chars at the
+  /// relay's record-failure path.
+  lastError       String?   @map("last_error")
+
+  /// Relay's dominant read query: "give me the next batch of
+  /// undispatched rows ordered by created_at". A partial index on
+  /// `dispatched_at IS NULL` keeps the index footprint bounded
+  /// against an ever-growing table (the table is append-only; the
+  /// partial filter is highly selective at steady state).
+  ///
+  /// Prisma's `@@index` cannot directly express the partial
+  /// predicate; the index is materialised in the migration SQL
+  /// (TS-060-followup-1).
+  @@index([eventName], map: "outbox_events_event_name_idx")
+  @@map("outbox_events")
+  @@schema("booking")
+}
+
+/// Visit-note mood scale (TS-062; PRD §6.4 / §7.4).
+///
+/// Coarse-grained 5-point ordinal that captures the senior's affect
+/// during the visit. The product choice is intentional — fine-grained
+/// numeric scoring would push the platform toward clinical language
+/// (CLAUDE.md §12 hospitality, not clinical). Each level is optional
+/// at the row layer so a provider can leave the field blank when
+/// they can't read the affect (e.g. a brief drop-off visit).
+enum VisitNoteMood {
+  low
+  subdued
+  neutral
+  bright
+  joyful
+
+  @@map("visit_note_mood")
+  @@schema("booking")
+}
+
+/// Visit-note appetite scale (TS-062). Drives the family wellness
+/// summary email (PRD §6.9) and the trust-safety welfare signal when
+/// persistently `none` or `minimal` (PDD §16.1).
+enum VisitNoteAppetite {
+  none
+  minimal
+  moderate
+  hearty
+  robust
+
+  @@map("visit_note_appetite")
+  @@schema("booking")
+}
+
+/// Visit-note hydration scale (TS-062). The provider records the
+/// senior's water / beverage intake during the visit. Persistently
+/// `poor` flags a welfare signal (PDD §16.1).
+enum VisitNoteHydration {
+  poor
+  light
+  adequate
+  good
+  excellent
+
+  @@map("visit_note_hydration")
+  @@schema("booking")
+}
+
+/// Visit-note social-engagement scale (TS-062). Captures how much
+/// the senior interacted with the provider during the visit. The
+/// family peace-of-mind dashboard (PRD §6.4) surfaces this so adult
+/// children see "how engaged was mom today" without reading freeform
+/// prose.
+enum VisitNoteSocialEngagement {
+  withdrawn
+  reserved
+  present
+  engaged
+  vibrant
+
+  @@map("visit_note_social_engagement")
+  @@schema("booking")
+}
+
+/// Booking visit notes (TS-062; PRD §6.4 family peace-of-mind
+/// dashboard, PRD §7.4 provider visit workflow, PDD §8.2 column
+/// inventory, PDD §9.2 lifecycle sequence).
+///
+/// **One row per booking.** `booking_id` is UNIQUE — every booking
+/// has at most one visit notes row. The upsert surface
+/// (`PUT /api/v1/bookings/:id/visit-notes`) writes-or-updates the
+/// row; the audit metadata (`recorded_at`, `recorded_by_user_id`,
+/// `updated_at`) tracks the lineage.
+///
+/// **Lifecycle gate.** The service layer accepts upsert only when
+/// the booking is `in_progress` or `completed` (PDD §9.2 — provider
+/// submits notes around check-out). Earlier states (pending /
+/// confirmed) reject with `forbidden`; the terminal `canceled`
+/// state has no notes (the booking didn't happen). Stored
+/// independently rather than as a JSON blob on `bookings` so the
+/// wellness-summary aggregator (PRD §6.9) can scan visit notes per
+/// senior without re-reading the heavier booking row.
+///
+/// **Soft FK** — `bookingId` → `bookings.id` *within this service
+/// schema*. We do not declare a Prisma relation across the schema
+/// because the recurrence + bookings models are already sibling and
+/// declaring relations creates the same kind of coupling we forbid
+/// across services. Service-layer integrity is the trust gate; the
+/// UNIQUE constraint on `booking_id` is the database-layer guard
+/// against a stray duplicate.
+///
+/// **Observation fields** — every structured field nullable so a
+/// partial save lands a valid row (the provider can update later
+/// before check-out). The contract layer's `superRefine` rejects a
+/// fully-empty payload at the wire so the DB row never holds the
+/// degenerate "all-null + empty photos" shape; the column NULLability
+/// only exists to support partial saves.
+///
+/// **`photo_keys`** — array of media-svc asset keys (the photos
+/// themselves live in S3 behind the signed-URL pipeline; CLAUDE.md
+/// §3.4). Capped at 12 entries by the contract; the column is
+/// `TEXT[]` so Phase 2 growth lands additively. Senior consent
+/// gating happens at the service boundary, not the column —
+/// TS-062-followup captures the gate.
+///
+/// **`freeform`** — narrative prose from the provider. Capped at
+/// 2000 chars at the contract layer. Never logged in plaintext
+/// (CLAUDE.md §3.9 PII discipline).
+///
+/// **`recorded_by_user_id`** — the actor on the most recent write.
+/// Stamped server-side from the authenticated request context.
+/// Provider's user-id today (only providers can write visit notes);
+/// admin override (TS-128) lands later and stamps the admin's
+/// user-id.
+model BookingVisitNote {
+  id               String                     @id @default(cuid())
+  /// Soft FK into `bookings.id` (same service schema). UNIQUE —
+  /// one visit-notes row per booking.
+  bookingId        String                     @unique @map("booking_id")
+  mood             VisitNoteMood?
+  appetite         VisitNoteAppetite?
+  hydration        VisitNoteHydration?
+  socialEngagement VisitNoteSocialEngagement? @map("social_engagement")
+  /// Free-form narrative prose. Bounded at 2000 chars at the contract
+  /// layer; never logged in plaintext (CLAUDE.md §3.9 PII discipline).
+  freeform         String?
+  /// Array of media-svc asset keys (the photos themselves live in S3
+  /// behind the signed-URL pipeline; CLAUDE.md §3.4). Capped at 12
+  /// at the contract layer. Stored as `TEXT[]` so Phase 2 growth
+  /// lands additively without a column-type migration.
+  photoKeys        String[]                   @default([]) @map("photo_keys")
+  /// Actor on the most recent write (provider's userId today;
+  /// admin override lands later — TS-128). Stamped server-side.
+  recordedByUserId String                     @map("recorded_by_user_id")
+  /// Wall-clock time of the most recent write. Stays distinct from
+  /// `updatedAt` because the row's `updatedAt` also moves on an
+  /// internal touch (e.g. a future moderation workflow rewriting
+  /// the freeform field for PII redaction).
+  recordedAt       DateTime                   @map("recorded_at") @db.Timestamptz(6)
+  createdAt        DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("booking_visit_notes")
+  @@schema("booking")
+}
+
+/// Booking check-in kind (TS-063; PRD §7.4 + PDD §9.2). The provider
+/// geo-checks-in at the start of a visit and geo-checks-out at the end.
+/// Each kind transitions the booking lifecycle:
+///
+///   - `check_in`  flips `confirmed`   → `in_progress` (emits
+///                  `booking.in_progress`).
+///   - `check_out` flips `in_progress` → `completed`   (emits
+///                  `booking.completed`).
+///
+/// The (`booking_id`, `kind`) pair is UNIQUE — at most one check-in
+/// row + one check-out row per booking in Phase 1.
+enum BookingCheckInKind {
+  check_in
+  check_out
+
+  @@map("booking_check_in_kind")
+  @@schema("booking")
+}
+
+/// Booking check-in (TS-063; PRD §7.4 provider visit workflow,
+/// PDD §8.2 column inventory, PDD §9.2 lifecycle sequence).
+///
+/// **Two rows per booking max.** The (`booking_id`, `kind`) pair is
+/// UNIQUE — one `check_in` row + one `check_out` row per booking. A
+/// concurrent double-POST without an `Idempotency-Key` lands at most
+/// one row of each kind; the second insert hits P2002 and the service
+/// surfaces a typed `already_recorded` failure.
+///
+/// **Atomic with status transition.** The `CheckInsService.record`
+/// operation inserts this row, updates the parent booking's status,
+/// and emits the matching `booking.*` outbox event — all in one
+/// Prisma `$transaction` so consumers see the trio atomically.
+///
+/// **Geo precision.** Latitude stored as `Decimal(8,6)` (covers
+/// -90.000000..90.000000), longitude stored as `Decimal(9,6)` (covers
+/// -180.000000..180.000000). 6 decimal places ≈ 11 cm of resolution
+/// at typical latitudes — more than enough for "did the provider
+/// arrive at the household address". Decimal (not float) keeps stored
+/// values deterministic across reads + lets the server-side rounding
+/// policy be explicit. The contract layer's wire shape is JSON number;
+/// the service rounds to 6 places at the persistence boundary.
+///
+/// **`location_accuracy_meters`** — nullable. Browser geolocation APIs
+/// surface horizontal accuracy in meters; recording it lets ops triage
+/// "the provider checked in 5 km away because their phone fell back
+/// to IP geolocation" vs. "the provider checked in at the right house,
+/// GPS accuracy 8 m". Stored as `Decimal(10,2)` for cm-grade accuracy.
+///
+/// **`occurred_at`** — server-stamped from a trusted clock (CLAUDE.md
+/// §3.2). The client does NOT supply this on the wire; PRD §7.4 keeps
+/// the geo check-in trustworthy.
+///
+/// **Soft FK** — `bookingId` → `bookings.id` *within this service
+/// schema*. No Prisma relation declared (mirrors the rationale on
+/// `BookingVisitNote` — sibling tables stay loosely coupled at the
+/// row layer; service-layer integrity is the trust gate).
+///
+/// **Family observability boundary.** The raw coordinates are visible
+/// to the provider portal + admin tooling but are NOT surfaced to the
+/// family-portal by default (CLAUDE.md §12 — over-sharing location
+/// data is excluded from default family observability). Phase 1: the
+/// family-portal renders "provider arrived" / "provider departed"
+/// chips driven by the `kind` + `occurredAt`, not the coordinates.
+model BookingCheckIn {
+  id                     String             @id @default(cuid())
+  /// Soft FK into `bookings.id` (same service schema).
+  bookingId              String             @map("booking_id")
+  kind                   BookingCheckInKind
+  /// Persisted to 6 decimal places (`Decimal(8,6)`) — bounded
+  /// `[-90, 90]` by CHECK constraint in the migration.
+  latitude               Decimal            @db.Decimal(8, 6)
+  /// Persisted to 6 decimal places (`Decimal(9,6)`) — bounded
+  /// `[-180, 180]` by CHECK constraint in the migration.
+  longitude              Decimal            @db.Decimal(9, 6)
+  /// Horizontal accuracy estimate in meters. Nullable when the device
+  /// did not surface accuracy. Persisted to two decimal places.
+  locationAccuracyMeters Decimal?           @map("location_accuracy_meters") @db.Decimal(10, 2)
+  /// Server-stamped on insert from a trusted clock. The contract layer
+  /// forbids client-supplied `occurredAt`.
+  occurredAt             DateTime           @map("occurred_at") @db.Timestamptz(6)
+  /// Actor on the insert. Stamped server-side from the authenticated
+  /// request context (provider's userId today; admin override lands
+  /// later — TS-128). Never client-supplied (CLAUDE.md §3.2).
+  recordedByUserId       String             @map("recorded_by_user_id")
+  createdAt              DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// One check-in + one check-out per booking. Surfaced as
+  /// `already_recorded` on duplicate POST.
+  @@unique([bookingId, kind], map: "booking_check_ins_booking_kind_unique_idx")
+  /// Powers the chronological list endpoint (`GET /check-ins`).
+  @@index([bookingId, occurredAt], map: "booking_check_ins_booking_occurred_idx")
+  /// TS-308a — the impossible-travel sweep's window scan ("every
+  /// check-in since the last tick"). Both other indexes here are
+  /// booking-leading, so a predicate on `occurred_at` alone could not
+  /// use either and fell back to a sequential scan.
+  @@index([occurredAt], map: "booking_check_ins_occurred_at_idx")
+  @@map("booking_check_ins")
+  @@schema("booking")
+}
+
+/// Booking dispute status (TS-065; PRD §10.5 + PDD §8.2).
+///
+/// Four-state machine governing the dispute resolution flow:
+///
+/// ```
+///   open ──┬──▶ under_review ──┬──▶ resolved   (terminal)
+///          │                   │
+///          └──▶ resolved        └──▶ dismissed (terminal)
+///          │
+///          └──▶ dismissed       (terminal)
+/// ```
+///
+/// State semantics:
+///
+/// `open`         = newly filed; awaiting concierge / ops triage. The
+///                  entry point for every dispute (family-portal,
+///                  provider-portal, or admin override).
+/// `under_review` = concierge / ops staff has picked it up and is
+///                  actively investigating. Optional — small disputes
+///                  may go straight `open` → `resolved` if the cause
+///                  is obvious (a no-show captured by check-in data).
+/// `resolved`     = a resolution has been recorded (refund issued,
+///                  credit applied, provider warned, etc.). Terminal
+///                  state with a mandatory `resolution_notes` value.
+/// `dismissed`    = no platform action taken — the complaint was
+///                  unfounded, withdrawn by the opener, or duplicative
+///                  of another dispute. Terminal state with mandatory
+///                  `resolution_notes`.
+///
+/// Terminal states (`resolved`, `dismissed`) have no outgoing
+/// transitions. A new complaint against the same booking opens a new
+/// dispute row (the table allows multiple disputes per booking) so the
+/// audit trail of the prior resolution is preserved.
+enum BookingDisputeStatus {
+  open
+  under_review
+  resolved
+  dismissed
+
+  @@map("booking_dispute_status")
+  @@schema("booking")
+}
+
+/// Booking dispute reason — categorical bucket the dispute is filed
+/// under (TS-065; PRD §10.5 dispute resolution workflow).
+///
+/// The product position is that families / providers / ops staff
+/// classify the complaint at file time so trust-safety routing
+/// (PDD §16.1 welfare flagging) and accounting routing (TS-084 refund
+/// policy) can fork off the categorical reason without parsing the
+/// freeform text. The freeform `reason_detail` column carries the
+/// human narrative for ops triage.
+///
+/// `welfare_concern` is FIRST CLASS (CLAUDE.md §12). Any dispute filed
+/// under this reason will route to `service-trust-safety`'s incident
+/// queue (TS-300) once the consumer subscription lands.
+enum BookingDisputeReason {
+  /// Provider didn't show up at the scheduled time. Drives accounting
+  /// "no-show refund" policy decision in TS-084.
+  no_show
+  /// Provider arrived materially after the scheduled start.
+  late_arrival
+  /// Provider left materially before the scheduled end.
+  early_departure
+  /// Complaint about the quality of the chef-prepared meal / experience.
+  service_quality
+  /// Charge / refund / commission discrepancy. Drives accounting
+  /// reconciliation (TS-084).
+  billing_dispute
+  /// Damage caused to household property during the visit.
+  property_damage
+  /// General safety concern (e.g., near-miss accident, unsafe handling).
+  safety_concern
+  /// Welfare concern (suspected elder abuse, neglect, exploitation).
+  /// Routes to trust-safety mandated-reporter workflow (CLAUDE.md §12;
+  /// PDD §16.1).
+  welfare_concern
+  /// Catch-all when none of the above categories fit. Encourages
+  /// detailed `reason_detail` text.
+  other
+
+  @@map("booking_dispute_reason")
+  @@schema("booking")
+}
+
+/// Booking dispute opener role (TS-065; PRD §10.5).
+///
+/// Categorises who filed the dispute so consumers can route on opener
+/// without joining back to identity. Stamped server-side from the
+/// authenticated request context — the client never supplies this on
+/// the wire (CLAUDE.md §3.2).
+///
+/// `admin` covers concierge / ops staff filing on behalf of a
+/// household (e.g., the family called the concierge line); the actor
+/// userId still records WHO filed.
+enum BookingDisputeOpenedByRole {
+  family
+  provider
+  admin
+
+  @@map("booking_dispute_opener_role")
+  @@schema("booking")
+}
+
+/// Booking dispute (TS-065; PRD §10.5 dispute resolution workflow,
+/// PDD §8.2 column inventory).
+///
+/// **Multiple disputes per booking allowed.** Unlike `BookingVisitNote`
+/// (one-per-booking) or `BookingCheckIn` (two-per-booking), a single
+/// booking can accumulate any number of disputes — a billing dispute
+/// filed by the family and a property-damage dispute filed by the
+/// provider against the same household visit are independent rows.
+/// The index on `bookingId` + `createdAt` powers the chronological
+/// listing endpoint.
+///
+/// **Soft FK** — `bookingId` → `bookings.id` within the same service
+/// schema. Mirrors `BookingVisitNote` / `BookingCheckIn` (no Prisma
+/// relation declared — service-layer integrity is the trust gate;
+/// CLAUDE.md §2.3).
+///
+/// **Lifecycle gate on open.** The service layer accepts a new
+/// dispute only when the booking is NOT in `pending` status (no
+/// service has been rendered yet — disputes presuppose a confirmed
+/// or further-progressed booking). The four allowed parent statuses
+/// are `confirmed`, `in_progress`, `completed`, `canceled`.
+///
+/// **Status state machine** (see `BookingDisputeStatus` enum doc):
+///   open → under_review → resolved / dismissed
+///   open → resolved / dismissed (direct close for obvious cases)
+///   under_review → resolved / dismissed
+/// `resolved` and `dismissed` are terminal. Re-opening is intentionally
+/// not modelled — a new complaint files a new dispute row to preserve
+/// the audit trail of the prior resolution.
+///
+/// **`reason_detail`** — free-form narrative from the opener. Capped
+/// at 2000 chars at the contract layer; never logged in plaintext
+/// (CLAUDE.md §3.9 PII discipline). Particularly important for the
+/// `welfare_concern` / `safety_concern` categories where the narrative
+/// is the trust-safety triage input.
+///
+/// **`resolution_notes`** — free-form narrative from the resolver
+/// (admin / concierge staff). Required when transitioning to
+/// `resolved` or `dismissed`; capped at 2000 chars.
+///
+/// **`opened_by_user_id` / `opened_by_role`** — actor + categorical
+/// role stamped server-side from the authenticated request context.
+/// Mirrors the established check-in / visit-notes pattern; the role
+/// derives from inspecting the actor's role assignments (admin role
+/// → `admin`, provider role → `provider`, else `family`).
+///
+/// **`resolved_by_user_id` / `resolved_at`** — actor + wall-clock
+/// time stamped on the transition into a terminal state. Both null
+/// until resolution.
+///
+/// **Family observability boundary** (CLAUDE.md §12). Disputes filed
+/// by the provider against the household — uncommon but possible
+/// (e.g., property damage caused by a hostile pet) — are visible to
+/// the family-portal so the family can respond, BUT raw narrative
+/// from a provider's dispute is bracketed by ops triage before family
+/// is notified for sensitive categories (welfare_concern). Phase-1
+/// implementation reads dispute rows behind the AccessTokenGuard;
+/// row-level access tightening lands with TS-141.
+model BookingDispute {
+  id               String                     @id @default(cuid())
+  /// Soft FK into `bookings.id` (same service schema).
+  bookingId        String                     @map("booking_id")
+  /// Actor that filed the dispute. Stamped server-side from the
+  /// authenticated request context (CLAUDE.md §3.2).
+  openedByUserId   String                     @map("opened_by_user_id")
+  /// Categorical opener role — derived server-side from the actor's
+  /// role assignments. Never client-supplied.
+  openedByRole     BookingDisputeOpenedByRole @map("opened_by_role")
+  reason           BookingDisputeReason
+  /// Free-form narrative supplied at file time. Bounded at 2000 chars
+  /// at the contract layer; never logged in plaintext (CLAUDE.md §3.9).
+  reasonDetail     String?                    @map("reason_detail")
+  status           BookingDisputeStatus       @default(open)
+  /// Free-form narrative supplied at resolution time. Required when
+  /// transitioning to `resolved` or `dismissed` (the service-layer
+  /// gate refuses a terminal transition with a null/empty value);
+  /// bounded at 2000 chars at the contract layer.
+  resolutionNotes  String?                    @map("resolution_notes")
+  /// Actor that drove the resolution. Stamped server-side on the
+  /// terminal transition; null until resolution.
+  resolvedByUserId String?                    @map("resolved_by_user_id")
+  /// Wall-clock time of the terminal transition. Stamped server-side
+  /// from a trusted clock (CLAUDE.md §3.2). Null until resolution.
+  resolvedAt       DateTime?                  @map("resolved_at") @db.Timestamptz(6)
+  createdAt        DateTime                   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Powers "list every dispute for this booking, chronological" — the
+  /// dominant family-portal / provider-portal / admin-tooling read
+  /// path (GET /api/v1/bookings/:id/disputes).
+  @@index([bookingId, createdAt], map: "booking_disputes_booking_created_idx")
+  /// Powers the ops queue ("show me every dispute still in `open` or
+  /// `under_review`"). At steady state most rows are terminal so this
+  /// is selective; a partial index lands as a follow-up if read load
+  /// justifies it.
+  @@index([status], map: "booking_disputes_status_idx")
+  /// Powers "show me disputes I filed" on the family-portal /
+  /// provider-portal "my activity" surfaces.
+  @@index([openedByUserId, createdAt], map: "booking_disputes_opened_by_user_created_idx")
+  @@map("booking_disputes")
+  @@schema("booking")
+}
+
+/// Household subscription tier (TS-064; PRD §5.1; CLAUDE.md §12).
+///
+/// Mirrors the family-membership taxonomy from PRD §5.1. The booking
+/// service does not own this taxonomy — service-subscription owns the
+/// `plans` catalog with codes `family.tier1` / `family.tier2` /
+/// `family.tier3`. This enum is service-booking's local
+/// representation, used as the column type on
+/// `household_tier_snapshots`. Translation between the producer-side
+/// plan code and this enum lives at the cache-hydration boundary
+/// (the internal HTTP endpoint today; the `subscription.tier_changed`
+/// consumer once TS-142 lands).
+///
+/// `tier_3_concierge` is the GATED tier — Tier-3 households can only
+/// book Elite Concierge providers per CLAUDE.md §12. Other tiers can
+/// book any provider tier (no upward gate).
+enum HouseholdSubscriptionTier {
+  tier_1_essential
+  tier_2_companion
+  tier_3_concierge
+
+  @@map("household_subscription_tier")
+  @@schema("booking")
+}
+
+/// Provider tier snapshot (TS-064). Mirrors service-provider's
+/// `ProviderTier` enum at the `apps/service-provider/prisma/schema.prisma`
+/// boundary — basic / certified / elite. Service-booking holds its own
+/// enum because cross-service Prisma imports are barred
+/// (CLAUDE.md §2.3); the column type stays local and the cache row
+/// is hydrated from the producer-side value.
+///
+/// `elite` is the only tier eligible to fulfil a Tier-3 Concierge
+/// household's booking per CLAUDE.md §12.
+enum ProviderTierSnapshotTier {
+  basic
+  certified
+  elite
+
+  @@map("provider_tier_snapshot_tier")
+  @@schema("booking")
+}
+
+/// Household subscription tier snapshot (TS-064; PRD §5.1; CLAUDE.md §12).
+///
+/// **Read-side cache** that service-booking maintains so the booking-
+/// create path can answer "what tier is this household on?" without
+/// crossing the service boundary into service-subscription. The cache
+/// is hydrated from one of two paths:
+///
+///   1. (Phase 1) Internal HTTP endpoint behind a shared-secret header
+///      (`POST /api/v1/internal/booking/tier-snapshots/household`). Ops
+///      or the gateway BFF (TS-140) writes the snapshot before the
+///      household's first booking. This is the dominant Phase-1 path
+///      because manual matching is the model (PRD §6.3 + PDD §28 item #4).
+///
+///   2. (TS-142) `subscription.tier_changed` event consumer. Once the
+///      outbox + relay infrastructure lands, service-subscription emits
+///      `subscription.tier_changed` whenever a household's plan flips
+///      and a booking-side worker upserts this row.
+///
+/// **One row per household.** `household_id` is the primary key — the
+/// upsert path is a `WHERE household_id = ?` against the PK index.
+///
+/// **Tier-gating evaluation** (CLAUDE.md §12). `BookingsService.createBooking`
+/// reads this row + the provider snapshot at create time. If the
+/// household tier is `tier_3_concierge` and the provider tier is not
+/// `elite`, the booking is rejected with `tier_gating_violation`. If
+/// either snapshot is missing, behaviour is governed by
+/// `BOOKING_TIER_GATING_MODE` — `enforce` rejects, `advisory` logs and
+/// allows (Phase-1 default while the cache hydrates).
+///
+/// **`source_event_id`** — nullable. The producer-side event id (e.g.
+/// the `subscription.tier_changed.eventId`) when the row is hydrated
+/// via the event path. Null when the row is written via the internal
+/// HTTP endpoint. Stored for idempotency follow-ups + ops debugging.
+///
+/// **`last_synced_at`** — producer-side timestamp; the snapshot is
+/// only valid as-of this moment. The booking service does not enforce
+/// staleness today; once the event-driven path is live, a stale
+/// snapshot becomes a metric not a hard error (PDD §20.5).
+model HouseholdTierSnapshot {
+  /// Soft FK into `household.households.id` (service-household schema).
+  /// Primary key — one row per household.
+  householdId   String                    @id @map("household_id")
+  tier          HouseholdSubscriptionTier
+  /// Producer-side wall-clock timestamp of the snapshot. The booking
+  /// service writes this from the caller's payload (or the event's
+  /// `occurredAt` once TS-142 lands) so the cached value retains its
+  /// original temporal context across re-syncs.
+  lastSyncedAt  DateTime                  @map("last_synced_at") @db.Timestamptz(6)
+  /// Source event id when hydrated via TS-142 event consumption.
+  /// Null when written via the internal HTTP endpoint.
+  sourceEventId String?                   @map("source_event_id")
+  createdAt     DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime                  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("household_tier_snapshots")
+  @@schema("booking")
+}
+
+/// Provider tier snapshot (TS-064; PRD §5.2; CLAUDE.md §12).
+///
+/// Mirrors `HouseholdTierSnapshot` but for the provider side. Hydrated
+/// either by ops via the internal HTTP endpoint
+/// (`POST /api/v1/internal/booking/tier-snapshots/provider`) or
+/// eventually by a `provider.tier_changed` event consumer once TS-142
+/// lands. One row per provider; the provider id is the primary key.
+///
+/// Read by `BookingsService.createBooking` alongside the matching
+/// household snapshot to decide whether to allow the booking; see
+/// `HouseholdTierSnapshot` for the gating logic.
+model ProviderTierSnapshot {
+  /// Soft FK into `provider.providers.id` (service-provider schema).
+  /// Primary key — one row per provider.
+  providerId    String                   @id @map("provider_id")
+  tier          ProviderTierSnapshotTier
+  /// Producer-side wall-clock timestamp of the snapshot.
+  lastSyncedAt  DateTime                 @map("last_synced_at") @db.Timestamptz(6)
+  /// Source event id when hydrated via TS-142 event consumption.
+  sourceEventId String?                  @map("source_event_id")
+  createdAt     DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("provider_tier_snapshots")
+  @@schema("booking")
+}

@@ -1,0 +1,1157 @@
+// Identity bounded context — see PDD §7.2 (service inventory) and §8.2 (identity schema).
+//
+// Scope so far: TS-020 added User; TS-022 added RefreshToken (rotating
+// refresh tokens with reuse detection per CLAUDE.md §3.1); TS-023 added
+// MfaMethod (TOTP secrets, encrypted at rest) + MfaChallenge (single-use
+// jti tracking for the second login step); TS-024 added Permission, Role,
+// RolePermission, UserRole — the RBAC catalog seeded from PDD §10.2 +
+// Appendix B plus the role-assignment table that powers the access
+// token's `roles` claim. TS-025 adds three columns to `User`
+// (`failed_login_count`, `last_failed_login_at`, `locked_until`) to
+// drive the per-user exponential-backoff lockout enforced in
+// `LockoutService`. The IP-level circuit breaker described in CLAUDE.md
+// §3.1 is captured as TS-025-followup-1 and arrives once Redis is
+// wired in (TS-009e / TS-044). TS-026 adds KycRecord — Stripe Identity
+// light verification rows used initially by provider onboarding
+// (TS-051) per PDD §11.1 + §16.2. TS-126-followup-6 promotes
+// `user_roles.user_id` from a soft FK to a real FK constraint and
+// declares the Prisma `User <-> UserRole` back-reference so the
+// admin-users role-filter can collapse to a one-step semi-join (no
+// new column — pure constraint addition). TS-023-followup-2 adds
+// MfaRecoveryCode — one-time hashed backup codes minted at MFA
+// enrollment-confirm time and accepted in lieu of a TOTP code on the
+// recovery-verify login path (PDD §10.1, CLAUDE.md §3.1). Each
+// addition is a forward-compatible expand → migrate → contract
+// migration per CLAUDE.md §4.1.
+//
+// Cross-service references are by id only — never a foreign key into another
+// service schema (CLAUDE.md §2.3, §4.1).
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm every service shares ONE
+  // physical `@prisma/client` install in the store, so a per-service
+  // `node_modules/.prisma/client` is never what `require('.prisma/client')`
+  // resolves to — Node walks up from the store realpath and finds the
+  // 2 KB postinstall stub instead, and every service dies at boot with
+  // "@prisma/client did not initialize yet".
+  //
+  // `./generated` is resolved relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. The feature has been
+  // production-stable since Prisma 5.0 even though it remains under the
+  // `previewFeatures` umbrella in 5.x — see Prisma migration notes.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `identity` Postgres schema. Every other service
+  // gets its own schema in the same database (Phase 1) or its own database
+  // entirely (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["identity"]
+}
+
+/// User account status. Drives login eligibility and downstream auth flows.
+/// `pending_verification` = signed up, email/phone not yet confirmed
+/// `active`               = normal state
+/// `suspended`            = temporarily blocked by trust & safety / ops
+/// `deactivated`          = self-service or admin-initiated permanent close
+enum UserStatus {
+  pending_verification
+  active
+  suspended
+  deactivated
+
+  @@map("user_status")
+  @@schema("identity")
+}
+
+/// Platform user. Holds only authentication-relevant fields here; profile
+/// data (family, senior, provider, partner, student) lives in the
+/// per-persona service that owns that bounded context.
+///
+/// `password_hash` stores a bcrypt digest at cost ≥ 12 (CLAUDE.md §3.1) —
+/// raw passwords never touch this table or any log line.
+///
+/// `email` is the primary login identifier. `phone` is optional at signup
+/// (TS-021); when present it gates SMS-based MFA fallback (TS-023).
+model User {
+  id                String     @id @default(cuid())
+  email             String     @unique
+  phone             String?    @unique
+  passwordHash      String     @map("password_hash")
+  status            UserStatus @default(pending_verification)
+  mfaEnabled        Boolean    @default(false) @map("mfa_enabled")
+  emailVerifiedAt   DateTime?  @map("email_verified_at") @db.Timestamptz(6)
+  /// Back-reference to role assignments (TS-126-followup-6). Powers
+  /// the admin-users role-filter semi-join — `prisma.user.findMany({
+  /// where: { roles: { some: ... } } })` — which collapses the
+  /// previous two-step "fetch matching userIds, then narrow user
+  /// query" pattern into one Prisma call. The relation is virtual at
+  /// the Prisma layer — no new column lands on `users`; the migration
+  /// only adds the `user_roles.user_id_fkey` FK constraint that the
+  /// existing soft FK column made possible.
+  roles             UserRole[]
+  /// Privacy requests this user FILED (TS-309a). Not the ones filed ABOUT
+  /// them — the subject is a soft reference, because two of the three subject
+  /// kinds live in other services' schemas.
+  privacyRequests   DataSubjectRequest[]
+  /// Outstanding + spent email-verification tokens (TS-510). Cascade-deleted
+  /// with the user: a token is meaningless without the account it activates.
+  emailVerificationTokens EmailVerificationToken[]
+  /// Back-reference to reviewer-required grant requests where this
+  /// user is the GRANTEE (TS-024-followup-4). Requester / approver
+  /// references on the approval are soft FKs and have no relation
+  /// here, mirroring `user_roles.granted_by_user_id`.
+  roleAssignmentApprovals RoleAssignmentApproval[]
+  /// Running count of consecutive failed login attempts since the
+  /// most recent successful authentication (TS-025; CLAUDE.md §3.1).
+  /// `LockoutService.recordSuccess` zeroes the counter; `recordFailure`
+  /// increments it atomically via `prisma.user.update` with the
+  /// Prisma `{ increment: 1 }` operator (Postgres SET col = col + 1
+  /// is naturally serializable). The exponential-backoff schedule in
+  /// `computeLockedUntil` derives the next `lockedUntil` from this
+  /// value, so the counter is both the policy input and the audit
+  /// trail of how aggressive the recent failure pattern has been.
+  failedLoginCount  Int        @default(0) @map("failed_login_count")
+  /// Timestamp of the most recent failed login attempt. Maintained
+  /// alongside `failedLoginCount` so support tooling can answer
+  /// "when was the last bad-password attempt?" without scanning the
+  /// activity log (TS-101). Null when no failure has been recorded
+  /// since signup or since the last successful login.
+  lastFailedLoginAt DateTime?  @map("last_failed_login_at") @db.Timestamptz(6)
+  /// Lockout deadline. Read-paths interpret `lockedUntil > now` as
+  /// "this account is currently locked"; once `now >= lockedUntil`
+  /// the lock has expired and the next login attempt is allowed
+  /// (subject to whatever the schedule computes if it also fails).
+  /// Null = never locked / last lock has aged out and been cleared
+  /// by a successful login. The column is NOT cleared automatically
+  /// on expiry — `LockoutService.recordSuccess` does that explicitly
+  /// when a clean login lands, which keeps the lock-expiry path a
+  /// pure read (no background sweeper required).
+  lockedUntil       DateTime?  @map("locked_until") @db.Timestamptz(6)
+  createdAt         DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime   @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone; populated by ops only. Read-paths must filter
+  /// `deletedAt = null` unless explicitly auditing deleted users.
+  deletedAt         DateTime?  @map("deleted_at") @db.Timestamptz(6)
+
+  @@index([status], map: "users_status_idx")
+  @@index([deletedAt], map: "users_deleted_at_idx")
+  /// Partial index over the rarely-non-null `locked_until` column
+  /// (TS-025). Sized to the population of currently-locked users
+  /// rather than every row, so admin queries like "show me every
+  /// account currently in a lockout window" scan a tight set without
+  /// paying for a full users-table sweep.
+  @@index([lockedUntil], map: "users_locked_until_idx")
+  @@map("users")
+  @@schema("identity")
+}
+
+/// Rotating refresh-token persistence (CLAUDE.md §3.1, §17.4; PDD §10.1).
+///
+/// Each row represents one issued refresh token in a rotation chain. The
+/// `familyId` is the stable session identifier (also baked into the access
+/// token's `sid` claim) — every token in the rotation chain shares the
+/// same `familyId`. Rotation works as follows:
+///
+///   1. Login → insert a new row with a fresh `familyId` and `tokenHash`.
+///   2. Successful `/refresh` → mark the current row's `rotatedAt`,
+///      insert a new row with the same `familyId` and a fresh `tokenHash`.
+///   3. Logout / explicit revoke → set `revokedAt` on every row in the
+///      family.
+///
+/// **Reuse detection.** A presented refresh token whose row already has a
+/// non-null `rotatedAt` (i.e. it was already exchanged once) means either
+/// (a) the legitimate client retried with a stale token they didn't realise
+/// was rotated, or (b) an attacker captured the token and is replaying it.
+/// We can't distinguish, so the safe default is to assume (b): mark every
+/// row in the family `revokedAt`, force re-authentication, and emit a
+/// trust-and-safety signal. This is the well-known "refresh token
+/// rotation with automatic reuse detection" pattern (OWASP ASVS V3.2.4).
+///
+/// `tokenHash` stores SHA-256(rawToken) base64url-encoded — never the raw
+/// token. SHA-256 (not bcrypt) because (a) the raw value is a 256-bit
+/// cryptographically-random opaque string with no human-meaningful entropy
+/// for an attacker to brute-force, and (b) refresh-token verification runs
+/// on every refresh and must be fast (sub-millisecond hash); bcrypt at
+/// cost 12 (~250-400ms) would dominate the latency budget. The unique
+/// constraint on `tokenHash` is what makes "this exact token has already
+/// been issued" a single-row primary-key lookup.
+///
+/// `userId` is a soft FK to `identity.users.id`. We don't declare a Prisma
+/// relation because Phase 1 keeps the model footprint small; if relation
+/// queries become necessary the FK can be added in a forward-compatible
+/// migration without changing the table.
+model RefreshToken {
+  id        String    @id @default(cuid())
+  /// Token rotation chain identifier. Stable across rotations within one
+  /// session; also published as the `sid` claim in the corresponding
+  /// access tokens. Unique-per-row uniqueness is NOT required — multiple
+  /// rows share a familyId by design.
+  familyId  String    @map("family_id")
+  userId    String    @map("user_id")
+  /// SHA-256(rawToken) base64url. Unique so a presented raw token maps to
+  /// exactly zero or one row.
+  tokenHash String    @unique @map("token_hash")
+  issuedAt  DateTime  @default(now()) @map("issued_at") @db.Timestamptz(6)
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
+  /// Set when this token was successfully exchanged for a new one. A
+  /// presented token whose row has `rotatedAt != null` triggers reuse
+  /// detection.
+  rotatedAt DateTime? @map("rotated_at") @db.Timestamptz(6)
+  /// Set when the family is revoked (logout, reuse-detected, or admin
+  /// action). Revoked rows are inert — `/refresh` returns 401.
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
+  /// Issuance metadata for audit. IP and UA are not PII per CCPA but are
+  /// linkable identifiers — kept on the session record only, never
+  /// emitted in tokens or logs at info level.
+  ip        String?
+  userAgent String?   @map("user_agent")
+  /// TS-297: set on impersonation-session rows — the OPERATOR's user id
+  /// (`userId` above is the impersonated user). Null on every ordinary
+  /// session. Read only via the familyId index (end-impersonation checks
+  /// the family is an impersonation family), so it carries no own index.
+  impersonatorUserId String? @map("impersonator_user_id")
+
+  @@index([userId], map: "refresh_tokens_user_id_idx")
+  @@index([familyId], map: "refresh_tokens_family_id_idx")
+  @@index([expiresAt], map: "refresh_tokens_expires_at_idx")
+  @@map("refresh_tokens")
+  @@schema("identity")
+}
+
+/// MFA method kinds. TOTP is the primary method (RFC 6238); SMS backup
+/// is reserved for TS-023-followup (requires Twilio integration which
+/// we don't bring online until TS-073). Adding kinds here is
+/// forward-compatible — Prisma maps additive enum values without
+/// requiring data migration.
+enum MfaMethodKind {
+  totp
+  sms_backup
+
+  @@map("mfa_method_kind")
+  @@schema("identity")
+}
+
+/// Multi-factor authentication method registered against a user.
+///
+/// Encryption-at-rest. The TOTP shared secret is sensitive PII per
+/// CLAUDE.md §3 (field-level encryption for sensitive credentials —
+/// the same envelope as DOB, SSN, dementia status). We store
+/// AES-256-GCM ciphertext (`secret_ciphertext`), the per-row 96-bit
+/// random IV (`secret_iv`), and the 128-bit auth tag (`secret_auth_tag`).
+/// Decryption requires the symmetric key referenced by `key_version`
+/// — versioned so a future key rotation can re-wrap rows without
+/// downtime (encrypt-once, decrypt-with-old-key-then-re-encrypt path).
+///
+/// Replay protection. The `last_used_step` column stores the most
+/// recently accepted RFC 6238 step counter (Unix seconds / 30s).
+/// `MfaService.verifyForChallenge` rejects any candidate code whose
+/// step value is ≤ `lastUsedStep` so a 30s code cannot be replayed
+/// inside its own validity window. This is the standard TOTP
+/// hardening from RFC 6238 §5.2 ("Validating TOTP and security
+/// considerations").
+///
+/// Confirmation. A method enters the table with `confirmedAt = null`
+/// (the user has scanned the QR but hasn't proven possession yet).
+/// `MfaService.confirmEnrollment` flips `confirmedAt` after the user
+/// types a working code. Login challenges only accept confirmed
+/// methods, so a half-finished enrollment never gates a real login.
+///
+/// Soft delete. `deletedAt` retires a method without losing the audit
+/// trail (TS-100 hot/cold audit log). Read-paths filter `deletedAt
+/// IS NULL`.
+///
+/// `userId` is a soft FK to `identity.users.id` — same convention as
+/// RefreshToken (Phase 1 keeps the relation graph small; FK can be
+/// added in a forward-compatible migration if relation queries are
+/// later needed).
+model MfaMethod {
+  id               String        @id @default(cuid())
+  userId           String        @map("user_id")
+  kind             MfaMethodKind
+  /// AES-256-GCM ciphertext of the base32 TOTP shared secret. Bytea
+  /// because the ciphertext is binary; never base64-encode at the
+  /// storage layer (an extra encoding step is just opportunity for
+  /// inconsistency between writers and readers).
+  secretCiphertext Bytes         @map("secret_ciphertext")
+  /// 96-bit random IV (NIST SP 800-38D §8.2 recommends 96 bits for
+  /// GCM). Stored separately so the auth-tag stays semantically
+  /// distinct from the IV in audit / forensic dumps.
+  secretIv         Bytes         @map("secret_iv")
+  /// 128-bit GCM auth tag. Verifying the tag is what makes the
+  /// at-rest encryption tamper-evident — a flipped ciphertext byte
+  /// fails authentication, so an attacker with DB write access
+  /// cannot silently swap a victim's TOTP secret.
+  secretAuthTag    Bytes         @map("secret_auth_tag")
+  /// References which key in the env-managed keyring encrypted this
+  /// row. The current `MFA_TOTP_ENC_KEY_VERSION` is what
+  /// MfaSecretCipher uses to encrypt new rows; old rows keep their
+  /// original `keyVersion` until rotated. Mismatched-version reads
+  /// fail closed (cannot decrypt with the wrong key).
+  keyVersion       Int           @map("key_version")
+  /// Optional human label ("iPhone Authenticator", "1Password vault")
+  /// shown to the user when listing their MFA methods. Never echoed
+  /// in logs.
+  label            String?
+  /// Most recently accepted RFC 6238 step (Unix seconds / 30s).
+  /// Replay-defence column — see model header.
+  lastUsedStep     BigInt?       @map("last_used_step")
+  /// Set by `MfaService.confirmEnrollment` after the user has typed
+  /// a working code. Methods with `confirmedAt = null` never gate a
+  /// login challenge.
+  confirmedAt      DateTime?     @map("confirmed_at") @db.Timestamptz(6)
+  lastUsedAt       DateTime?     @map("last_used_at") @db.Timestamptz(6)
+  createdAt        DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Soft-delete tombstone. Read-paths filter `deletedAt = null`.
+  deletedAt        DateTime?     @map("deleted_at") @db.Timestamptz(6)
+
+  @@index([userId], map: "mfa_methods_user_id_idx")
+  @@index([userId, deletedAt, confirmedAt], map: "mfa_methods_user_active_idx")
+  @@map("mfa_methods")
+  @@schema("identity")
+}
+
+/// Single-use challenge token tracking for the MFA-required login flow.
+///
+/// When `AuthService.login` succeeds against an MFA-enabled account it
+/// does NOT issue a session — instead it mints a short-lived JWT (5
+/// min default) carrying a `userId` claim and a `jti` matching this
+/// table's primary key. The caller exchanges that JWT plus a TOTP
+/// code at `/api/v1/auth/mfa/verify`; the verifier checks the JWT
+/// signature, looks up the row by `jti`, and rejects the challenge if
+/// `consumedAt` is already set OR `expiresAt` has passed.
+///
+/// Why the table exists. The JWT TTL bounds the replay window to the
+/// signed lifetime, but inside that window the JWT could be replayed
+/// alongside a captured TOTP code. The `consumedAt` column collapses
+/// the replay window to the time-of-first-use — exactly one mfa-verify
+/// call per challenge.
+///
+/// Why a separate table from `mfa_methods`. The challenge is per-
+/// login-attempt (high-cardinality, short-lived) while the method is
+/// per-user-per-device (low-cardinality, long-lived). Mixing the two
+/// would cost a column on every method row and force pruning logic
+/// into the method service. The challenge table is also a natural
+/// home for any future challenge metadata (originating IP, attempt
+/// count) that doesn't belong on the method.
+///
+/// Cleanup. `expiresAt` is indexed so a future janitor worker
+/// (TS-023-followup) can prune expired+consumed rows on a schedule —
+/// keeping the table footprint bounded under sustained MFA login
+/// volume.
+model MfaChallenge {
+  /// Matches the JWT `jti` claim. The verify path looks the row up by
+  /// primary-key equality.
+  id         String    @id
+  userId     String    @map("user_id")
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(6)
+  /// Set by `MfaChallengeTokenService.consume` inside a transaction
+  /// that ALSO performs the row-lookup. The transactional sequencing
+  /// is what makes "consume exactly once" race-safe under concurrent
+  /// verify attempts — a second concurrent attempt either sees
+  /// `consumedAt != null` after the winner commits, or its own
+  /// update affects 0 rows.
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Issuance metadata for audit trail. IP and UA are linkable
+  /// identifiers and are kept on the challenge record only — never
+  /// in the JWT payload, never in logs at info level.
+  ip         String?
+  userAgent  String?   @map("user_agent")
+
+  @@index([userId], map: "mfa_challenges_user_id_idx")
+  @@index([expiresAt], map: "mfa_challenges_expires_at_idx")
+  @@map("mfa_challenges")
+  @@schema("identity")
+}
+
+/// One-time MFA recovery (backup) code (TS-023-followup-2; PDD §10.1,
+/// CLAUDE.md §3.1).
+///
+/// Recovery codes are the industry-standard ergonomic pairing for any
+/// TOTP rollout: without them a lost authenticator device is a
+/// customer-support ticket (and, for admin staff gated by the
+/// admin-MFA gate in `AuthService.login`, a hard lockout). At
+/// enrollment-confirm time `MfaService.confirmEnrollment` mints a
+/// fixed-size batch, returns the plaintext codes to the client EXACTLY
+/// once, and persists only their hashes here. During the second login
+/// step the user may present one code in lieu of a TOTP code at
+/// `POST /api/v1/auth/mfa/recovery/verify`; the matched row is marked
+/// `consumed_at` and never accepted again.
+///
+/// **Hash, not encrypt.** `code_hash` stores SHA-256(normalisedCode)
+/// base64url — the same reasoning as `RefreshToken.tokenHash`: the raw
+/// value is a high-entropy (~50-bit) opaque token with no
+/// human-meaningful structure for an attacker to brute-force, and the
+/// verify path is a single-row primary-key-shaped lookup that must be
+/// fast. Bcrypt's per-compare cost (~250-400ms) would be wrong here —
+/// there is nothing low-entropy to slow down. We hash (not encrypt)
+/// because the server never needs to recover the plaintext: it only
+/// ever compares a presented code's hash against the stored hash.
+/// Normalisation (uppercase, strip separators) happens before hashing
+/// so the display form (`XXXXX-XXXXX`) and the typed form collide.
+///
+/// **Single-use.** `consumed_at` is the spent tombstone. Consumption
+/// is race-safe: `MfaRecoveryCodeService.verifyAndConsume` does a
+/// conditional `updateMany ... WHERE consumed_at IS NULL`, so two
+/// concurrent presentations of the same code resolve to exactly one
+/// winner (the loser's update affects 0 rows and is treated as a
+/// miss).
+///
+/// **Lifecycle.** A batch exists only while the user has MFA enabled.
+/// `confirmEnrollment` deletes any stale batch before inserting a
+/// fresh one (idempotent re-enrol); `removeMethod` deletes the batch
+/// when the user's last confirmed method goes away (MFA disabled →
+/// recovery codes are meaningless). Hard delete is correct here — a
+/// spent or invalidated recovery code carries no audit value that the
+/// activity / audit log (TS-100) doesn't already hold via the
+/// `mfa.recovery_code_used` / `mfa.recovery_codes_generated` events.
+///
+/// `userId` is a soft FK to `identity.users.id` — same convention as
+/// RefreshToken / MfaMethod / MfaChallenge (Phase 1 keeps the relation
+/// graph small; an FK can be added in a forward-compatible migration
+/// if relation queries are later needed).
+model MfaRecoveryCode {
+  id         String    @id @default(cuid())
+  userId     String    @map("user_id")
+  /// SHA-256(normalisedCode) base64url. Unique so a presented code maps
+  /// to exactly zero or one row across the platform — the verify path
+  /// is a single-row lookup keyed by this column, then scoped to the
+  /// presenting user.
+  codeHash   String    @unique @map("code_hash")
+  /// Single-use tombstone. `null` = unused; set the first (and only)
+  /// time a code is accepted at the recovery-verify endpoint.
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// Per-user lookup — powers batch delete on re-enrol / MFA-disable
+  /// and the future "how many recovery codes do I have left?" +
+  /// regenerate surface (TS-023-followup-2c). The verify path uses the
+  /// unique `code_hash` index, not this one.
+  @@index([userId], map: "mfa_recovery_codes_user_id_idx")
+  @@map("mfa_recovery_codes")
+  @@schema("identity")
+}
+
+/// Single-use email-verification token (TS-510).
+///
+/// Signup creates a user in `pending_verification` and login requires
+/// `active`, so before this table existed no account created through the
+/// platform's own signup path could ever log in. One row is minted inside the
+/// signup transaction and one more on every explicit resend; consuming any
+/// unexpired row for a user activates the account.
+///
+/// **A table, not a column on `users`.** Resend has to be possible without
+/// invalidating a link the user may be about to click, several tokens may
+/// legitimately be outstanding at once, and the spent rows are the record of
+/// when and how often the account was verified. A single nullable column can
+/// express none of that.
+///
+/// **Only the digest is stored.** The token is a bearer credential that
+/// travels in a URL; keeping SHA-256 of it means read access to this table
+/// cannot mint a working link (CLAUDE.md §3.1 — never store or log a full
+/// token). SHA-256 rather than bcrypt deliberately: the input is 256 bits of
+/// CSPRNG output, so there is no dictionary to slow down, and a per-request
+/// bcrypt cost on an unauthenticated endpoint is a denial-of-service lever.
+model EmailVerificationToken {
+  id         String    @id @default(cuid())
+  userId     String    @map("user_id")
+  /// SHA-256(token) base64url. Unique so a presented token maps to exactly
+  /// zero or one row — the verify path is a single-row lookup on this column,
+  /// never a scan of a user's tokens. Mirrors `mfa_recovery_codes.code_hash`.
+  tokenHash  String    @unique @map("token_hash")
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(6)
+  /// Single-use tombstone. `null` = spendable; stamped in the same
+  /// transaction that flips the user to `active`.
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Powers the resend path's "does this user already have a live token?"
+  /// question and the future expired-row prune (TS-510-followup-1). The
+  /// verify path uses the unique `token_hash` index, not this one.
+  @@index([userId, consumedAt], map: "email_verification_tokens_user_id_consumed_at_idx")
+  @@map("email_verification_tokens")
+  @@schema("identity")
+}
+
+/// Atomic permission — `resource:action` per CLAUDE.md §2.2 (e.g.
+/// `subscription:write`, `accounting:close_period`). The `(resource,
+/// action)` pair is unique; the `id` exists so role-permission joins
+/// can pivot on a small foreign key rather than two columns.
+///
+/// Permissions are seeded from `seedRbacCatalog` (TS-024). Adding
+/// new permissions is a code change (catalog entry) plus an
+/// idempotent re-seed; never a manual DB insert in production.
+model Permission {
+  id          String   @id @default(cuid())
+  resource    String
+  action      String
+  /// Human-readable description shown in admin RBAC tooling (TS-290).
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  rolePermissions RolePermission[]
+
+  @@unique([resource, action], map: "permissions_resource_action_key")
+  @@map("permissions")
+  @@schema("identity")
+}
+
+/// Role — either a system role from PDD §10.2 (`isSystem = true`,
+/// seeded by `seedRbacCatalog`) or a custom role authored via the
+/// admin RBAC tooling (TS-290; `isSystem = false`).
+///
+/// System roles are protected at the service layer: their permission
+/// set is owned by the seed catalog. Custom roles are mutable. The
+/// flag is descriptive of provenance, not a DB-level immutability
+/// constraint — the protection lives in `RoleAssignmentService` /
+/// the future admin tooling.
+///
+/// `name` is the global identifier referenced by access-token
+/// payloads' `roles[*].name` claim and by admin role-assignment
+/// requests. Unique across system + custom roles to avoid a custom
+/// role accidentally shadowing a system role's permission set.
+model Role {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  /// True for the seeded system roles (PDD §10.2). Custom roles
+  /// (created via admin tooling) carry `false`. The seed function
+  /// only writes rows with `isSystem = true`.
+  isSystem    Boolean  @default(false) @map("is_system")
+  /// Soft-archive marker (TS-290). Non-null means the role is hidden
+  /// from assignment surfaces (`RoleAssignmentService.grant` rejects
+  /// it) and read-only in the admin tooling. Roles are never
+  /// hard-deleted — `user_roles` history rows FK them. System roles
+  /// cannot be archived (service-layer guard in `RoleCatalogService`).
+  archivedAt  DateTime? @map("archived_at") @db.Timestamptz(6)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  rolePermissions RolePermission[]
+  userAssignments UserRole[]
+  /// Reviewer-required grant requests targeting this role
+  /// (TS-024-followup-4).
+  assignmentApprovals RoleAssignmentApproval[]
+
+  @@index([isSystem], map: "roles_is_system_idx")
+  @@map("roles")
+  @@schema("identity")
+}
+
+/// Role ↔ Permission join. Many-to-many; primary key is the
+/// composite (role_id, permission_id) so a permission cannot be
+/// double-attached to the same role and the row's existence is the
+/// authoritative "this role has this permission" claim.
+///
+/// `onDelete: Cascade` on both sides because a deleted role / deleted
+/// permission cannot have meaningful join rows. System roles are
+/// never deleted (seed is upsert-only); custom roles can be deleted
+/// via admin tooling and their join rows go with them.
+model RolePermission {
+  roleId       String   @map("role_id")
+  permissionId String   @map("permission_id")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId], map: "role_permissions_permission_id_idx")
+  @@map("role_permissions")
+  @@schema("identity")
+}
+
+/// Tenant scope for a role assignment (PDD §10.2 — `global`, `tenant`,
+/// `household`). Materialised as a Postgres enum so a typo at the
+/// service layer fails at the DB boundary instead of silently
+/// becoming a free-text string. The auth-sdk's `TenantScope`
+/// discriminated union mirrors this enum exactly — any change here
+/// requires a coordinated change there.
+enum UserRoleScopeType {
+  global
+  tenant
+  household
+
+  @@map("user_role_scope_type")
+  @@schema("identity")
+}
+
+/// Role assignment — links a user to a role inside a scope, with
+/// optional expiration and explicit revocation columns (CLAUDE.md
+/// §3.2: "Role assignments support expiration").
+///
+/// `scopeType` + `scopeId` together encode the auth-sdk's
+/// `TenantScope` discriminated union:
+///   - `global`    → `scopeId` MUST be null
+///   - `tenant`    → `scopeId` MUST be a non-null tenantId
+///   - `household` → `scopeId` MUST be a non-null householdId
+/// The invariant is enforced at the service layer (`RoleAssignment
+/// Service`) and at the contract boundary; it is not a DB CHECK
+/// constraint because Prisma's check-constraint support is preview-
+/// only (see Prisma issue #3388) and we prefer a single
+/// authoritative validation path.
+///
+/// `expiresAt` (nullable) supports time-bounded grants — a
+/// reviewer-required role like `finance:adjust` can be granted with
+/// a 30-day expiry that requires re-approval. `revokedAt`
+/// (nullable) is the explicit-revocation tombstone, distinct from
+/// soft-deletion in case a future audit query needs to surface
+/// "rows that were active at time T".
+///
+/// `grantedByUserId` records the admin who issued the grant
+/// (CLAUDE.md §3.2 "Privilege escalation requires audit + reviewer
+/// signoff"). Null when seeded by the system or for self-service
+/// grants like a customer signing up as `family_payer`.
+///
+/// `userId` references `identity.users.id`. TS-126-followup-6
+/// promoted this from a soft FK to a real FK constraint
+/// (`user_roles_user_id_fkey`, ON DELETE RESTRICT) so the
+/// admin-users role-filter can collapse to a one-step Prisma
+/// `where: { roles: { some: ... } }` semi-join. RefreshToken /
+/// MfaMethod / MfaChallenge / KycRecord remain soft-FK by
+/// convention; the upgrade landed here because the relation-query
+/// surface justified the constraint.
+///
+/// Active-assignment dedup (TS-024-followup-3): a partial unique
+/// index `user_roles_active_unique_idx` on `(user_id, role_id,
+/// scope_type, scope_id) NULLS NOT DISTINCT WHERE revoked_at IS
+/// NULL` rejects duplicate ACTIVE grants at the DB boundary
+/// (`RoleAssignmentService.grant` maps the P2002 to a 409).
+/// Raw-SQL only — Prisma cannot model partial / nulls-not-distinct
+/// indexes, so it lives in the migration, not here (same convention
+/// as the repo's other partial indexes). Revoked history rows are
+/// exempt, so re-granting after a revoke works.
+model UserRole {
+  id              String            @id @default(cuid())
+  userId          String            @map("user_id")
+  roleId          String            @map("role_id")
+  scopeType       UserRoleScopeType @map("scope_type")
+  scopeId         String?           @map("scope_id")
+  grantedByUserId String?           @map("granted_by_user_id")
+  expiresAt       DateTime?         @map("expires_at") @db.Timestamptz(6)
+  createdAt       DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Tombstone for explicit revocation. `null` = active. Distinct
+  /// from `expiresAt` because revocation is an admin action and
+  /// expiration is automatic; the audit trail benefits from
+  /// distinguishing the two.
+  revokedAt       DateTime?         @map("revoked_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  /// Back-link from the approval that minted this grant
+  /// (TS-024-followup-4). Null for grants that did not go through
+  /// the reviewer flow (system grants, non-sensitive roles).
+  approval RoleAssignmentApproval?
+
+  @@index([userId], map: "user_roles_user_id_idx")
+  @@index([roleId], map: "user_roles_role_id_idx")
+  /// Powers the `getActiveAssignments` hot path — a single user-id
+  /// lookup whose secondary predicates filter against `revokedAt`
+  /// + `expiresAt`. Compound order matches the predicate.
+  @@index([userId, revokedAt, expiresAt], map: "user_roles_user_active_idx")
+  @@map("user_roles")
+  @@schema("identity")
+}
+
+/// Approval-workflow status for a sensitive-role grant request
+/// (TS-024-followup-4, schema-first for TS-294). `pending` →
+/// `approved` | `rejected` are reviewer decisions; `expired` is the
+/// staleness terminal state for requests nobody decided in time
+/// (policy + transition enforcement land with TS-294's flow logic).
+enum RoleAssignmentApprovalStatus {
+  pending
+  approved
+  rejected
+  expired
+
+  @@map("role_assignment_approval_status")
+  @@schema("identity")
+}
+
+/// Reviewer-required grant request (TS-024-followup-4; CLAUDE.md
+/// §3.2 "Privilege escalation requires audit + reviewer signoff for
+/// sensitive roles" — `super_admin`, `finance`). Schema-first: this
+/// model lands the DATA shape now so the admin tooling track
+/// (TS-290+) doesn't need a second migration; the approval FLOW
+/// (request → second-admin decision → grant activation) wires up in
+/// TS-294.
+///
+/// Design: a pending-REQUEST row, not a column on `user_roles`. The
+/// row carries the full requested grant parameters (`userId`,
+/// `roleId`, scope pair, `expiresAt`) and the real `user_roles` row
+/// is only inserted when a second admin approves — TS-294's
+/// acceptance is "the grant only becomes active on approval". A
+/// half-active grant therefore never exists in `user_roles`, and
+/// token issuance keeps reading `user_roles` alone, ignorant of the
+/// approval machinery.
+///
+/// `userRoleId` back-links the `user_roles` row minted on approval
+/// (null while pending / rejected / expired); unique because one
+/// approval mints at most one grant. `requestedByUserId` /
+/// `approvedByUserId` are soft user references by the same
+/// convention as `user_roles.granted_by_user_id`; `userId` (the
+/// grantee) is a real FK matching `user_roles.user_id`
+/// (TS-126-followup-6). The scope pair reuses `UserRoleScopeType`
+/// and the same service-layer invariants (`global` → null scopeId).
+///
+/// A raw-SQL partial unique index
+/// (`role_assignment_approvals_pending_unique_idx` on `(user_id,
+/// role_id, scope_type, scope_id) NULLS NOT DISTINCT WHERE status =
+/// 'pending'`) rejects duplicate concurrent pending requests for
+/// the same grant — mirror of `user_roles_active_unique_idx`; not
+/// representable in Prisma, lives in the migration.
+model RoleAssignmentApproval {
+  id                String                       @id @default(cuid())
+  userId            String                       @map("user_id")
+  roleId            String                       @map("role_id")
+  scopeType         UserRoleScopeType            @map("scope_type")
+  scopeId           String?                      @map("scope_id")
+  /// Expiration the eventual grant will carry (copied onto the
+  /// `user_roles` row at approval time) — NOT the staleness
+  /// deadline of the request itself; request staleness is the
+  /// `expired` status, decided by TS-294 policy.
+  expiresAt         DateTime?                    @map("expires_at") @db.Timestamptz(6)
+  /// Admin who asked for the grant. Required — unlike system
+  /// grants, a reviewer-required request always has an
+  /// authenticated requesting actor.
+  requestedByUserId String                       @map("requested_by_user_id")
+  /// Optional free-text justification shown to the reviewer and
+  /// preserved for the audit trail.
+  reason            String?
+  status            RoleAssignmentApprovalStatus @default(pending)
+  approvedByUserId  String?                      @map("approved_by_user_id")
+  /// When the reviewer decided (approved / rejected) or the request
+  /// was marked expired. Null while pending.
+  decidedAt         DateTime?                    @map("decided_at") @db.Timestamptz(6)
+  /// The decider's optional free-text note (TS-294) — approve or
+  /// reject. Distinct from `reason`, which is the REQUESTER's
+  /// justification.
+  decisionNote      String?                      @map("decision_note")
+  userRoleId        String?                      @unique(map: "role_assignment_approvals_user_role_id_key") @map("user_role_id")
+  createdAt         DateTime                     @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime                     @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+  role     Role      @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  userRole UserRole? @relation(fields: [userRoleId], references: [id], onDelete: Restrict)
+
+  @@index([userId], map: "role_assignment_approvals_user_id_idx")
+  @@index([roleId], map: "role_assignment_approvals_role_id_idx")
+  /// Powers the reviewer-queue read — `WHERE status = 'pending'
+  /// ORDER BY created_at` — and the history views' status filters.
+  @@index([status, createdAt], map: "role_assignment_approvals_status_created_idx")
+  @@map("role_assignment_approvals")
+  @@schema("identity")
+}
+
+/// Per-organisation security policy (TS-296; CLAUDE.md §3.1; PDD
+/// §10.1). Identity has no org/tenant ENTITY — tenancy is expressed
+/// as the bare `scopeId` string on tenant-scoped `user_roles` rows
+/// (cross-service references are id-only by convention). This model
+/// hosts security flags KEYED BY that same scope id, starting with
+/// `ssoRequired`: when true, an admin-staff login whose active
+/// admin assignments touch this scope must arrive SSO-asserted or
+/// the session is refused (403 `sso_assertion_required`).
+///
+/// The well-known row `scopeId = 'global'` (sentinel, exported from
+/// contracts as `ORG_SECURITY_POLICY_GLOBAL_SCOPE_ID`) governs
+/// GLOBAL-scoped admin staff — super_admin, finance, etc. — since
+/// those assignments carry no tenant id.
+///
+/// Rows are operator-curated via `/api/v1/admin/org-security-policies`
+/// (upsert semantics — absent row means "no policy", all flags
+/// default-off), so the login hot path pays at most one indexed
+/// lookup and only when the user holds an admin role.
+model OrgSecurityPolicy {
+  id          String   @id @default(cuid())
+  /// Tenant scope id this policy applies to, or the `'global'`
+  /// sentinel. Unique — one policy row per scope.
+  scopeId     String   @unique(map: "org_security_policies_scope_id_key") @map("scope_id")
+  /// CLAUDE.md §3.1 "SSO + 2FA enforcement for admin staff" — the
+  /// SSO half. The MFA half is unconditional (TS-023-followup-1).
+  ssoRequired Boolean  @default(false) @map("sso_required")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("org_security_policies")
+  @@schema("identity")
+}
+
+/// External KYC provider. Phase 1 ships a single value (`stripe_identity`)
+/// because PDD §11.1 names Stripe Identity as the platform's light-KYC
+/// vendor for providers. The enum exists rather than a bare string so a
+/// future Checkr / Persona / Onfido integration arrives as an additive
+/// catalog entry rather than a free-text field. Adding values is a
+/// forward-compatible Postgres ALTER TYPE ADD VALUE.
+enum KycProvider {
+  stripe_identity
+
+  @@map("kyc_provider")
+  @@schema("identity")
+}
+
+/// KYC verification status. Mirrors the Stripe Identity
+/// `verificationSession` status state machine plus a `pending` entry
+/// for the moment between row insert and the first Stripe webhook
+/// landing. Transitions are one-way except `requires_input` → any
+/// active state (Stripe re-emits processing/verified after the user
+/// retries with new evidence).
+///
+/// - `pending`         — row inserted, Stripe session created, no
+///                       webhook events received yet.
+/// - `processing`      — Stripe is verifying the submitted documents.
+/// - `verified`        — Stripe says identity is confirmed; `verifiedAt`
+///                       is populated.
+/// - `requires_input`  — Stripe wants the user to retry (bad photo,
+///                       expired ID, etc.).
+/// - `failed`          — Stripe gave up on the session.
+/// - `canceled`        — operator-initiated or user-initiated cancel.
+///
+/// Provider-tier promotion (TS-051) gates on `verified`; the other
+/// states are surfaced to the provider portal as call-to-action UX.
+enum KycStatus {
+  pending
+  processing
+  verified
+  requires_input
+  failed
+  canceled
+
+  @@map("kyc_status")
+  @@schema("identity")
+}
+
+/// KYC verification record (PDD §8.2 `kyc_records`).
+///
+/// Each row represents one Stripe Identity `verificationSession` issued
+/// for a user. The user may have multiple historical rows (a `failed`
+/// row followed by a fresh `pending` retry, for example); the "current"
+/// record is the most-recent by `createdAt`. Read paths that need the
+/// definitive verification state filter to `status = verified` ordered
+/// by `verifiedAt DESC`.
+///
+/// **External id is the Stripe handle.** `externalId` stores the Stripe
+/// `verificationSession.id` (vs_...) — the same identifier Stripe sends
+/// on every webhook event for the session. Webhook ingestion looks the
+/// row up by `externalId` (unique) so out-of-order delivery is
+/// idempotent regardless of which event arrives first.
+///
+/// **At-rest encryption.** `payload_*` columns hold the AES-256-GCM
+/// envelope-encrypted Stripe payload — the most recent
+/// `verification_session.*` event body Stripe delivered, persisted so
+/// admin tooling (TS-126 / TS-128) can replay the decision trail
+/// without a round trip to Stripe. Cipher is `KycPayloadCipherService`
+/// (TS-026), independent key from the MFA cipher (CLAUDE.md §3 / §3.5
+/// — compartmentalised compromise). Columns are nullable so a freshly-
+/// created `pending` row before the first webhook lands has no payload
+/// yet.
+///
+/// **Last event id tracking.** `lastEventId` stores the Stripe
+/// `event.id` of the most recent webhook applied to this row. Coupled
+/// with `service-webhook`'s `stripe_processed_events.event_id` PK, the
+/// pair gives us end-to-end idempotency: even if service-webhook
+/// re-dispatches the same event (e.g. after a relay restart), the
+/// `applyWebhookEvent` call short-circuits when `event.id == lastEventId`.
+/// The column is nullable because `pending` rows haven't received any
+/// events yet.
+///
+/// **Soft FK.** `userId` references `identity.users.id`. We do not
+/// declare a Prisma relation — matches the convention adopted by
+/// RefreshToken / MfaMethod / MfaChallenge for the same reason
+/// (Phase 1 keeps the relation graph small; relation queries can be
+/// added in a forward-compatible migration).
+///
+/// **Unique externalId.** Stripe's `verificationSession.id` is globally
+/// unique within a Stripe account, so a row-level unique constraint
+/// is the natural lookup key for webhook hydration. Two
+/// `startSession` calls for the same user produce two different
+/// `externalId` values — the unique index guards against pathological
+/// races, not against the legitimate "user retried after a failure"
+/// flow.
+model KycRecord {
+  id                String      @id @default(cuid())
+  userId            String      @map("user_id")
+  provider          KycProvider
+  status            KycStatus   @default(pending)
+  /// Stripe `verificationSession.id` (vs_...). Unique across the
+  /// platform — Stripe guarantees this within a Stripe account, and
+  /// we run a single account in Phase 1.
+  externalId        String      @unique @map("external_id")
+  /// AES-256-GCM ciphertext of the most recent Stripe webhook
+  /// payload. Nullable until the first webhook lands.
+  payloadCiphertext Bytes?      @map("payload_ciphertext")
+  /// 96-bit random IV. Stored separately so audit / forensic dumps
+  /// keep the IV and auth tag semantically distinct from the
+  /// ciphertext.
+  payloadIv         Bytes?      @map("payload_iv")
+  /// 128-bit GCM auth tag. Verifying the tag is what makes the
+  /// at-rest encryption tamper-evident.
+  payloadAuthTag    Bytes?      @map("payload_auth_tag")
+  /// References which key in the env-managed keyring encrypted the
+  /// payload. Mismatched-version reads fail closed.
+  payloadKeyVersion Int?        @map("payload_key_version")
+  /// Stripe `event.id` of the most recently applied webhook event.
+  /// Short-circuits a same-event redelivery without touching the
+  /// payload columns. Nullable until the first event lands.
+  lastEventId       String?     @map("last_event_id")
+  /// Set on the transition into `verified`. Read-paths that need
+  /// "verified-as-of-when" pull this column directly.
+  verifiedAt        DateTime?   @map("verified_at") @db.Timestamptz(6)
+  createdAt         DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime    @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Powers `getLatestForUser` — a single user-id lookup whose
+  /// clustering on `(userId, createdAt DESC)` returns the
+  /// most-recent row first.
+  @@index([userId, createdAt(sort: Desc)], map: "kyc_records_user_recent_idx")
+  /// Powers admin queries like "every record currently in
+  /// `requires_input`" — small predicate, partial-index-shaped
+  /// access pattern, but kept full because the cardinality is
+  /// bounded and Phase 1 traffic volume is low. Promote to a
+  /// partial index if the table grows past million-row scale.
+  @@index([status], map: "kyc_records_status_idx")
+  @@map("kyc_records")
+  @@schema("identity")
+}
+
+/// Outbox event (TS-142-followup-1, PDD §7.3, CLAUDE.md §5.3).
+///
+/// Producer-side row written in the same Prisma transaction as the
+/// business state change. The `apps/workers/outbox-relay` worker
+/// polls for rows with `dispatched_at IS NULL`, forwards them to
+/// Redis Streams (`events:{event_name}`), and stamps `dispatched_at`
+/// on success. Consumers must be idempotent on `event_id`
+/// (at-least-once delivery semantics).
+///
+/// Column shape is identical across every producer service — each
+/// service ships its own migration that creates a separate
+/// `{schema}.outbox_events` table. The `@taste-and-see/nest-outbox`
+/// SDK is schema-agnostic; services compose `OutboxModule.forRoot`
+/// with their schema name and the SDK writes the row via raw SQL
+/// inside the caller's `prisma.$transaction`.
+///
+/// The model is declared here primarily so `prisma generate` reflects
+/// the table on the local client (for ad-hoc queries via Prisma
+/// Studio + admin tooling). Service code writes via the SDK's raw
+/// SQL surface; reads happen exclusively through the relay's
+/// `pg`-backed claim repository (the worker app does not share this
+/// Prisma client).
+///
+/// Identity-side producers land in their own follow-ups — e.g.
+/// `kyc.status_changed` (TS-026-followup-3) on a KYC status
+/// transition, and the account-locked notification signal
+/// (TS-025-followup-3). The table ships ahead of those producers so
+/// the relay wiring + migration review are decoupled from the
+/// per-event producer work (one reviewable migration per service).
+model OutboxEvent {
+  /// Dedup key — consumers must idempotency-check on this. UUID v4
+  /// generated by the SDK by default; producers may pass an explicit
+  /// id (e.g. a deterministic `{kycRecordId}.status.{occurredAtEpochMs}`
+  /// composite) for cross-boundary exactly-once-effective delivery.
+  eventId         String    @id @map("event_id")
+  /// Dot-notation event name from `packages/contracts/events`. The
+  /// SDK validates the name against the registry before inserting
+  /// — unknown names are rejected at the producer boundary.
+  eventName       String    @map("event_name")
+  /// Validated domain payload (validated by the SDK against the
+  /// matching `eventRegistry` schema before insert).
+  payload         Json
+  /// Producer wall-clock time the event semantically happened. May
+  /// differ from `created_at` for backfilled events.
+  occurredAt      DateTime  @map("occurred_at") @db.Timestamptz(6)
+  /// Service name that produced the row (e.g. `service-identity`).
+  /// Useful for relay observability + per-service throughput metrics.
+  producerService String    @map("producer_service")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Stamped by the relay when the row has been successfully
+  /// forwarded onto the bus. Null means undispatched + eligible for
+  /// the next poll cycle.
+  dispatchedAt    DateTime? @map("dispatched_at") @db.Timestamptz(6)
+  /// Failed dispatch counter. The relay stops retrying once this
+  /// reaches `MAX_ATTEMPTS` — those rows are dead-lettered for ops
+  /// attention (surfaced via metrics + an admin endpoint).
+  attempts        Int       @default(0)
+  /// Stamped by the relay on the most recent failed attempt.
+  lastAttemptAt   DateTime? @map("last_attempt_at") @db.Timestamptz(6)
+  /// Most recent failure message — capped at 2000 chars at the
+  /// relay's record-failure path.
+  lastError       String?   @map("last_error")
+
+  /// Relay's dominant read query: "give me the next batch of
+  /// undispatched rows ordered by created_at". A partial index on
+  /// `dispatched_at IS NULL` keeps the index footprint bounded
+  /// against an ever-growing table (the table is append-only; the
+  /// partial filter is highly selective at steady state).
+  ///
+  /// Prisma's `@@index` cannot directly express the partial
+  /// predicate; the partial index is materialised in the migration
+  /// SQL (20260608120000_outbox_events).
+  @@index([eventName], map: "outbox_events_event_name_idx")
+  @@map("outbox_events")
+  @@schema("identity")
+}
+
+/// Data-subject request kinds (TS-309a; PRD §11.4, PDD §16.3).
+///
+/// `erasure` is accepted even though TS-309c cannot execute one: refusing to
+/// RECORD a request would be worse than refusing to fulfil it, and a recorded
+/// refusal with a categorical reason is most of what a regulator asks to see.
+enum DataSubjectRequestKind {
+  access
+  erasure
+
+  @@map("data_subject_request_kind")
+  @@schema("identity")
+}
+
+/// Who the data is about (TS-309a).
+///
+/// `senior` is separate from `user` because a senior is frequently NOT an
+/// account. The household directory models seniors as their own records, and
+/// they are the subject of most of the platform's sensitive data while often
+/// never logging in — which is exactly why the requester and the subject have
+/// to be modelled apart.
+enum DataSubjectKind {
+  user
+  senior
+  provider
+
+  @@map("data_subject_kind")
+  @@schema("identity")
+}
+
+/// Lifecycle of a data-subject request (TS-309a). The legal edges live in
+/// `DATA_SUBJECT_REQUEST_STATUS_TRANSITIONS` in `packages/contracts` — this
+/// enum is the storage, the contract is the machine, and the service imports
+/// the contract rather than restating it (the TS-303c2b rule: a second copy of
+/// a legal state machine is how they drift).
+enum DataSubjectRequestStatus {
+  received
+  verifying
+  in_progress
+  fulfilled
+  refused
+  withdrawn
+
+  @@map("data_subject_request_status")
+  @@schema("identity")
+}
+
+/// Why a request was refused (TS-309a). Categorical because "no" is an answer
+/// a regulator expects to find recorded — a request that quietly stops
+/// progressing is indistinguishable from one nobody worked. See the contract
+/// for what each value means and why it is one the platform can justify.
+enum DataSubjectRequestRefusalReason {
+  identity_not_verified
+  not_the_subject
+  subject_consent_absent
+  retention_required
+  duplicate_request
+  out_of_scope
+
+  @@map("data_subject_request_refusal_reason")
+  @@schema("identity")
+}
+
+/// A privacy request under CCPA / state law (TS-309a; PRD §11.4; PDD §16.3,
+/// §16.4; CLAUDE.md §3.6, §12).
+///
+/// **This table exists to keep three things apart that the original acceptance
+/// treated as one person.** "Users export their data" holds only when the
+/// account holder and the data subject coincide, and on this platform they
+/// routinely do not: the senior is who most of the data is about, the family
+/// payer holds the account. So the row carries the REQUESTER (stamped from the
+/// access token), the SUBJECT (who the data is about), and the VERIFICATION
+/// that links them — and without that third thing nothing is ever handed over.
+///
+/// When requester and subject differ and the subject is a senior,
+/// `household.senior_consent` governs what a family observer may see at all
+/// (CLAUDE.md §12). An export that ignored it would breach the platform's own
+/// consent model in the course of satisfying a privacy request. This table
+/// makes that case REPRESENTABLE BUT NEVER AUTOMATIC: `self_service = false`
+/// requests can only leave `verifying` through a human act, recorded here.
+///
+/// Lives in `service-identity` rather than a new `service-privacy` because the
+/// hard part of a DSAR is "who is this person and may they act for that
+/// subject", and identity already owns users, sessions and MFA — the
+/// verification machinery a separate service would have to call anyway. If
+/// erasure orchestration later needs its own queue and its own failure
+/// domain, splitting it out is a migration of one table, not a redesign.
+model DataSubjectRequest {
+  id                 String                           @id @default(cuid())
+  /// The authenticated account that asked. **Stamped from the verified access
+  /// token, NEVER from a request body** — a record in which the caller names
+  /// themselves is worthless as evidence (the rule TS-301b applied to incident
+  /// reporters). Real FK: the requester is always a user of this service.
+  requesterUserId    String                           @map("requester_user_id")
+  requester          User                             @relation(fields: [requesterUserId], references: [id], onDelete: Restrict)
+  subjectKind        DataSubjectKind                  @map("subject_kind")
+  /// Soft reference into whichever directory owns the subject —
+  /// `identity.users`, `household.seniors`, or `provider.providers`. Never a
+  /// Prisma relation: two of the three live in other services' schemas
+  /// (CLAUDE.md §2.3 / §4.1).
+  subjectId          String                           @map("subject_id")
+  /// Denormalised "the requester IS the subject", computed at intake and never
+  /// recomputed. Stored rather than derived because it is the predicate the
+  /// whole authorisation turns on, and a row whose meaning changes later is
+  /// not evidence.
+  selfService        Boolean                          @map("self_service")
+  kind               DataSubjectRequestKind
+  status             DataSubjectRequestStatus         @default(received)
+  /// The requester's own words. Bounded at the contract layer. Written by a
+  /// person and may name anybody, so: stored, never logged, never on an event.
+  note               String?
+  /// Intake wall-clock — when the request was made, not when the row landed.
+  receivedAt         DateTime                         @map("received_at") @db.Timestamptz(6)
+  /// Statutory response deadline, computed ONCE at intake from
+  /// `DATA_SUBJECT_REQUEST_RESPONSE_DAYS`. Stored rather than derived so a
+  /// later change to that constant cannot retroactively rewrite what was
+  /// promised on an old request.
+  dueAt              DateTime                         @map("due_at") @db.Timestamptz(6)
+  /// When the single permitted extension was taken. Non-null means `due_at`
+  /// already includes it; the service refuses a second.
+  extendedAt         DateTime?                        @map("extended_at") @db.Timestamptz(6)
+  extensionReason    String?                          @map("extension_reason")
+  /// The verification trail. All three are set together or none is — a DB
+  /// CHECK enforces the pairing, so a half-written verification (which would
+  /// read as "verified by nobody for no reason") is unrepresentable.
+  verifiedAt         DateTime?                        @map("verified_at") @db.Timestamptz(6)
+  verifiedByUserId   String?                          @map("verified_by_user_id")
+  /// How the link between requester and subject was established. Free text
+  /// because the methods vary; never returned to the requester, because
+  /// publishing it teaches someone how to defeat it.
+  verificationMethod String?                          @map("verification_method")
+  fulfilledAt        DateTime?                        @map("fulfilled_at") @db.Timestamptz(6)
+  refusedAt          DateTime?                        @map("refused_at") @db.Timestamptz(6)
+  refusalReason      DataSubjectRequestRefusalReason? @map("refusal_reason")
+  refusalNote        String?                          @map("refusal_note")
+  withdrawnAt        DateTime?                        @map("withdrawn_at") @db.Timestamptz(6)
+  createdAt          DateTime                         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime                         @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// "My requests" — the requester-facing list, newest first.
+  @@index([requesterUserId, receivedAt], map: "data_subject_requests_requester_idx")
+  /// "Every request about this person" — the duplicate check at intake, and
+  /// the answer to "what have we been asked about this senior".
+  @@index([subjectKind, subjectId], map: "data_subject_requests_subject_idx")
+  /// The operator queue, deadline-soonest first. Steady state is dominated by
+  /// terminal rows, so the migration materialises this PARTIAL on the three
+  /// live statuses — Prisma's `@@index` cannot express the predicate
+  /// (CLAUDE.md §7.3).
+  @@index([dueAt], map: "data_subject_requests_open_due_idx")
+  @@map("data_subject_requests")
+  @@schema("identity")
+}

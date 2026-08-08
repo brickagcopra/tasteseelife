@@ -1,0 +1,35 @@
+{
+  "name": "@taste-and-see/e2e",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "End-to-end suite for Taste & See (TS-505). Drives the api-gateway over HTTP against a real fleet of services started from their compiled dist/, matching production topology: the gateway is the only surface a client touches, and it is what signs the internal trust headers.",
+  "scripts": {
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "clean": "rimraf test-results playwright-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.48.2",
+    "@prisma/client": "5.22.0",
+    "@taste-and-see/api-gateway": "workspace:*",
+    "@taste-and-see/contracts": "workspace:*",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/service-accounting": "workspace:*",
+    "@taste-and-see/service-audit": "workspace:*",
+    "@taste-and-see/service-booking": "workspace:*",
+    "@taste-and-see/service-concierge": "workspace:*",
+    "@taste-and-see/service-household": "workspace:*",
+    "@taste-and-see/service-identity": "workspace:*",
+    "@taste-and-see/service-search": "workspace:*",
+    "@taste-and-see/service-trust-safety": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@taste-and-see/worker-outbox-relay": "workspace:*",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "rimraf": "6.0.1",
+    "typescript": "5.5.4"
+  }
+}

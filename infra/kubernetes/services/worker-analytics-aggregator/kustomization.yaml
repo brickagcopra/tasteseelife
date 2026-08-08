@@ -1,0 +1,117 @@
+# Per-worker base for worker-analytics-aggregator (TS-151-followup-1
+# rollout, Batch 3 — observability/analytics cluster). Consumes the
+# reusable bullmq-worker component. The worker is a thin nightly
+# scheduler with NO datastore of its own (TS-217-prep-3b): once a day it
+# makes one shared-secret-pinned internal call to service-analytics'
+# `POST /api/v1/internal/analytics/search-relevance/compute`, which owns
+# the raw-table read + the aggregation.
+#
+# Lives in `platform-workers`. Headless: the bullmq-worker component
+# ships NO Service / Ingress / HPA — the worker runs on a scheduler tick
+# and exposes only /healthz + /readyz for the k8s probes. PORT is pinned
+# to the component's default 3000 (the probe port) rather than the env
+# schema's 3054 default — purely a healthz listener, so matching the
+# component avoids per-port patching.
+#
+# Egress: the worker calls service-analytics in platform-services, which
+# the namespace default-deny blocks by default — egress-network-policy.yaml
+# opens exactly that path (platform-services:3023). The analytics base in
+# turn admits ingress from platform-workers.
+#
+# The internal API key matches service-analytics'
+# INTERNAL_AGGREGATION_API_KEY — rotation is a two-side deploy. The base
+# URL + header name are env-independent and ride the non-secret ConfigMap.
+#
+# Env overlays in infra/kubernetes/overlays/<env>/ patch image tag and a
+# handful of ConfigMap values per env.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: platform-workers
+
+components:
+  - ../../components/bullmq-worker
+
+resources:
+  - secret-placeholder.yaml
+  - egress-network-policy.yaml
+
+commonLabels:
+  app.kubernetes.io/name: worker-analytics-aggregator
+  app.kubernetes.io/instance: worker-analytics-aggregator
+  app.kubernetes.io/part-of: taste-and-see
+
+patches:
+  - target:
+      kind: ServiceAccount
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-analytics-aggregator
+
+  - target:
+      kind: ConfigMap
+      name: bullmq-worker-config
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-analytics-aggregator-config
+      - op: replace
+        path: /data
+        value:
+          NODE_ENV: production
+          LOG_LEVEL: info
+          PORT: "3000"
+          SERVICE_VERSION: dev
+          # TS-504-followup-2a-2 — this worker now boots the OTel SDK + Sentry
+          # (`src/observability/bootstrap.ts`, first import in main.ts). Both OTel
+          # flags default true in the Zod schema; stated here so the enabled
+          # posture is visible in the manifest rather than implied. SENTRY_DSN
+          # EMPTY = off, and the worker logs that it is off rather than staying quiet.
+          OTEL_TRACES_ENABLED: "true"
+          OTEL_METRICS_ENABLED: "true"
+          SENTRY_DSN: ""
+          ANALYTICS_SERVICE_BASE_URL: http://service-analytics.platform-services.svc.cluster.local:3023
+          ANALYTICS_AGGREGATION_INTERNAL_HEADER_NAME: x-analytics-internal-api-key
+          REQUEST_TIMEOUT_MS: "30000"
+          ANALYTICS_AGGREGATOR_ENABLED: "true"
+          ANALYTICS_AGGREGATOR_RUN_HOUR_UTC: "3"
+          ANALYTICS_AGGREGATOR_SCHEDULER_TICK_MS: "3600000"
+
+  - target:
+      kind: Deployment
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-analytics-aggregator
+      - op: replace
+        path: /spec/template/spec/serviceAccountName
+        value: worker-analytics-aggregator
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: ghcr.io/brickagcopra/worker-analytics-aggregator:replace-me
+      - op: replace
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: worker-analytics-aggregator-config
+          - secretRef:
+              name: worker-analytics-aggregator-secrets
+
+  - target:
+      kind: NetworkPolicy
+      name: bullmq-worker-ingress-deny
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-analytics-aggregator-ingress-deny
+
+  - target:
+      kind: PodDisruptionBudget
+      name: bullmq-worker
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: worker-analytics-aggregator

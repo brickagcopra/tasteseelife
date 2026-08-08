@@ -1,0 +1,183 @@
+# ArgoCD Helm values (chart argo-cd 7.7.0 → ArgoCD v2.13.x).
+#
+# Phase 1 posture: single-replica controllers, HA disabled. The Phase 1
+# cluster (3× Cloud VPS L per ADR-0001) does not warrant the resource
+# overhead of HA mode; an outage of an ArgoCD controller pauses CD but
+# does NOT affect running workloads. Promotion to HA (3× controller
+# replicas, in-cluster Redis HA) lands with TS-152-followup-1 once the
+# cluster grows past the Phase 1 baseline.
+#
+# Critical wire-up:
+#   - configs.cm.kustomize.buildOptions: --enable-helm
+#     ArgoCD's repo-server invokes `kustomize build`; without this flag
+#     the base/ingress-nginx/ + base/cert-manager/ HelmChartInflation-
+#     Generators silently emit no chart-rendered children, identical
+#     to the foot-gun documented in infra/kubernetes/README.md.
+#   - configs.params."server.insecure": true
+#     ArgoCD-server terminates TLS at the NGINX Ingress (TS-151's
+#     ingress-nginx + cert-manager). Running argocd-server itself in
+#     insecure mode (HTTP on :8080) means TLS happens exactly once at
+#     the edge — the standard pattern when an ingress fronts ArgoCD.
+#     The Ingress resource carries `cert-manager.io/cluster-issuer:
+#     letsencrypt-prod` so the public hostname always serves a
+#     legitimate cert.
+#   - server.ingress.enabled: false (Phase 1)
+#     The ArgoCD UI ingress is deliberately NOT exposed in Phase 1.
+#     Operators reach the UI via `kubectl port-forward svc/argocd-server
+#     -n argocd 8080:80` until SSO + WAF rules land (TS-152-followup-2).
+#     The argocd CLI uses the same port-forward, so day-to-day ops works
+#     without internet-facing ArgoCD until the auth story is hardened.
+
+global:
+  domain: argocd.invalid.local # placeholder; overridden when ingress lands (TS-152-followup-2)
+  podLabels:
+    app.kubernetes.io/part-of: taste-and-see
+
+configs:
+  cm:
+    # Kustomize-helm inflation is mandatory for our base/ingress-nginx +
+    # base/cert-manager bases — without --enable-helm the repo-server emits
+    # zero chart-rendered children and the cluster ends up with no ingress.
+    kustomize.buildOptions: --enable-helm
+    # Source-of-truth admin policy. Local admin user disabled in favour of
+    # SSO once that lands (TS-152-followup-2). For Phase 1 the admin user
+    # stays enabled so an operator can recover an OIDC outage.
+    admin.enabled: "true"
+    # Repo timeout aligned to the largest manifest set we expect at Phase 1
+    # (per-service overlays — none over 200 manifests yet).
+    timeout.reconciliation: 180s
+    timeout.hard.reconciliation: 0s
+    # Resource-tracking via annotation, not the legacy label-based scheme.
+    # Annotation tracking survives `kustomize commonLabels` changes without
+    # ArgoCD treating every label tweak as a resource churn.
+    application.resourceTrackingMethod: annotation
+    # Block out-of-cluster destinations by default. Per-AppProject explicit
+    # allow-lists declare which clusters each project may target. Phase 1 is
+    # single-cluster so every AppProject targets `https://kubernetes.default.svc`.
+    application.instanceLabelKey: argocd.argoproj.io/instance
+
+  params:
+    # argocd-server runs HTTP behind the ingress that terminates TLS.
+    server.insecure: "true"
+    # Conservative repo-server concurrency — Phase 1 cluster CPU is the
+    # bottleneck, not the repo-server.
+    reposerver.parallelism.limit: "10"
+    # Health-check timeout for `kubectl wait`-style health checks the
+    # built-in resource customisations run.
+    controller.repo.server.timeout.seconds: "120"
+
+  # RBAC: Phase 1 ships a permissive admin-only policy. Per-team RBAC +
+  # SSO lands with TS-152-followup-2 (Dex / OIDC integration against the
+  # company IdP).
+  rbac:
+    create: true
+    policy.default: role:readonly
+    policy.csv: |
+      # The local `admin` user (created by the chart) maps to role:admin which
+      # has full cluster + AppProject + Application authority. Until SSO ships,
+      # every operator action goes through this user via `argocd login`.
+      g, admin, role:admin
+
+      # role:readonly inherits a wide read surface from the built-in policy.
+      # Keep explicit grants narrow; widen via TS-152-followup-2.
+      p, role:readonly, applications, get, */*, allow
+      p, role:readonly, projects, get, *, allow
+      p, role:readonly, repositories, get, *, allow
+      p, role:readonly, clusters, get, *, allow
+
+# Controller settings — single-replica for Phase 1.
+controller:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: false # Wired alongside TS-151-followup-6 (Prometheus / Grafana stack)
+
+# Server (UI + gRPC) — single-replica for Phase 1.
+server:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  ingress:
+    enabled: false # Wired with TS-152-followup-2 (SSO + WAF + public hostname)
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: false
+
+# Repo-server — manifest rendering workhorse.
+repoServer:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: false
+
+# ApplicationSet controller — keeps the CRD present even though Phase 1 has
+# no ApplicationSet manifests yet (TS-152-followup-4 introduces the first one
+# when the per-service split becomes operationally meaningful).
+applicationSet:
+  enabled: true
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: false
+
+# Notifications controller — drives Slack / email / PagerDuty alerts on
+# sync / health state transitions. The CRDs ship enabled so a follow-up
+# can wire templates without re-applying the install overlay; the actual
+# notification config (Slack webhook, templates) lands with TS-152-followup-5.
+notifications:
+  enabled: true
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+# Bundled Redis — single replica for Phase 1; HA Redis (sentinel) follows
+# the controller-HA promotion path documented above (TS-152-followup-1).
+redis:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+# Dex (OIDC bridge) — disabled in Phase 1. Enabled with TS-152-followup-2
+# when SSO against the company IdP lands.
+dex:
+  enabled: false

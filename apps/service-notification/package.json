@@ -1,0 +1,71 @@
+{
+  "name": "@taste-and-see/service-notification",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Notification bounded context (PDD §7.2 service inventory entry #9). Owns transactional template management — MJML + Handlebars authoring, per-locale versioning, immutable version history, render-on-demand for sibling channel dispatchers. TS-072 ships the NestJS 11 + Prisma + Postgres skeleton with the `notification` Postgres schema (templates + immutable versions), the MJML compiler + Handlebars renderer with strict variable validation (PDD §12.2), the AccessTokenGuard-protected admin CRUD endpoints, and the shared-secret-pinned internal `/render` endpoint. Channel SDKs (Postmark / SES / Twilio / APNs+FCM) plus per-channel preferences + quiet hours + senior-mode defaults land with TS-073. The Cassandra `notification.history` keyspace (PDD §8.3) lands as TS-072-followup-3 once outbox-driven delivery telemetry arrives.",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "start:dev": "tsc -p tsconfig.build.json --watch",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:boot-graph": "vitest run test/app-module-graph.test.ts",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo",
+    "seed:templates": "node dist/scripts/seed-notification-templates.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate:dev": "prisma migrate dev",
+    "prisma:migrate:deploy": "prisma migrate deploy",
+    "prisma:migrate:status": "prisma migrate status",
+    "prisma:studio": "prisma studio"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.0.0",
+    "@nestjs/core": "11.0.0",
+    "@nestjs/platform-express": "11.0.0",
+    "@prisma/client": "5.22.0",
+    "@taste-and-see/auth-sdk": "workspace:*",
+    "@taste-and-see/contracts": "workspace:*",
+    "@taste-and-see/logger": "workspace:*",
+    "@taste-and-see/nest-auth": "workspace:*",
+    "@taste-and-see/nest-common": "workspace:*",
+    "@taste-and-see/nest-observability": "workspace:*",
+    "@taste-and-see/nest-outbox-consumer": "workspace:*",
+    "@taste-and-see/nest-prisma-tenant-scope": "workspace:*",
+    "@taste-and-see/sentry": "workspace:*",
+    "@taste-and-see/tracing": "workspace:*",
+    "handlebars": "4.7.8",
+    "ioredis": "5.4.1",
+    "jsonwebtoken": "9.0.2",
+    "mjml": "4.15.3",
+    "postmark": "5.1.0",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.1",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/testing": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/express": "5.0.0",
+    "@types/jsonwebtoken": "9.0.7",
+    "@types/mjml": "4.7.4",
+    "@types/mjml-core": "4.15.2",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "prisma": "5.22.0",
+    "rimraf": "6.0.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "prisma": {
+    "schema": "prisma/schema.prisma"
+  }
+}

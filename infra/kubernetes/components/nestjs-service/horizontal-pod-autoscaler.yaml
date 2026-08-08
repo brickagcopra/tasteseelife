@@ -1,0 +1,46 @@
+# Horizontal Pod Autoscaler. Default: scale on CPU utilisation, range
+# 2..6, target 70%. Custom-metric scaling (queue depth for workers,
+# RPS for high-fanout services) lands per-service in a follow-up.
+#
+# Stabilization windows tuned to absorb minute-scale spikes (15s) but
+# scale down conservatively (5m) so we don't oscillate during normal
+# traffic ebb-and-flow.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nestjs-service
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: backend
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nestjs-service
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Max

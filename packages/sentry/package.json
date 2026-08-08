@@ -1,0 +1,54 @@
+{
+  "name": "@taste-and-see/sentry",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Sentry error reporting for Taste & See (CLAUDE.md §10). Errors only — @taste-and-see/tracing owns spans and metrics, so the Node SDK is initialised with skipOpenTelemetrySetup and no instrumentation integrations. The `.` subpath is SDK-free (pure scrubbing + option types) so the Next.js portals can share the redaction rules without pulling in @sentry/node; `./node` carries the @sentry/node bootstrap. Redaction key names are DERIVED from @taste-and-see/logger's DEFAULT_REDACT_PATHS so there is exactly one PII list on the platform.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "default": "./dist/node.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "node": [
+        "dist/node.d.ts"
+      ]
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "1.9.0",
+    "@sentry/node": "10.69.0",
+    "@taste-and-see/logger": "workspace:*"
+  },
+  "devDependencies": {
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/node": "22.10.1",
+    "eslint": "8.57.0",
+    "rimraf": "6.0.1",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

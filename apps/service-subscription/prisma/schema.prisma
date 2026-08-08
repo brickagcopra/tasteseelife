@@ -1,0 +1,972 @@
+// Subscription bounded context — see PDD §7.2 (service inventory entry #5)
+// and §8.2 (`subscription` schema column inventory).
+//
+// Scope so far:
+//   - TS-040 adds the `plans` table — the read-only catalog of subscription
+//     products offered to families/seniors, providers, and Cooking Academy
+//     students. Seeded by `pnpm seed:plans` with the seven Phase-1 plans
+//     (3 family tiers + 3 provider tiers + 1 academy membership).
+//   - TS-041b adds the per-customer `subscriptions` row, the append-only
+//     `subscription_history` audit log, the `payment_methods` cache, and
+//     the `invoices` + `invoice_line_items` shape (mostly populated by
+//     webhook-driven flows once TS-142's outbox relay routes verified
+//     Stripe events into this service). Outbound endpoints orchestrate
+//     `customer.create`, `subscription.create / update / cancel`; inbound
+//     state mutations (subscription.updated, invoice.payment_succeeded)
+//     land via the relay path.
+//
+//   - TS-043 adds `coupons` + `coupon_redemptions` — the promo-code
+//     catalog + per-customer redemption audit trail. CouponsService
+//     wraps validation + lazy Stripe Coupon creation + atomic redemption
+//     persistence inside the same Prisma transaction that creates the
+//     subscription row, so a Stripe failure leaves zero local state.
+//     Abuse rate-limiting (IP + per-user) for the validate endpoint
+//     lives in a Redis-backed sliding-window guard (CLAUDE.md §12).
+//
+// Deliberately deferred to follow-on tasks (all per PDD §8.2):
+//   - Inbound webhook → DB sync handlers — once TS-142 relay is in place.
+//
+// Splitting these by task keeps each migration focused and reviewable, and
+// matches the shape used in the household service (TS-030 shipped 3 base
+// tables, then TS-031/TS-032/TS-033 each added their own expand-only
+// migration).
+//
+// Cross-service references are by id only — never a foreign key into another
+// service schema (CLAUDE.md §2.3, §4.1). `subscriptions.customer_id` is the
+// soft FK into `household.households.id` (when `customer_group = family`),
+// `provider.providers.id` (when `customer_group = provider`), or
+// `identity.users.id` (when `customer_group = academy`). Cross-schema
+// joins are forbidden — the gateway aggregates if a downstream view needs
+// the household name + the subscription record together.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. Production-stable since
+  // Prisma 5.0 even though it remains under the `previewFeatures` umbrella
+  // in 5.x.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `subscription` Postgres schema. Every other service
+  // gets its own schema in the same database (Phase 1) or its own database
+  // entirely (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["subscription"]
+}
+
+/// Which Taste & See customer group a plan is offered to. Mirrors the
+/// PRD §5 split between Family/Senior membership, Chef/Caregiver
+/// subscriptions, and Cooking Academy products. The customer_group also
+/// drives `subscriptions.customer_id`'s referent — for `family`, the id
+/// is a `household.households.id` (soft FK); for `provider`, it's a
+/// `provider.providers.id` (soft FK); for `academy`, it's a
+/// `identity.users.id`.
+///
+/// Adding a new group is a breaking-but-explicit contract change rather
+/// than a silent extension — every consumer of `PlanCustomerGroupSchema`
+/// would either pick up the new variant or reject it.
+enum PlanCustomerGroup {
+  family
+  provider
+  academy
+
+  @@map("plan_customer_group")
+  @@schema("subscription")
+}
+
+/// Subscription plan — the catalog of products families, providers, and
+/// Academy students can subscribe to (PRD §5).
+///
+/// **Money columns** (CLAUDE.md §4.1, §17.6): `Decimal(12,2)` with an
+/// explicit `currency` column (Phase 1 is single-currency USD; the
+/// schema is multi-currency-ready per PDD §11.2 "Multi-currency-ready
+/// schema"). Wire format is integer minor units (`monthlyPriceUsdMinor`,
+/// `annualPriceUsdMinor`) per the contract DTO; the `PlansService`
+/// converts `Decimal` to minor-units at the DTO boundary so no
+/// `Number`-coerced math touches the value in transit.
+///
+/// **Plan code** (`code`): unique, lowercase, dot/kebab-cased identifier
+/// (`family.tier1`, `provider.elite`, `academy.membership`). Codes are
+/// stable forever — they are referenced by event payloads
+/// (`subscription.activated.planCode`) and may be quoted in customer
+/// emails and accounting reports. Renames are not supported; if a plan
+/// needs a new identity (e.g. major price restructure), retire the old
+/// code with `active = false` and create a new one.
+///
+/// **Features**: a JSON array of human-readable feature strings rendered
+/// on the pricing page. Stored as `jsonb` so admin tooling (TS-127) can
+/// edit it without migrations.
+///
+/// **Sort position**: the order in which plans render on the pricing
+/// page within a customer_group (Tier 1 → Tier 2 → Tier 3, Basic → Elite,
+/// etc). Service layer sorts by `(customer_group, sort_position)` for the
+/// list endpoint; admin tooling can rewrite positions without DDL.
+///
+/// **Active flag**: a soft "retire this plan" mechanism. Inactive plans
+/// are filtered from the public list endpoint but remain readable by
+/// admin tools and continue to back the historical subscriptions that
+/// reference them.
+///
+/// Soft-delete is intentionally NOT supported here: plans are never
+/// deleted (every subscription row points at one via `plan_id`, and the
+/// historical record matters for accounting). `active = false` is the
+/// retire path.
+model Plan {
+  id              String            @id @default(cuid())
+  /// Stable identifier referenced by event payloads + reports.
+  /// Lower-case, dot/kebab-cased. UNIQUE.
+  code            String            @unique
+  /// Human-readable name rendered on the pricing page and in invoice
+  /// line items ("Essential", "Companion Dining", "Concierge Lifestyle").
+  name            String
+  /// Optional marketing description. Capped at 2000 chars at the contract
+  /// layer; persisted as `text` so the contract is the canonical limit.
+  description     String?
+  customerGroup   PlanCustomerGroup @map("customer_group")
+  /// Monthly subscription price. `Decimal(12,2)` to defeat float
+  /// arithmetic (CLAUDE.md §4.1) — the DTO converts to integer USD
+  /// minor units before the wire so consumers never do Number math.
+  monthlyPrice    Decimal           @map("monthly_price") @db.Decimal(12, 2)
+  /// Annual subscription price (typically `monthly * 10` for a
+  /// "two months free" effective discount; admin tooling can override).
+  /// Same `Decimal(12,2)` discipline.
+  annualPrice     Decimal           @map("annual_price") @db.Decimal(12, 2)
+  /// Currency code (ISO 4217). Phase-1 is `USD` only; the schema is
+  /// multi-currency-ready so a Phase-3 (national / international)
+  /// rollout is forward-compatible.
+  currency        String            @default("USD") @db.Char(3)
+  /// JSON array of human-readable feature strings (rendered on the
+  /// pricing page). Stored as `jsonb` so admin tooling can edit
+  /// without migrations. Contract layer caps each string at 160 chars
+  /// and the array at 64 entries.
+  features        Json              @default("[]")
+  /// `true` = plan is visible on the public pricing page. `false` =
+  /// retired plan; backs historical subscriptions but no new ones.
+  active          Boolean           @default(true)
+  /// Within `customer_group`, lower = earlier on the pricing page.
+  /// Drives ordering of the GET /api/v1/plans response.
+  sortPosition    Int               @default(0) @map("sort_position")
+  /// Stripe Product id (`prod_...`) backing this plan. Null until the
+  /// first subscription for the plan is created (lazy initialisation
+  /// in `SubscriptionsService.create`); once set, every subsequent
+  /// Stripe `price_data` reuses the same Product so the Stripe Dashboard
+  /// stays clean (one Product per platform Plan).
+  ///
+  /// Future admin tooling (TS-127) can pre-seed this via a Stripe
+  /// Product create + back-fill, but lazy is cheaper for Phase 1 — the
+  /// per-plan Product is created on the first subscription and survives
+  /// thereafter.
+  stripeProductId String?           @map("stripe_product_id")
+  createdAt       DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime          @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Back-relation for the FK in `Subscription.plan_id`. Required by
+  /// Prisma's relation modelling; the back-ref is rarely traversed in
+  /// queries (we look up subscriptions by id, not by plan).
+  subscriptions Subscription[]
+
+  /// Powers the public pricing-page query — "list every active plan
+  /// for this customer_group, ordered by sortPosition then code".
+  /// Composite covering index so a single scan filters AND orders.
+  @@index([active, customerGroup, sortPosition, code], map: "plans_active_customer_group_sort_idx")
+  @@map("plans")
+  @@schema("subscription")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// TS-041b — per-customer subscription rows + the audit log + payment-method
+// cache + invoice envelope. Outbound endpoints (POST/PATCH/DELETE
+// /api/v1/subscriptions) populate `subscriptions` + `subscription_history`
+// directly. Inbound webhook-driven mutations (subscription.updated,
+// invoice.created, invoice.payment_succeeded, invoice.payment_failed) land
+// in `subscriptions` / `invoices` / `invoice_line_items` once TS-142's
+// outbox relay routes verified Stripe events from `service-webhook` into
+// this service. Until then the invoice tables exist as the persistence
+// shape but receive no live writes.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Subscription lifecycle status. Mirrors the platform's domain semantics
+/// rather than Stripe's exact set — the contract layer maps both ways.
+///
+/// - `incomplete`         — created but the first payment hasn't cleared.
+/// - `incomplete_expired` — first payment never cleared in time.
+/// - `trialing`           — inside a trial period (no charges yet).
+/// - `active`             — paid + within the current period.
+/// - `past_due`           — payment failed; in dunning grace period.
+/// - `unpaid`             — dunning exhausted; no service.
+/// - `canceled`           — terminated. May still have access until
+///                          `period_end` if `cancel_at_period_end` was set.
+/// - `paused`             — admin-suspended (PRD §10.3 pause/resume).
+///
+/// Adding a new status is a breaking-but-explicit contract change.
+enum SubscriptionStatus {
+  incomplete
+  incomplete_expired
+  trialing
+  active
+  past_due
+  unpaid
+  canceled
+  paused
+
+  @@map("subscription_status")
+  @@schema("subscription")
+}
+
+/// Billing interval for the subscription. Mirrors the choice exposed at
+/// checkout: monthly or annual. Plan-catalog seeded prices are quoted for
+/// both intervals (`monthlyPrice`, `annualPrice`); the chosen interval is
+/// frozen on the subscription row at creation.
+enum BillingInterval {
+  monthly
+  annual
+
+  @@map("billing_interval")
+  @@schema("subscription")
+}
+
+/// Categorical reason a subscription was canceled. Drives the
+/// `subscription.canceled` event payload (`SubscriptionCanceledSchema.reason`)
+/// and downstream analytics (PRD §10.3 dunning + churn analytics).
+enum SubscriptionCancelReason {
+  customer_request
+  payment_failure
+  fraud
+  admin_action
+  partner_termination
+
+  @@map("subscription_cancel_reason")
+  @@schema("subscription")
+}
+
+/// Append-only event types for `subscription_history`. The audit log records
+/// every state transition — created, status change, plan change, cancel,
+/// pause/resume — without ever updating an existing row (CLAUDE.md §3.6).
+enum SubscriptionHistoryEvent {
+  created
+  status_changed
+  plan_changed
+  payment_method_changed
+  trial_extended
+  paused
+  resumed
+  canceled
+  reactivated
+
+  @@map("subscription_history_event")
+  @@schema("subscription")
+}
+
+/// Payment-method backing a subscription. `card` is the only kind we
+/// support at launch; `bank_account` (ACH) lands once we enable it for
+/// monthly Tier 2 (PRD §6.2). HSA/FSA cards register as `card` from
+/// Stripe's perspective.
+enum PaymentMethodKind {
+  card
+  bank_account
+
+  @@map("payment_method_kind")
+  @@schema("subscription")
+}
+
+/// Invoice status. Mirrors Stripe's invoice lifecycle to keep the mapping
+/// trivial; we collapse `deleted` (a Stripe-internal state for drafts) to
+/// `void` because no consumer cares about the distinction.
+enum InvoiceStatus {
+  draft
+  open
+  paid
+  void
+  uncollectible
+
+  @@map("invoice_status")
+  @@schema("subscription")
+}
+
+/// Categorical kind of an invoice line item. Most lines are `subscription`
+/// (the recurring charge); add-ons (concierge bookings billed onto the
+/// subscription invoice) are `addon`; `discount` lines are negative-amount
+/// coupon redemptions; `tax` lines are Stripe Tax remittance.
+enum InvoiceLineItemKind {
+  subscription
+  addon
+  discount
+  tax
+  proration
+
+  @@map("invoice_line_item_kind")
+  @@schema("subscription")
+}
+
+/// Per-customer subscription record (PDD §8.2 `subscriptions` table).
+///
+/// **`stripe_subscription_id`** is the durable identity link into Stripe's
+/// system. Unique. The platform's own `id` (cuid) is what every other
+/// service references; the Stripe id stays scoped to this service +
+/// `service-webhook`.
+///
+/// **`customer_id`** is a SOFT foreign key — its referent depends on
+/// `customer_group`:
+///   - `family`   → `household.households.id`
+///   - `provider` → `provider.providers.id`
+///   - `academy`  → `identity.users.id`
+/// Cross-schema joins are forbidden (CLAUDE.md §2.3); the gateway
+/// aggregates when a view needs the household name + the subscription.
+///
+/// **`plan_id`** is a soft FK into `plans.id` in this same schema (so it
+/// CAN have an FK constraint — both tables live in `subscription`). The
+/// FK is enforced because plans never disappear; admin tooling retires a
+/// plan via `active = false`, never deletion.
+///
+/// **`current_period_start` / `current_period_end`** are the boundaries of
+/// the current billing period. Used by the accounting service for revenue
+/// recognition (CLAUDE.md §6: "Subscription revenue recognition: deferred
+/// → recognized over the service period").
+///
+/// **`cancel_at_period_end`** marks a subscription that has been requested
+/// to cancel at the end of the current period (the Stripe-default cancel
+/// flow). Until `period_end`, status remains `active` and the customer
+/// retains access; on the period boundary, the webhook flips status to
+/// `canceled`. Immediate-cancel skips this and goes straight to `canceled`.
+///
+/// **Soft-delete is intentionally NOT supported** here. Canceled
+/// subscriptions remain queryable forever — they are part of the customer
+/// history that drives lifetime-value reporting and reactivation flows.
+model Subscription {
+  id                       String                    @id @default(cuid())
+  /// Stripe's `sub_...` id. Unique. Phase 1 issues exactly one Stripe
+  /// subscription per platform subscription; future product bundles
+  /// (Tier 2 + Cooking Academy combo) might split, but not at launch.
+  stripeSubscriptionId     String                    @unique @map("stripe_subscription_id")
+  /// Stripe's `cus_...` id. Cached here so updates don't have to roundtrip
+  /// to `payment_methods` to look up the customer. Same value as the
+  /// `payment_methods.stripe_customer_id` on every method backing this
+  /// subscription.
+  stripeCustomerId         String                    @map("stripe_customer_id")
+  /// Soft FK — see model header for the per-customer-group referent.
+  customerId               String                    @map("customer_id")
+  customerGroup            PlanCustomerGroup         @map("customer_group")
+  /// FK into `plans` (same schema, so a real FK is allowed).
+  planId                   String                    @map("plan_id")
+  plan                     Plan                      @relation(fields: [planId], references: [id])
+  status                   SubscriptionStatus
+  billingInterval          BillingInterval           @map("billing_interval")
+  /// Start of the current billing period. Updated on every period roll
+  /// (driven by Stripe's `invoice.created` webhook in the relay flow).
+  currentPeriodStart       DateTime                  @map("current_period_start") @db.Timestamptz(6)
+  currentPeriodEnd         DateTime                  @map("current_period_end") @db.Timestamptz(6)
+  /// Trial end timestamp when the subscription is in `trialing` status.
+  /// Null after the trial ends or when no trial was offered.
+  trialEnd                 DateTime?                 @map("trial_end") @db.Timestamptz(6)
+  /// `true` when the customer has requested cancel-at-period-end and the
+  /// period has not yet expired. Until `currentPeriodEnd`, status stays
+  /// `active`; on the period boundary the webhook flips status to
+  /// `canceled`.
+  cancelAtPeriodEnd        Boolean                   @default(false) @map("cancel_at_period_end")
+  /// Reason captured at cancel time; null for active subscriptions.
+  cancelReason             SubscriptionCancelReason? @map("cancel_reason")
+  /// Timestamp the cancel was actioned. For cancel-at-period-end this is
+  /// when the request was received (NOT when the cancellation takes
+  /// effect — that's `currentPeriodEnd`).
+  canceledAt               DateTime?                 @map("canceled_at") @db.Timestamptz(6)
+  /// `id` of the default payment method backing the subscription. Soft FK
+  /// into this schema's `payment_methods.id`. Null when the subscription
+  /// is in `incomplete` (no successful payment yet).
+  defaultPaymentMethodId   String?                   @map("default_payment_method_id")
+  /// TS-042 dunning state — Stripe-driven retry count this billing cycle.
+  /// Incremented on every `invoice.payment_failed` event mapped through
+  /// `DunningService.recordPaymentFailure`. Resets to 0 on
+  /// `recordPaymentSuccess` (or on the next clean period roll). A row
+  /// with `dunningAttempts > 0` AND `status = 'past_due'` is in the
+  /// grace window.
+  dunningAttempts          Int                       @default(0) @map("dunning_attempts")
+  /// Timestamp of the most recent retry attempt. Null while the
+  /// subscription has never seen a failed payment in the current cycle.
+  /// Kept distinct from `currentPeriodStart` because Stripe schedules
+  /// retries at varying intervals (smart retries) — the gap between this
+  /// and `dunningGraceUntil` is what the dunning sweeper watches.
+  dunningLastAttemptAt     DateTime?                 @map("dunning_last_attempt_at") @db.Timestamptz(6)
+  /// Deadline after which the dunning exhaustion sweep flips the row
+  /// from `past_due` to `unpaid`. Stamped on the FIRST failure in a cycle
+  /// (at `firstFailureAt + DUNNING_GRACE_DAYS`, default 21 days) and
+  /// preserved through subsequent retry attempts so the grace window is
+  /// absolute, not "21 days from last retry". Null when the subscription
+  /// has never entered dunning.
+  dunningGraceUntil        DateTime?                 @map("dunning_grace_until") @db.Timestamptz(6)
+  /// Timestamp pause was applied (Stripe `pause_collection` set). Null
+  /// while the subscription has never been paused / is currently active.
+  pauseCollectionStartedAt DateTime?                 @map("pause_collection_started_at") @db.Timestamptz(6)
+  /// If non-null, Stripe automatically resumes collection at this
+  /// instant. Mirrors Stripe's `pause_collection.resumes_at`. Null for
+  /// an indefinite pause.
+  pauseCollectionResumesAt DateTime?                 @map("pause_collection_resumes_at") @db.Timestamptz(6)
+  /// Free-form operator/customer-supplied reason captured at pause time.
+  /// Persisted as text; capped at the contract layer to 500 chars
+  /// (`PAUSE_REASON_MAX_LENGTH`). Reset to null on resume.
+  pauseReason              String?                   @map("pause_reason")
+  createdAt                DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                DateTime                  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  history  SubscriptionHistory[]
+  invoices Invoice[]
+
+  /// Hot read path #1: "list every active subscription for a given
+  /// customer". The web-family dashboard hits this on every load.
+  @@index([customerId, customerGroup, status], map: "subscriptions_customer_status_idx")
+  /// Hot read path #2: dunning + admin queries — "show me everything in
+  /// past_due" or "show me every subscription whose current period
+  /// rolls today". `WHERE status = 'past_due'` is the dominant filter.
+  @@index([status, currentPeriodEnd], map: "subscriptions_status_period_end_idx")
+  /// Plan-rollup analytics — "how many active subs on Tier 2?". Lower
+  /// volume than the per-customer query but referenced often enough to
+  /// keep an index for.
+  @@index([planId, status], map: "subscriptions_plan_status_idx")
+  /// TS-042 dunning sweeper: "show me past_due rows whose grace
+  /// expired". Materialised as a PARTIAL index `(dunning_grace_until)
+  /// WHERE status='past_due' AND dunning_grace_until IS NOT NULL` in
+  /// the migration SQL (TS-042-followup-1) — Prisma 5.x's `@@index`
+  /// cannot directly express the partial predicate, so the index
+  /// lives outside Prisma's introspection. Same pattern as
+  /// `outbox_events_undispatched_idx` (TS-142). DO NOT add an
+  /// `@@index([dunningGraceUntil], ...)` declaration here — the
+  /// next `prisma migrate dev` would recreate the plain composite
+  /// and drop the partial.
+  @@map("subscriptions")
+  @@schema("subscription")
+}
+
+/// Append-only audit trail of subscription state transitions
+/// (PDD §8.2 `subscription_history`, CLAUDE.md §3.6 audit).
+///
+/// Every status change, plan change, pause, resume, cancel, etc. produces
+/// a row. **Rows are never updated or deleted** — corrections are new
+/// rows that supersede prior context (CLAUDE.md §17.7).
+///
+/// `actor_user_id` is the user who initiated the change. Null for
+/// system-driven transitions (webhook-triggered status flips, dunning
+/// auto-cancel) — those carry `actor_kind = 'system'` and a `source`
+/// pointing at the inbound event id (e.g. the Stripe event id).
+model SubscriptionHistory {
+  id             String                   @id @default(cuid())
+  subscriptionId String                   @map("subscription_id")
+  subscription   Subscription             @relation(fields: [subscriptionId], references: [id])
+  event          SubscriptionHistoryEvent
+  fromStatus     SubscriptionStatus?      @map("from_status")
+  toStatus       SubscriptionStatus?      @map("to_status")
+  /// Free-form contextual JSON: the plan codes for a plan_changed event,
+  /// the cancel reason text for a canceled event, etc. The event-name
+  /// determines the shape; consumers parse on the wire.
+  context        Json                     @default("{}")
+  /// User who initiated the change. Null for system-driven transitions.
+  actorUserId    String?                  @map("actor_user_id")
+  /// Categorical actor kind — `user` for a customer-initiated change,
+  /// `admin` for an ops override, `system` for webhook / dunning / job.
+  actorKind      String                   @map("actor_kind")
+  /// External-source pointer — the Stripe event id for webhook-driven
+  /// transitions, the BullMQ job id for scheduled actions, an admin
+  /// request id for ops overrides. Non-null for `actor_kind = system`.
+  source         String?
+  occurredAt     DateTime                 @default(now()) @map("occurred_at") @db.Timestamptz(6)
+
+  /// Per-subscription chronological scroll — the dominant read pattern.
+  @@index([subscriptionId, occurredAt(sort: Desc)], map: "subscription_history_subscription_idx")
+  /// Compliance / audit: "every action this user initiated". Lower
+  /// volume but valuable for the trust-and-safety review surface.
+  @@index([actorUserId, occurredAt(sort: Desc)], map: "subscription_history_actor_idx")
+  @@map("subscription_history")
+  @@schema("subscription")
+}
+
+/// Payment-method cache (PDD §8.2 `payment_methods` table).
+///
+/// **No card-data ever touches this table** (CLAUDE.md §17.1, §17.12).
+/// The columns persisted here are exactly the metadata Stripe surfaces
+/// for display: card brand, last 4, expiry month/year, billing-zip.
+/// The PAN, CVV, and full expiry are not stored — the `stripe_pm_id` is
+/// the durable handle and Stripe is the system of record.
+///
+/// `customer_id` is the soft FK matching the subscription pattern (per
+/// `customer_group`). `default` flags the customer's preferred method.
+/// A customer can have multiple methods; only one carries `default = true`
+/// at a time (enforced at the service layer; a partial unique index can
+/// land in a follow-up if races become a problem).
+model PaymentMethod {
+  id                    String            @id @default(cuid())
+  /// Stripe's `pm_...` id. Unique.
+  stripePaymentMethodId String            @unique @map("stripe_payment_method_id")
+  /// Stripe's `cus_...` id — same value as the subscriptions row that
+  /// references this method.
+  stripeCustomerId      String            @map("stripe_customer_id")
+  /// Soft FK — same per-customer-group referent as `subscriptions.customer_id`.
+  customerId            String            @map("customer_id")
+  customerGroup         PlanCustomerGroup @map("customer_group")
+  kind                  PaymentMethodKind
+  /// Card brand (visa, mastercard, amex, etc) — nullable for ACH.
+  brand                 String?
+  /// Last 4 digits — display-only. Always nullable so non-card kinds
+  /// don't have to fake a value.
+  last4                 String?           @db.VarChar(4)
+  expiryMonth           Int?              @map("expiry_month")
+  expiryYear            Int?              @map("expiry_year")
+  /// `true` when this is the customer's default payment method. Only one
+  /// payment method per customer should hold `default = true` at a time;
+  /// service layer enforces, future partial unique index can defend.
+  isDefault             Boolean           @default(false) @map("is_default")
+  createdAt             DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime          @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Per-customer list query — "show me every method I have on file".
+  @@index([customerId, customerGroup], map: "payment_methods_customer_idx")
+  @@map("payment_methods")
+  @@schema("subscription")
+}
+
+/// Invoice envelope (PDD §8.2 `invoices` table).
+///
+/// One row per Stripe invoice. Most rows arrive via the
+/// `invoice.created` webhook through the future TS-142 relay path; the
+/// outbound `POST /api/v1/subscriptions` flow can also create an
+/// inaugural invoice synchronously when a paid plan + immediate-charge
+/// is requested. Until the relay lands, this table mostly carries the
+/// inaugural invoice rows the create flow persists directly.
+model Invoice {
+  id               String        @id @default(cuid())
+  /// Stripe's `in_...` id. Unique.
+  stripeInvoiceId  String        @unique @map("stripe_invoice_id")
+  subscriptionId   String        @map("subscription_id")
+  subscription     Subscription  @relation(fields: [subscriptionId], references: [id])
+  status           InvoiceStatus
+  /// Total amount (subtotal + tax - discount) in `currency` MAJOR units —
+  /// dollars-and-cents, e.g. `49.00`, NOT `4900`.
+  ///
+  /// **The doc-comment here used to say "minor units", which was wrong and
+  /// would have stored every invoice 100x too large** (TS-041b-followup-3b).
+  /// `Decimal(12,2)` with two decimal places IS dollars-and-cents, and it is
+  /// the same convention `plans.monthly_price` / `annual_price` carry; the
+  /// wire DTOs convert with `decimalToMinorUnits` at the boundary, which is
+  /// where the minor-unit form belongs. Money columns NEVER use floats
+  /// (CLAUDE.md §4.1, §17.6).
+  total            Decimal       @db.Decimal(12, 2)
+  /// Tax amount in `currency` MAJOR units. Computed by Stripe Tax. Same
+  /// convention as `total` above.
+  tax              Decimal       @default(0) @db.Decimal(12, 2)
+  /// Amount actually paid, in `currency` MAJOR units (only meaningful for
+  /// `paid` invoices). Differs from `total` for partial payments + retried
+  /// collections.
+  amountPaid       Decimal       @default(0) @map("amount_paid") @db.Decimal(12, 2)
+  currency         String        @default("USD") @db.Char(3)
+  issuedAt         DateTime      @map("issued_at") @db.Timestamptz(6)
+  /// Null for non-paid invoices. Stamped on `invoice.payment_succeeded`.
+  paidAt           DateTime?     @map("paid_at") @db.Timestamptz(6)
+  /// Hosted invoice URL Stripe issues for self-serve view + payment
+  /// retry. Null until Stripe provides one.
+  hostedInvoiceUrl String?       @map("hosted_invoice_url")
+  /// PDF download URL (Stripe-hosted). Null until Stripe provides one.
+  invoicePdfUrl    String?       @map("invoice_pdf_url")
+  createdAt        DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime      @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  lineItems InvoiceLineItem[]
+
+  /// Per-subscription chronological scroll — the dominant read pattern
+  /// for the family-portal "billing history" page.
+  @@index([subscriptionId, issuedAt(sort: Desc)], map: "invoices_subscription_issued_idx")
+  /// Dunning + ops queries — "show me every open invoice past due".
+  @@index([status, issuedAt], map: "invoices_status_issued_idx")
+  @@map("invoices")
+  @@schema("subscription")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// TS-043 — coupons + per-customer redemption audit trail.
+//
+// The coupon catalog is managed by admin tooling (`POST /api/v1/admin/coupons`
+// for create + `DELETE /api/v1/admin/coupons/:id` for deactivation). Each
+// row is the **definition** of a discount; redemption is the act of
+// applying it to a specific subscription.
+//
+// The `coupon_redemptions` table is append-only-by-policy (per CLAUDE.md
+// §3.6 — financial-history audit trail). Rows are never updated or
+// deleted; a refund / reversal of a redemption is a separate row with a
+// negative `valueAppliedMinor` plus an audit-log entry. Phase 1 doesn't
+// ship the reversal path (covered by TS-084 refund / contra-revenue work
+// in accounting-svc); the schema is forward-compatible.
+//
+// Stripe integration. For `percent_off` and `amount_off` kinds, the
+// service lazy-creates a Stripe Coupon on first redemption and caches
+// the id on `coupons.stripe_coupon_id` (mirrors the `Plan.stripeProductId`
+// pattern shipped in TS-041b). For `extended_trial`, Stripe is bypassed
+// entirely — the trial-extension lands via `trial_period_days` on the
+// subscription create call, not a coupon. The `stripe_coupon_id` is NULL
+// for that kind.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Discount mechanism (PRD §10.4: percent / fixed / extended trial / free).
+///
+/// Each kind controls how `Coupon.amount` is interpreted:
+///   - `percent_off`     — `amount` is the percent (1–100).
+///                          Stripe `Coupon.percent_off`.
+///   - `amount_off`      — `amount` is the discount in `Coupon.currency`
+///                          minor units (cents). Stripe `Coupon.amount_off`.
+///   - `extended_trial`  — `amount` is the number of trial days to add to
+///                          the inaugural subscription. Bypasses Stripe
+///                          coupons; passes via `trial_period_days` at
+///                          subscription create. Cannot stack.
+///
+/// "First month free" from PRD §10.4 is expressed as `percent_off=100` +
+/// `duration=once`. The intent is a tight enum that's easy for accounting
+/// to reason about, not a 1:1 mirror of every Stripe coupon shape.
+enum CouponKind {
+  percent_off
+  amount_off
+  extended_trial
+
+  @@map("coupon_kind")
+  @@schema("subscription")
+}
+
+/// How long the discount applies. Mirrors Stripe's `Coupon.duration`
+/// 1:1 so the lazy-create call doesn't need a translation table.
+///
+///   - `once`      — applied to the first invoice only.
+///   - `repeating` — applied to a fixed number of invoices
+///                   (`duration_in_months` required).
+///   - `forever`   — applied to every invoice for the life of the
+///                   subscription.
+///
+/// `extended_trial` coupons IGNORE `duration` — they only apply to the
+/// initial trial. Service-layer validates duration only for the two
+/// Stripe-backed kinds.
+enum CouponDuration {
+  once
+  repeating
+  forever
+
+  @@map("coupon_duration")
+  @@schema("subscription")
+}
+
+/// Promo-code catalog (PDD §8.2 `coupons` table; PRD §10.4).
+///
+/// **Code uniqueness**: case-insensitive at the service layer (stored
+/// uppercased); the DB unique index sees the normalised form.
+///
+/// **`appliesToPlanIds`**: empty array means "applies to every plan in
+/// every customer_group". Non-empty restricts redemption to that set;
+/// the validation gate rejects with `plan_not_eligible` on mismatch.
+///
+/// **`maxRedemptions` / `timesRedeemed`**: platform-wide cap. The
+/// service guards the cap via the `timesRedeemed < maxRedemptions`
+/// check BEFORE persisting the redemption row and increments atomically
+/// in the same transaction. A race that lands both writers above cap is
+/// a known edge — caught by the cap re-check at the second writer's
+/// transaction commit (Postgres serialisation; the loser sees
+/// `cap_exceeded` and the failure is surfaced as a 409 to the client).
+///
+/// **`perCustomerLimit`**: per-`(customerId, customerGroup)` cap. Default
+/// `1` matches the "single-use per customer" PRD §10.4 default.
+/// `null` = unlimited.
+///
+/// **`firstTimeCustomerOnly`**: when `true`, the validation gate refuses
+/// the coupon for any customer with at least one prior subscription on
+/// the platform. Mirrors PRD §10.4 "First-time customer only".
+///
+/// **`minSpendMinor`**: minimum monthly unit price (in minor units of
+/// `currency`) required to apply the coupon. `null` = no minimum.
+///
+/// **`stackable`**: `false` (default) means the coupon refuses to apply
+/// if the subscription already has any other coupon active. Phase 1
+/// runs with non-stackable only (stacking lands as TS-043-followup-9).
+///
+/// **`stripeCouponId`**: cached `coupon_...` handle. Null until first
+/// redemption (lazy-create pattern, mirrors `Plan.stripeProductId`).
+/// `extended_trial` coupons never populate this — Stripe is bypassed.
+///
+/// **Immutable post-create**: admin tooling exposes create + deactivate
+/// only. A retired coupon's row is preserved so the redemption history
+/// + accounting contra-revenue trail stays traceable. The "edit a coupon"
+/// path is intentionally absent; PRD §10.4 implies that's via a new code.
+model Coupon {
+  id                    String         @id @default(cuid())
+  /// User-typed code, normalised to upper-case at the service boundary.
+  /// 3–32 chars (contract layer is canonical for the cap). UNIQUE on the
+  /// normalised form; the contract regex restricts the charset to
+  /// `[A-Z0-9_-]` so accidental whitespace / weird characters can't
+  /// land in the DB.
+  code                  String         @unique
+  /// Admin-facing label (not shown to the customer at redemption).
+  name                  String
+  kind                  CouponKind
+  /// Amount in the units required by `kind` (see `CouponKind` doc-comment).
+  /// `Int` because:
+  ///   - percent_off    → integer percent (1–100)
+  ///   - amount_off     → minor units (no decimals on the wire)
+  ///   - extended_trial → integer days
+  /// Currency for amount_off is `currency`. The contract layer caps to
+  /// 100 / sensible bounds depending on kind.
+  amount                Int
+  /// ISO 4217 currency code. Only meaningful for `amount_off`; ignored
+  /// for `percent_off` and `extended_trial`. Defaults to USD.
+  currency              String         @default("USD") @db.Char(3)
+  duration              CouponDuration @default(once)
+  /// Number of months the discount repeats for. Required when
+  /// `duration = repeating`, null otherwise. Service-layer enforced.
+  durationInMonths      Int?           @map("duration_in_months")
+  /// Empty array = applies to every plan. Non-empty = restricted set.
+  /// Stored as native `text[]` so the service can do a membership check
+  /// in a single `WHERE 'plan_xyz' = ANY(applies_to_plan_ids)` predicate
+  /// without parsing JSON.
+  appliesToPlanIds      String[]       @default([]) @map("applies_to_plan_ids")
+  /// Platform-wide redemption cap. `null` = unlimited.
+  maxRedemptions        Int?           @map("max_redemptions")
+  /// Total redemptions to date. Updated atomically in the same Prisma
+  /// transaction that inserts the `coupon_redemptions` row.
+  timesRedeemed         Int            @default(0) @map("times_redeemed")
+  /// Per-customer redemption cap. Default 1 matches PRD §10.4 default.
+  /// `null` = unlimited per customer.
+  perCustomerLimit      Int?           @default(1) @map("per_customer_limit")
+  /// `true` = coupon valid only when the customer has zero prior
+  /// subscriptions across `customer_group` (PRD §10.4 "First-time
+  /// customer only"). Service-layer check; default `false`.
+  firstTimeCustomerOnly Boolean        @default(false) @map("first_time_customer_only")
+  /// Minimum monthly unit price (in `currency` minor units) required
+  /// to apply the coupon. `null` = no minimum.
+  minSpendMinor         Int?           @map("min_spend_minor")
+  /// `false` = refuses redemption if the subscription already carries
+  /// another active coupon. Phase 1 is non-stackable only; stacking
+  /// arrives as TS-043-followup-9.
+  stackable             Boolean        @default(false)
+  /// UTC instant after which redemption is rejected. `null` = no expiry.
+  expiresAt             DateTime?      @map("expires_at") @db.Timestamptz(6)
+  /// `false` = retired; cannot be redeemed but the row + history are
+  /// preserved. Service surfaces the inactive state as `coupon_inactive`.
+  active                Boolean        @default(true)
+  /// Stripe Coupon id (`coupon_...`). Lazy-initialised on first
+  /// redemption; cached so subsequent redemptions reuse it. NULL for
+  /// `extended_trial` (Stripe is bypassed). Mirrors `Plan.stripeProductId`.
+  stripeCouponId        String?        @unique @map("stripe_coupon_id")
+  /// Free-form admin notes. Capped at the contract layer.
+  notes                 String?
+  /// User id of the admin who created the coupon. Soft FK into
+  /// `identity.users.id` (cross-service reference by id only).
+  createdByUserId       String         @map("created_by_user_id")
+  createdAt             DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  redemptions CouponRedemption[]
+
+  /// Coupon-validation query: "find the active, non-expired coupon
+  /// matching this code". The unique-on-code index suffices for the
+  /// equality lookup; this composite is the secondary path used by the
+  /// admin list endpoint (TS-127) for "show me every active coupon".
+  @@index([active, expiresAt], map: "coupons_active_expires_idx")
+  @@map("coupons")
+  @@schema("subscription")
+}
+
+/// Per-customer redemption audit trail (PDD §8.2 `coupon_redemptions`).
+///
+/// One row per `(coupon, subscription)` tuple. **Append-only by policy**
+/// — CLAUDE.md §3.6 audit log discipline applies to financial-history
+/// tables. Reversals (refund / void) ship as TS-084 accounting work.
+///
+/// The composite unique index `(coupon_id, subscription_id)` is the
+/// race guard: two concurrent subscription-create flows that race the
+/// per-customer-limit check still cannot land two redemption rows for
+/// the same subscription. The losing transaction sees a P2002 and the
+/// service surfaces it as `redemption_conflict`.
+model CouponRedemption {
+  id                String            @id @default(cuid())
+  couponId          String            @map("coupon_id")
+  coupon            Coupon            @relation(fields: [couponId], references: [id])
+  /// Soft FK — same per-customer-group referent as
+  /// `subscriptions.customer_id`. Captured so the per-customer-limit
+  /// check has a stable join key without crossing service schemas.
+  customerId        String            @map("customer_id")
+  customerGroup     PlanCustomerGroup @map("customer_group")
+  /// Soft FK into `subscriptions.id`. Captured so reversal flows can
+  /// look up the subscription that received the discount.
+  subscriptionId    String            @map("subscription_id")
+  /// Value of the discount actually applied to the FIRST invoice, in
+  /// `currency` minor units. For:
+  ///   - `amount_off`     → equal to coupon.amount.
+  ///   - `percent_off`    → computed as `unitPrice * percent / 100`,
+  ///                         capped to unitPrice.
+  ///   - `extended_trial` → 0 (the value is measured in days, not
+  ///                         dollars; accounting recognises the
+  ///                         deferred revenue across the extended
+  ///                         period without a coupon contra-entry).
+  valueAppliedMinor Int               @map("value_applied_minor")
+  currency          String            @default("USD") @db.Char(3)
+  redeemedAt        DateTime          @default(now()) @map("redeemed_at") @db.Timestamptz(6)
+
+  /// Race guard for the per-customer-limit check (see model header).
+  @@unique([couponId, subscriptionId], map: "coupon_redemptions_coupon_subscription_uq")
+  /// Per-customer scroll: "how many times has this customer used this
+  /// coupon" — the `perCustomerLimit` check.
+  @@index([couponId, customerId, customerGroup], map: "coupon_redemptions_coupon_customer_idx")
+  /// "How many subscriptions did this coupon apply to overall" — admin
+  /// reporting + accounting contra-revenue reconciliation.
+  @@index([couponId, redeemedAt(sort: Desc)], map: "coupon_redemptions_coupon_redeemed_idx")
+  @@map("coupon_redemptions")
+  @@schema("subscription")
+}
+
+/// Invoice line item (PDD §8.2 `invoice_line_items` table).
+///
+/// Each Stripe `invoice_line_item` becomes one row. Lines carry the
+/// per-line amount (`Decimal(12,2)`), a free-form description, and the
+/// service-period the line covers. Used by the accounting service for
+/// per-line revenue recognition (subscription revenue is recognised
+/// over `period_start..period_end`).
+model InvoiceLineItem {
+  id               String              @id @default(cuid())
+  invoiceId        String              @map("invoice_id")
+  invoice          Invoice             @relation(fields: [invoiceId], references: [id])
+  /// Stripe's `il_...` id. Unique. Captured so a re-sync from a webhook
+  /// can replay deterministically without duplicate-line drift.
+  stripeLineItemId String              @unique @map("stripe_line_item_id")
+  kind             InvoiceLineItemKind
+  description      String
+  /// Line amount in `currency` MAJOR units — same convention as
+  /// `invoices.total`. A `discount` line is NEGATIVE.
+  amount           Decimal             @db.Decimal(12, 2)
+  currency         String              @default("USD") @db.Char(3)
+  /// Service period the line covers — the bounds the accounting service
+  /// uses to amortise revenue. Both nullable for non-time-based lines
+  /// (one-time addons, discounts).
+  periodStart      DateTime?           @map("period_start") @db.Timestamptz(6)
+  periodEnd        DateTime?           @map("period_end") @db.Timestamptz(6)
+  createdAt        DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// Invoice-scoped scroll. The dominant read pattern is "show me the
+  /// lines on this invoice in display order"; we use stripe-line-item id
+  /// as a stable sort tie-breaker via the secondary index column.
+  @@index([invoiceId], map: "invoice_line_items_invoice_idx")
+  @@map("invoice_line_items")
+  @@schema("subscription")
+}
+
+/// Outbox event (TS-142, PDD §7.3, CLAUDE.md §5.3).
+///
+/// Producer-side row written in the same Prisma transaction as the
+/// business state change. The `apps/workers/outbox-relay` worker
+/// polls for rows with `dispatched_at IS NULL`, forwards them to
+/// Redis Streams (`events:{event_name}`), and stamps `dispatched_at`
+/// on success. Consumers must be idempotent on `event_id`
+/// (at-least-once delivery semantics).
+///
+/// Column shape is identical across every producer service — each
+/// service ships a separate migration that creates its own
+/// `{schema}.outbox_events` table. The `@taste-and-see/nest-outbox`
+/// SDK is schema-agnostic — services compose `OutboxModule.forRoot`
+/// with their schema name and the SDK writes the row via raw SQL
+/// inside the caller's `prisma.$transaction`.
+///
+/// The model is declared here primarily so `prisma generate` reflects
+/// the table on the local client (for ad-hoc queries via Prisma
+/// Studio + admin tooling). Service code writes via the SDK's raw
+/// SQL surface; reads happen exclusively through the relay's
+/// `pg`-backed claim repository (the worker app does not share this
+/// Prisma client).
+model OutboxEvent {
+  /// Dedup key — consumers must idempotency-check on this. UUID v4
+  /// generated by the SDK by default; producers may pass an explicit
+  /// id (e.g. a Stripe webhook `event.id`) for cross-boundary
+  /// exactly-once-effective delivery.
+  eventId         String    @id @map("event_id")
+  /// Dot-notation event name from `packages/contracts/events`. The
+  /// SDK validates the name against the registry before inserting
+  /// — unknown names are rejected at the producer boundary.
+  eventName       String    @map("event_name")
+  /// Validated domain payload (validated by the SDK against the
+  /// matching `eventRegistry` schema before insert).
+  payload         Json
+  /// Producer wall-clock time the event semantically happened. May
+  /// differ from `created_at` for backfilled events.
+  occurredAt      DateTime  @map("occurred_at") @db.Timestamptz(6)
+  /// Service name that produced the row (e.g. `service-subscription`).
+  /// Useful for relay observability + per-service throughput metrics.
+  producerService String    @map("producer_service")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Stamped by the relay when the row has been successfully
+  /// forwarded onto the bus. Null means undispatched + eligible for
+  /// the next poll cycle.
+  dispatchedAt    DateTime? @map("dispatched_at") @db.Timestamptz(6)
+  /// Failed dispatch counter. The relay stops retrying once this
+  /// reaches `MAX_ATTEMPTS` — those rows are dead-lettered for ops
+  /// attention (surfaced via metrics + an admin endpoint).
+  attempts        Int       @default(0)
+  /// Stamped by the relay on the most recent failed attempt.
+  lastAttemptAt   DateTime? @map("last_attempt_at") @db.Timestamptz(6)
+  /// Most recent failure message — capped at 2000 chars at the
+  /// relay's record-failure path.
+  lastError       String?   @map("last_error")
+
+  /// Relay's dominant read query: "give me the next batch of
+  /// undispatched rows ordered by created_at". A partial index on
+  /// `dispatched_at IS NULL` keeps the index footprint bounded
+  /// against an ever-growing table (the table is append-only; the
+  /// partial filter is highly selective at steady state).
+  ///
+  /// Prisma's `@@index` cannot directly express the partial
+  /// predicate; the index is materialised in the migration SQL.
+  @@index([eventName], map: "outbox_events_event_name_idx")
+  @@map("outbox_events")
+  @@schema("subscription")
+}
+
+/// SDK-owned consumer-side dedup ledger (TS-041b-followup-3a).
+///
+/// Written exclusively by `@taste-and-see/nest-outbox-consumer` via raw SQL;
+/// no service code reads or writes it. Declared here so `prisma migrate` and
+/// the schema stay the single description of what lives in the
+/// `subscription` schema — an undeclared table is one a future
+/// `prisma migrate dev` would offer to drop.
+///
+/// Orthogonal to `OutboxEvent` above: that is the PRODUCER side ("events I
+/// will publish"), this is the CONSUMER side ("events I have already
+/// applied"). Different tables, different directions.
+///
+/// **Secondary, not primary, protection here.** In service-booking the
+/// domain has its own UNIQUE backing this up, because applying a hold twice
+/// has an effect. Reconciliation does not: re-running it against unchanged
+/// Stripe state writes nothing. A truncated dedup table costs duplicate
+/// Stripe reads, never duplicate writes.
+model OutboxConsumerDedup {
+  consumerGroup  String    @map("consumer_group")
+  eventId        String    @map("event_id")
+  eventName      String    @map("event_name")
+  /// `in_flight` | `processed` | `dead_lettered` — a DB CHECK pins the
+  /// vocabulary (the SDK owns the transitions).
+  state          String
+  attempts       Int       @default(1)
+  lastError      String?   @map("last_error")
+  firstSeenAt    DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  lastAttemptAt  DateTime  @default(now()) @map("last_attempt_at") @db.Timestamptz(6)
+  processedAt    DateTime? @map("processed_at") @db.Timestamptz(6)
+  deadLetteredAt DateTime? @map("dead_lettered_at") @db.Timestamptz(6)
+
+  @@id([consumerGroup, eventId])
+  /// The ops "what is stuck in the dead-letter queue" read. Materialised in
+  /// the migration as a PARTIAL index on `dead_lettered_at IS NOT NULL` —
+  /// steady state is overwhelmingly `processed` rows.
+  @@index([consumerGroup, deadLetteredAt], map: "subscription_outbox_consumer_dedup_dead_lettered_idx")
+  @@map("outbox_consumer_dedup")
+  @@schema("subscription")
+}

@@ -1,0 +1,157 @@
+#cloud-config
+#
+# Bootstrap script for a single k3s server node.
+#
+# Renders per-node via Terraform `templatefile()`. The variables interpolated
+# below are documented inline; if you change the variable surface here, mirror
+# the change in main.tf's `cloud_init` template invocation.
+#
+# Variables:
+#   env                       — environment name (dev / staging / prod)
+#   node_index                — 0-based index in the cluster
+#   node_role                 — "primary" for index 0 (--cluster-init), "joiner" otherwise
+#   primary_node_ip           — IP of the index-0 node on the private VLAN (used by joiners)
+#   cluster_token             — shared k3s join token (random_password output)
+#   k3s_version               — version pin (e.g. "v1.30.4+k3s1")
+#   ssh_public_key            — operator's authorized_keys entry
+#   private_network_cidr      — CIDR for the VLAN (used by node ip selection logic)
+#   private_network_ip_prefix — pre-computed grep-friendly IP prefix (e.g. "10.40."),
+#                               derived by Terraform from `private_network_cidr` so
+#                               the shell heredoc doesn't need bash parameter
+#                               expansion (which collides with Terraform's `${...}`).
+#   cluster_domain            — k3s --cluster-domain
+#   extra_labels              — space-joined `--node-label k=v` flags
+#
+# Hardening choices baked in:
+#   * Root SSH disabled (PermitRootLogin no) — operator uses tastesee-ops
+#   * Password auth disabled — keys only
+#   * Unattended-upgrades enabled (security only, no kernel auto-reboot)
+#   * ufw scaffolded but left disabled at boot — the k3s install opens its
+#     own ports and we don't want to race the install. Final firewall
+#     rules land via a follow-up runbook step.
+
+hostname: ${env}-k3s-${node_index}
+manage_etc_hosts: true
+timezone: Etc/UTC
+
+users:
+  - name: tastesee-ops
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [sudo, adm]
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+package_update: true
+package_upgrade: false  # let unattended-upgrades drive this on its own cadence
+
+packages:
+  - curl
+  - ca-certificates
+  - gnupg
+  - jq
+  - unattended-upgrades
+  - apt-listchanges
+  - fail2ban
+  - chrony
+  - ufw
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/10-tastesee-hardening.conf
+    permissions: "0644"
+    content: |
+      PermitRootLogin no
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      X11Forwarding no
+      AllowUsers tastesee-ops
+
+  - path: /etc/apt/apt.conf.d/52unattended-upgrades-local
+    permissions: "0644"
+    content: |
+      Unattended-Upgrade::Origins-Pattern {
+        "origin=Ubuntu,codename=$${distro_codename},label=Ubuntu-Security";
+      };
+      Unattended-Upgrade::Automatic-Reboot "false";
+
+  - path: /etc/sysctl.d/90-k3s.conf
+    permissions: "0644"
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+
+  - path: /usr/local/bin/install-k3s.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      # Detect the private VLAN interface — Contabo names it `ens10` on
+      # current Cloud VPS images. If your image differs, override via the
+      # K3S_NODE_IP_INTERFACE env in /etc/default/k3s-install.
+      VLAN_IF="$${K3S_NODE_IP_INTERFACE:-ens10}"
+      # Wait until the VLAN interface has an address inside our CIDR.
+      # private_network_ip_prefix is the dotted IP prefix (e.g. "10.40.")
+      # computed in Terraform so we don't have to do bash parameter
+      # expansion inside a Terraform templatefile() heredoc.
+      for i in $(seq 1 60); do
+        ip -4 addr show "$$VLAN_IF" 2>/dev/null | grep -q "${private_network_ip_prefix}" && break
+        sleep 2
+      done
+      NODE_IP=$$(ip -4 -o addr show "$$VLAN_IF" | awk '{print $$4}' | cut -d/ -f1 | head -n1)
+      if [ -z "$$NODE_IP" ]; then
+        echo "FATAL: no private-VLAN IP found on $$VLAN_IF; aborting k3s install." >&2
+        exit 1
+      fi
+
+      EXTRA_LABELS="${extra_labels}"
+
+      %{ if node_role == "primary" ~}
+      curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION="${k3s_version}" \
+        K3S_TOKEN="${cluster_token}" \
+        sh -s - server \
+          --cluster-init \
+          --node-ip "$$NODE_IP" \
+          --advertise-address "$$NODE_IP" \
+          --flannel-iface "$$VLAN_IF" \
+          --cluster-domain "${cluster_domain}" \
+          --tls-san "$$NODE_IP" \
+          --disable traefik \
+          --disable servicelb \
+          --write-kubeconfig-mode 0640 \
+          --kubelet-arg "node-ip=$$NODE_IP" \
+          $${EXTRA_LABELS}
+      %{ else ~}
+      # Joiner: wait for primary's API to come up, then `--server`.
+      for i in $(seq 1 120); do
+        curl -kfs "https://${primary_node_ip}:6443/livez" >/dev/null && break
+        sleep 5
+      done
+      curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION="${k3s_version}" \
+        K3S_TOKEN="${cluster_token}" \
+        K3S_URL="https://${primary_node_ip}:6443" \
+        sh -s - server \
+          --server "https://${primary_node_ip}:6443" \
+          --node-ip "$$NODE_IP" \
+          --advertise-address "$$NODE_IP" \
+          --flannel-iface "$$VLAN_IF" \
+          --cluster-domain "${cluster_domain}" \
+          --tls-san "$$NODE_IP" \
+          --disable traefik \
+          --disable servicelb \
+          --write-kubeconfig-mode 0640 \
+          --kubelet-arg "node-ip=$$NODE_IP" \
+          $${EXTRA_LABELS}
+      %{ endif ~}
+
+runcmd:
+  - [ systemctl, restart, ssh ]
+  - [ systemctl, enable, --now, unattended-upgrades ]
+  - [ systemctl, enable, --now, fail2ban ]
+  - [ systemctl, enable, --now, chrony ]
+  - [ sysctl, --system ]
+  - [ /usr/local/bin/install-k3s.sh ]
+
+final_message: "k3s ${node_role} bootstrap complete on $${HOSTNAME} after $${UPTIME} seconds"

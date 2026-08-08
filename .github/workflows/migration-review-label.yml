@@ -1,0 +1,246 @@
+# Taste & See — migration gates.
+#
+# This workflow hosts the PR-time gates that enforce migration discipline.
+# Two job-level gates ship here:
+#
+#   1. `migration-label-gate` (TS-009d) — when a PR modifies any file under
+#      `**/prisma/migrations/**` it must carry the `migration-review` label
+#      or the job fails. Adding the label re-runs the workflow and clears
+#      the gate; removing it re-runs and re-fails.
+#
+#   2. `schema-requires-migration` (TS-009d-followup-3) — when a PR modifies
+#      a `**/prisma/schema.prisma` file, the same PR must add at least one
+#      NEW file under the matching service's `**/prisma/migrations/` tree.
+#      Catches the "I edited the Prisma model but forgot to run
+#      `prisma migrate dev`" loophole that the migration-review label can't
+#      detect (no migrations file → no label-required signal).
+#
+# Why (CLAUDE.md §4.1, §4.4, §11): every schema change must ship with a
+# forward-compatible migration (expand → migrate data → contract) and that
+# migration must be explicitly reviewed. Procedural protection (`prisma
+# migrate dev` produces a migration when the schema changes) is the first
+# line of defence; these gates are the belt-and-braces machine check.
+#
+# Wiring both gates into branch protection is a repo-settings concern, not
+# a workflow concern: in Settings → Branches, add "Migration review label
+# gate" + "Schema requires migration gate" to the required status checks
+# for `main` (tracked as TS-009d-followup-2). Until that is done, the gates
+# report failures but do not block merge.
+#
+# Stale-label limitation (intentional, for now): if a reviewer applies the
+# label after seeing migration A, and then a new commit pushes migration B
+# without dropping the label, gate (1) still reads as passing. Branch
+# protection's "dismiss stale approvals on new commits" covers PR review
+# but does not auto-strip arbitrary labels. Tracked as TS-009d-followup-1
+# in `Pending_tasks.md` if the loophole becomes load-bearing.
+#
+# This workflow is deliberately separate from `ci.yml` so that adding the
+# `labeled`/`unlabeled` triggers does not re-run lint, type-check, tests,
+# trivy, and semgrep every time a label flips. Gate (2) carries an
+# `if: github.event.action != 'labeled' && != 'unlabeled'` filter so it
+# only runs on commit-bearing PR events — saves a few CI seconds when a
+# reviewer is just toggling labels.
+
+name: Migration gates
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+# Read-only is sufficient: the jobs list PR files and read PR labels via
+# the API — no writes, no checkout of PR code.
+permissions:
+  contents: read
+  pull-requests: read
+
+# Cancel superseded runs on the same PR so reviewers don't see a queue of
+# stale gate runs after a flurry of label/unlabel toggles.
+concurrency:
+  group: migration-review-label-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  migration-label-gate:
+    name: Migration review label gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Detect prisma/migrations changes and enforce label
+        # SHA-pinned per TS-009a policy. Trailing comment carries the
+        # human-readable version; bumping requires updating both in lockstep.
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          REQUIRED_LABEL: migration-review
+        with:
+          script: |
+            const requiredLabel = process.env.REQUIRED_LABEL;
+            const { owner, repo } = context.repo;
+            const prNumber = context.issue.number;
+
+            // Paginate so a PR with many migration files (e.g. multi-service
+            // schema bump) doesn't slip past the per-page=30 default.
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+
+            // Match `<anything>/prisma/migrations/<anything>` and the
+            // top-level `prisma/migrations/...` form. Catches both the
+            // per-service layout (`apps/service-foo/prisma/migrations/...`)
+            // and any future repo-root usage. `migration_lock.toml` lives
+            // inside the same directory and is intentionally included.
+            const migrationFiles = files
+              .map((f) => f.filename)
+              .filter(
+                (path) =>
+                  path.includes('/prisma/migrations/') ||
+                  path.startsWith('prisma/migrations/'),
+              );
+
+            if (migrationFiles.length === 0) {
+              core.info('No prisma/migrations/** paths touched. Gate passes.');
+              return;
+            }
+
+            core.info(`Migration paths touched (${migrationFiles.length}):`);
+            for (const path of migrationFiles) core.info(`  - ${path}`);
+
+            const labels = (context.payload.pull_request?.labels ?? []).map(
+              (l) => l.name,
+            );
+            const hasLabel = labels.includes(requiredLabel);
+
+            if (hasLabel) {
+              core.info(`Required label '${requiredLabel}' is present. Gate passes.`);
+              return;
+            }
+
+            core.setFailed(
+              [
+                `Required label '${requiredLabel}' is not applied.`,
+                `This PR modifies prisma/migrations/** and must be reviewed by`,
+                `a migration reviewer who applies the '${requiredLabel}' label`,
+                `before merge. See CLAUDE.md §4.4 (forward-compatible migrations)`,
+                `and §11 (PR gates).`,
+              ].join(' '),
+            );
+
+  schema-requires-migration:
+    name: Schema requires migration gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # Skip on label-only PR events — labels don't change file diffs, so
+    # re-running this gate on every label flip is wasted CI time. The
+    # sibling `migration-label-gate` above DOES need to re-run on label
+    # events because the gate's pass/fail depends on label presence.
+    if: github.event.action != 'labeled' && github.event.action != 'unlabeled'
+    steps:
+      - name: Pair schema.prisma changes with new migrations
+        # SHA-pinned per TS-009a policy. Same SHA as the sibling job above
+        # — bump them in lockstep when actions/github-script releases.
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = context.issue.number;
+
+            // Paginate so a PR with many touched files (e.g. multi-service
+            // schema bump + cross-cutting refactor) doesn't slip past the
+            // per-page=30 default.
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+
+            // Match `<anything>/prisma/schema.prisma` AND the top-level
+            // `prisma/schema.prisma` form so the gate covers both the
+            // per-service layout (`apps/service-foo/prisma/schema.prisma`)
+            // and any future repo-root usage. Skip status='removed' so
+            // that a service-decommissioning PR (which removes the schema
+            // AND the migrations directory in lockstep) doesn't trip the
+            // gate — the gate's concern is "edited the model but forgot
+            // a migration", not "retired the service entirely". Renames
+            // are also skipped for the same reason.
+            const schemaPaths = files
+              .filter((f) => {
+                if (f.status === 'removed' || f.status === 'renamed') {
+                  return false;
+                }
+                const p = f.filename;
+                return (
+                  p.endsWith('/prisma/schema.prisma') ||
+                  p === 'prisma/schema.prisma'
+                );
+              })
+              .map((f) => f.filename);
+
+            if (schemaPaths.length === 0) {
+              core.info('No prisma/schema.prisma paths touched. Gate passes.');
+              return;
+            }
+
+            core.info(`schema.prisma paths touched (${schemaPaths.length}):`);
+            for (const p of schemaPaths) core.info(`  - ${p}`);
+
+            // For each touched schema.prisma, derive the sibling prisma/
+            // directory and require that the same PR added at least one
+            // file under `<dir>/migrations/`. We require ADDED status
+            // specifically — modifying an existing migration is never the
+            // right answer (migrations are immutable once merged per
+            // CLAUDE.md §4.4); the gate must catch "edited the model but
+            // forgot to generate a new migration directory."
+            const unpaired = [];
+            for (const schemaPath of schemaPaths) {
+              // Strip the trailing 'schema.prisma' to get the prisma/ dir.
+              // Works for both 'a/b/c/prisma/schema.prisma' and the
+              // top-level 'prisma/schema.prisma' shape.
+              const prismaDir = schemaPath.slice(
+                0,
+                schemaPath.length - 'schema.prisma'.length,
+              );
+              const migrationsPrefix = `${prismaDir}migrations/`;
+
+              const hasNewMigration = files.some(
+                (f) =>
+                  f.status === 'added' &&
+                  f.filename.startsWith(migrationsPrefix),
+              );
+
+              if (!hasNewMigration) {
+                unpaired.push({ schemaPath, migrationsPrefix });
+              }
+            }
+
+            if (unpaired.length === 0) {
+              core.info(
+                'Every modified schema.prisma has a sibling new migration file. Gate passes.',
+              );
+              return;
+            }
+
+            core.setFailed(
+              [
+                'Schema changes detected without an accompanying new migration:',
+                ...unpaired.map(
+                  ({ schemaPath, migrationsPrefix }) =>
+                    `  - ${schemaPath} (no new file under ${migrationsPrefix})`,
+                ),
+                '',
+                'CLAUDE.md §4.4 requires every schema change to ship with a',
+                "forward-compatible migration. Run `pnpm exec prisma migrate dev",
+                '--name <descriptive>` in the matching service directory to',
+                'generate the migration directory, then commit it alongside the',
+                'schema change.',
+                '',
+                'If the schema change is comment-only (no DDL impact),',
+                "generate a no-op migration via `pnpm exec prisma migrate dev",
+                "--create-only --name <descriptive>` and commit the empty",
+                'migration.sql alongside the schema edit so the audit trail',
+                'records that the schema touch was intentional.',
+              ].join('\n'),
+            );

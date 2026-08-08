@@ -1,0 +1,68 @@
+# Child Application: prod/platform.
+#
+# Critical: `syncPolicy.automated` is OMITTED. Per PDD §11 every prod sync
+# is an explicit operator action AFTER a staging soak. The operator runs:
+#
+#   argocd app sync platform-prod
+#
+# The platform-prod AppProject's syncWindow restricts business-hours sync to
+# Mon-Fri 09:00-17:00 + Sat-Sun 09:00-13:00, with admin override available
+# for incident-driven hotfixes.
+#
+# `selfHeal` is also deliberately omitted — an out-of-band hotfix applied
+# directly to a prod resource (e.g. `kubectl edit` during an incident) stands
+# until the operator deliberately resyncs from git. This is the opposite of
+# dev/staging where selfHeal aggressively pulls the cluster back to manifest.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-prod
+  namespace: argocd
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    tastesee.io/env: prod
+    tastesee.io/role: platform
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: platform-prod
+
+  source:
+    repoURL: https://github.com/brickagcopra/tasteseelife.git
+    path: infra/kubernetes/overlays/prod
+    targetRevision: main
+    kustomize:
+      commonAnnotations:
+        argocd.argoproj.io/tracking-id: platform-prod:argoproj.io/Application:argocd/platform-prod
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: platform-services
+
+  # No automated.* block — prod is manual-sync only. Retry policy applies
+  # once an operator triggers a sync (so a transient network blip mid-sync
+  # doesn't require operator re-action).
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=false
+      - ApplyOutOfSyncOnly=true
+      - PrunePropagationPolicy=foreground
+      - ServerSideApply=true
+      - Replace=false
+    retry:
+      limit: 3
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 10m
+
+  ignoreDifferences:
+    - group: networking.k8s.io
+      kind: Ingress
+      jsonPointers:
+        - /spec/tls/0/hosts
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+      jsonPointers:
+        - /spec/metrics

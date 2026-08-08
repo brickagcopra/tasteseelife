@@ -1,0 +1,1377 @@
+# Staging environment overlay.
+#
+# Staging is the production-parity testbed: same replica count + same
+# resource sizing as prod, just pointed at the staging Stripe test
+# mode + staging data node + a staging.tasteseelife.com hostname.
+#
+# Per CLAUDE.md §11, the soak window between staging promote and prod
+# promote is the trust gate for releases. Staging therefore tracks
+# every prod change before prod sees it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+  - ../../services/service-identity
+  - ../../services/api-gateway
+  - ../../services/service-subscription
+  - ../../services/service-booking
+  - ../../services/service-household
+  - ../../services/service-provider
+  - ../../services/worker-outbox-relay
+  - ../../services/web-family
+  - ../../services/web-marketing
+  - ../../services/service-accounting
+  - ../../services/service-notification
+  - ../../services/service-media
+  - ../../services/service-webhook
+  - ../../services/worker-accounting-metrics
+  - ../../services/worker-stripe-reconciliation
+  - ../../services/worker-media-processor
+  - ../../services/service-payouts
+  - ../../services/service-audit
+  - ../../services/service-activity
+  - ../../services/service-analytics
+  - ../../services/worker-analytics-aggregator
+  - ../../services/service-messaging
+  - ../../services/service-concierge
+  - ../../services/service-academy
+  - ../../services/service-search
+  - ../../services/web-admin
+  - ../../services/web-provider
+  - ../../services/worker-search-indexer
+  - ../../services/worker-identity-janitor
+  - ../../services/worker-certification-renewal
+  - ../../services/worker-wellness-summary
+  - ../../services/service-ads
+  - ../../services/service-content
+  - ../../services/service-trust-safety
+
+patches:
+  - target:
+      kind: Service
+      name: postgres-primary
+      namespace: platform-data
+    patch: |-
+      - op: replace
+        path: /spec/externalName
+        value: postgres.staging.internal
+
+  - target:
+      kind: Service
+      name: redis-primary
+      namespace: platform-data
+    patch: |-
+      - op: replace
+        path: /spec/externalName
+        value: redis.staging.internal
+
+  # ── Grafana Ingress (TS-151-followup-6) ────────────────────────────
+  # staging keeps the letsencrypt-staging issuer (base default).
+  - target:
+      kind: Ingress
+      name: grafana
+      namespace: observability
+    patch: |-
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: grafana.staging.tasteseelife.com
+      - op: replace
+        path: /spec/rules/0/host
+        value: grafana.staging.tasteseelife.com
+
+  - target:
+      kind: Deployment
+      name: service-identity
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-identity
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-identity-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── api-gateway (TS-151-followup-1) ────────────────────────────────
+  - target:
+      kind: Deployment
+      name: api-gateway
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: api-gateway
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: api-gateway-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── service-subscription (TS-151-followup-1) ───────────────────────
+  - target:
+      kind: Deployment
+      name: service-subscription
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-subscription
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-subscription-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+      # TS-151-followup-17 — these are user-facing links, and no overlay
+      # parameterised them, so dev and staging both rendered the PRODUCTION
+      # host. The verification link is the one that matters: an unpatched dev
+      # signup mails the user into production, where the token does not exist.
+      - op: replace
+        path: /data/BILLING_PORTAL_RETURN_URL
+        value: https://app.staging.tasteseelife.com/billing
+
+  # ── service-booking (TS-151-followup-1) ────────────────────────────
+  - target:
+      kind: Deployment
+      name: service-booking
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-booking
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-booking-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── service-household (TS-151-followup-1) ──────────────────────────
+  - target:
+      kind: Deployment
+      name: service-household
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-household
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-household-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── service-provider (TS-151-followup-1) ───────────────────────────
+  - target:
+      kind: Deployment
+      name: service-provider
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-provider
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-provider-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── worker-outbox-relay (TS-151-followup-1) ────────────────────────
+  - target:
+      kind: ConfigMap
+      name: worker-outbox-relay-config
+      namespace: platform-workers
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── web-family (TS-151-followup-1) ─────────────────────────────────
+  - target:
+      kind: Deployment
+      name: web-family
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: web-family
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: web-family-config
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/PORTAL_BASE_URL
+        value: https://app.staging.tasteseelife.com
+
+  - target:
+      kind: Ingress
+      name: web-family
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: app.staging.tasteseelife.com
+      - op: replace
+        path: /spec/rules/0/host
+        value: app.staging.tasteseelife.com
+
+  # ── web-marketing (TS-151-followup-1) ──────────────────────────────
+  - target:
+      kind: Deployment
+      name: web-marketing
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: web-marketing
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: web-marketing-config
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+
+  - target:
+      kind: Ingress
+      name: web-marketing
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: www.staging.tasteseelife.com
+      - op: replace
+        path: /spec/rules/0/host
+        value: www.staging.tasteseelife.com
+
+  # ── service-accounting (TS-151-followup-1, Batch 2) ────────────────
+  - target:
+      kind: Deployment
+      name: service-accounting
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-accounting
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-accounting-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── service-notification (TS-151-followup-1, Batch 2) ──────────────
+  - target:
+      kind: Deployment
+      name: service-notification
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-notification
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-notification-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+      # TS-151-followup-17 — these are user-facing links, and no overlay
+      # parameterised them, so dev and staging both rendered the PRODUCTION
+      # host. The verification link is the one that matters: an unpatched dev
+      # signup mails the user into production, where the token does not exist.
+      - op: replace
+        path: /data/DUNNING_BILLING_URL
+        value: https://app.staging.tasteseelife.com/billing
+      - op: replace
+        path: /data/EMAIL_VERIFICATION_URL_BASE
+        value: https://app.staging.tasteseelife.com/verify-email
+
+  # ── service-media (TS-151-followup-1, Batch 2) ─────────────────────
+  - target:
+      kind: Deployment
+      name: service-media
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-media
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-media-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── service-webhook (TS-151-followup-1, Batch 2) — no JWT verify ───
+  - target:
+      kind: Deployment
+      name: service-webhook
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-webhook
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-webhook-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── worker-accounting-metrics (TS-151-followup-1, Batch 2) ─────────
+  - target:
+      kind: ConfigMap
+      name: worker-accounting-metrics-config
+      namespace: platform-workers
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── worker-stripe-reconciliation (TS-151-followup-1, Batch 2) ──────
+  - target:
+      kind: ConfigMap
+      name: worker-stripe-reconciliation-config
+      namespace: platform-workers
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── worker-media-processor (TS-151-followup-1, Batch 2) ────────────
+  - target:
+      kind: ConfigMap
+      name: worker-media-processor-config
+      namespace: platform-workers
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── service-payouts (TS-151-followup-1) — money path completion ────
+  - target:
+      kind: Deployment
+      name: service-payouts
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-payouts
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-payouts-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── service-audit (TS-151-followup-1, Batch 3) ─────────────────────
+  - target:
+      kind: Deployment
+      name: service-audit
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-audit
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-audit-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── service-activity (TS-151-followup-1, Batch 3) ──────────────────
+  - target:
+      kind: Deployment
+      name: service-activity
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-activity
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-activity-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── service-analytics (TS-151-followup-1, Batch 3) ─────────────────
+  - target:
+      kind: Deployment
+      name: service-analytics
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-analytics
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-analytics-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── worker-analytics-aggregator (TS-151-followup-1, Batch 3) ───────
+  - target:
+      kind: ConfigMap
+      name: worker-analytics-aggregator-config
+      namespace: platform-workers
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── service-messaging (TS-151-followup-1, Batch 4) ─────────────────
+  - target:
+      kind: Deployment
+      name: service-messaging
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-messaging
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-messaging-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+      - op: replace
+        path: /data/REDIS_KEY_NAMESPACE_PREFIX
+        value: "staging:service-messaging:socket:"
+      - op: replace
+        path: /data/WS_CORS_ORIGINS
+        value: https://app.staging.tasteseelife.com
+
+  # ── service-concierge (TS-151-followup-1, Batch 4) ─────────────────
+  - target:
+      kind: Deployment
+      name: service-concierge
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-concierge
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-concierge-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── service-academy (TS-151-followup-1, Batch 4) ───────────────────
+  - target:
+      kind: Deployment
+      name: service-academy
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-academy
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-academy-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+      - op: replace
+        path: /data/ACADEMY_PUBLIC_BASE_URL
+        value: https://app.staging.tasteseelife.com
+
+  # ── service-search (TS-151-followup-1, Batch 4) ────────────────────
+  - target:
+      kind: Deployment
+      name: service-search
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-search
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-search-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/JWT_AUDIENCE
+        value: taste-and-see/api/staging
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── web-admin (TS-151-followup-1, Batch 5) ─────────────────────────
+  - target:
+      kind: Deployment
+      name: web-admin
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: web-admin
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: web-admin-config
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+
+  - target:
+      kind: Ingress
+      name: web-admin
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: admin.staging.tasteseelife.com
+      - op: replace
+        path: /spec/rules/0/host
+        value: admin.staging.tasteseelife.com
+
+  # ── web-provider (TS-151-followup-1, Batch 5) ──────────────────────
+  - target:
+      kind: Deployment
+      name: web-provider
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: web-provider
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: web-provider-config
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+
+  - target:
+      kind: Ingress
+      name: web-provider
+      namespace: platform-frontends
+    patch: |-
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: pros.staging.tasteseelife.com
+      - op: replace
+        path: /spec/rules/0/host
+        value: pros.staging.tasteseelife.com
+
+  # ── worker-search-indexer (TS-151-followup-1, Batch 5) ─────────────
+  - target:
+      kind: ConfigMap
+      name: worker-search-indexer-config
+      namespace: platform-workers
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── worker-identity-janitor (TS-151-followup-1, Batch 5) ───────────
+  - target:
+      kind: ConfigMap
+      name: worker-identity-janitor-config
+      namespace: platform-workers
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # ── worker-certification-renewal (TS-151-followup-1, Batch 5) ──────
+  - target:
+      kind: ConfigMap
+      name: worker-certification-renewal-config
+      namespace: platform-workers
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+      # TS-151-followup-17 — see the dev overlay's note. Unpatched, this worker
+      # emails providers a link to the PRODUCTION portal from staging.
+      - op: replace
+        path: /data/CERTIFICATION_RENEWAL_RENEW_URL
+        value: https://app.staging.tasteseelife.com/academy/renewals
+
+  # ── worker-wellness-summary (TS-151-followup-1, Batch 5) ───────────
+  - target:
+      kind: ConfigMap
+      name: worker-wellness-summary-config
+      namespace: platform-workers
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+      - op: replace
+        path: /data/SERVICE_VERSION
+        value: staging
+
+  # Image pinning for staging.
+  #
+  # Staging is operator-promoted: the TS-009g workflow does NOT auto-bump
+  # this field. A promotion PR updates `newTag` to a `sha-*` tag that has
+  # already passed in dev for the configured soak window — captured as
+  # TS-009g-followup-2. The `:staging` default is the bootstrap fallback.
+  # -- service-ads (TS-300-followup-2) ---------------------------------
+  - target:
+      kind: Deployment
+      name: service-ads
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-ads
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-ads-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+
+  # -- service-content (TS-300-followup-2) ---------------------------------
+  - target:
+      kind: Deployment
+      name: service-content
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-content
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-content-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+
+  # -- service-trust-safety (TS-300-followup-2) ---------------------------------
+  - target:
+      kind: Deployment
+      name: service-trust-safety
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: service-trust-safety
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+
+  - target:
+      kind: ConfigMap
+      name: service-trust-safety-config
+      namespace: platform-services
+    patch: |-
+      - op: replace
+        path: /data/NODE_ENV
+        value: staging
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: info
+
+images:
+  - name: ghcr.io/brickagcopra/service-identity
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-identity-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/api-gateway
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-subscription
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-subscription-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-booking
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-booking-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-household
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-household-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-provider
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-provider-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/worker-outbox-relay
+    newTag: staging
+  - name: ghcr.io/brickagcopra/web-family
+    newTag: staging
+  - name: ghcr.io/brickagcopra/web-marketing
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-accounting
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-accounting-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-notification
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-notification-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-media
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-media-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-webhook
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-webhook-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/worker-accounting-metrics
+    newTag: staging
+  - name: ghcr.io/brickagcopra/worker-stripe-reconciliation
+    newTag: staging
+  - name: ghcr.io/brickagcopra/worker-media-processor
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-payouts
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-payouts-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-audit
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-audit-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-activity
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-activity-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-analytics
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-analytics-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/worker-analytics-aggregator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-messaging
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-messaging-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-concierge
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-concierge-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-academy
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-academy-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-search
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-search-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/web-admin
+    newTag: staging
+  - name: ghcr.io/brickagcopra/web-provider
+    newTag: staging
+  - name: ghcr.io/brickagcopra/worker-search-indexer
+    newTag: staging
+  - name: ghcr.io/brickagcopra/worker-identity-janitor
+    newTag: staging
+  - name: ghcr.io/brickagcopra/worker-certification-renewal
+    newTag: staging
+  - name: ghcr.io/brickagcopra/worker-wellness-summary
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-ads
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-ads-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-content
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-content-migrator
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-trust-safety
+    newTag: staging
+  - name: ghcr.io/brickagcopra/service-trust-safety-migrator
+    newTag: staging

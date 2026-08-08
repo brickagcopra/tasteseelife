@@ -1,0 +1,406 @@
+// Payouts bounded context — see PDD §7.2 (service inventory entry #11)
+// and PDD §11.3 (provider payouts). The TS-090 slice ships the Stripe
+// Connect Express onboarding surface; T+2 disbursement scheduling +
+// provider payable balances + 1099 prep land with TS-091.
+//
+// Soft-FK discipline (CLAUDE.md §2.3, §4.1). Every column that looks
+// like an id into another service's schema (`provider_id` into
+// `provider.providers.id`) is a plain TEXT — service-payouts does not
+// maintain referential integrity with the producer services. Stripe
+// account ids (`acct_*`), event ids (`evt_*`) are similarly free TEXT,
+// bounded at the contract layer.
+//
+// Provider Payable balance lives in service-accounting
+// (`accounting.provider_payable_balances`, TS-083). service-payouts
+// reads that balance over the wire (or via an event) to decide which
+// providers to enrol in the next sweep. The decrement on disbursement
+// is a posting back to service-accounting (TS-083-followup-9). This
+// service does not duplicate the balance row.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. Production-stable
+  // since Prisma 5.0 even though it remains under `previewFeatures`.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `payouts` Postgres schema. Every other service
+  // gets its own schema in the same database (Phase 1) or its own
+  // database entirely (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["payouts"]
+}
+
+/// Onboarding lifecycle status for a provider's Stripe Connect Express
+/// account. Mirrors `PayoutAccountStatusSchema` in `packages/contracts`.
+///
+///   - `pending_onboarding` — Stripe Express account created, provider
+///     has not yet completed the onboarding form. `details_submitted`
+///     is false.
+///   - `restricted` — onboarding submitted but Stripe flagged
+///     outstanding requirements; disbursements blocked until cleared.
+///   - `active` — Stripe says `charges_enabled` + `payouts_enabled` are
+///     true and no requirements are past due. Disbursements proceed.
+///   - `disabled` — Stripe disabled the account (compliance / fraud /
+///     manual block). Disbursements halted; admin intervention needed.
+enum PayoutAccountStatus {
+  pending_onboarding
+  restricted
+  active
+  disabled
+
+  @@map("payout_account_status")
+  @@schema("payouts")
+}
+
+/// One row per provider × Stripe Connect Express account (TS-090).
+///
+/// **Idempotency.** `providerId` is UNIQUE — a provider holds at most
+/// one Stripe Connect Express account on the platform. A retried
+/// "create" call returns the existing row rather than minting a second
+/// account; the service relies on this constraint as the authoritative
+/// dedup mechanism.
+///
+/// **Stripe truth.** Stripe is the source of truth for `chargesEnabled`,
+/// `payoutsEnabled`, `detailsSubmitted`, and the requirements arrays.
+/// This row is a local cache, refreshed from `account.updated`
+/// webhooks (consumed via `stripe_account_events` below) and on
+/// admin-triggered manual reconciliation.
+///
+/// **Status derivation.** `status` is computed at write time from
+/// `chargesEnabled` + `payoutsEnabled` + the requirements arrays + the
+/// `disabledReason` — kept as a separate column rather than always
+/// derived so admin filters (`WHERE status = 'restricted'`) hit an
+/// index. Service-layer code uses `deriveStatus(...)` to compute the
+/// value before INSERT/UPDATE.
+///
+/// **Append-only for sensitive Stripe metadata.** The Stripe account id
+/// (`stripeAccountId`) is set at create and never updated — a regression
+/// that rebinds an account to a different provider would corrupt every
+/// downstream payout. Service-layer code enforces this; the migration
+/// adds a Postgres trigger that raises on any UPDATE that changes the
+/// column.
+model ProviderPayoutAccount {
+  /// Surrogate primary key — the row's stable identity inside this
+  /// table (CUID2). Distinct from `stripeAccountId` so the row id can
+  /// be referenced before Stripe has assigned its id (stub mode is
+  /// also internally consistent).
+  id                          String              @id @default(cuid())
+
+  /// Soft FK into `provider.providers.id`. UNIQUE — one Stripe Connect
+  /// Express account per provider.
+  providerId                  String              @unique @map("provider_id")
+
+  /// Stripe Connect account id (`acct_*` in live mode, `acct_stub_<id>`
+  /// in stub mode). UNIQUE — Stripe ids are globally unique within an
+  /// account, and the stub generator deterministically derives from
+  /// the surrogate id so collisions are impossible.
+  stripeAccountId             String              @unique @map("stripe_account_id")
+
+  /// ISO 3166-1 alpha-2 country code. Stripe requires this at account
+  /// creation; the platform Phase 1 default is `US`.
+  country                     String
+
+  /// ISO 4217 currency code. Phase 1 default is `USD` (PRD §11.4).
+  defaultCurrency             String              @map("default_currency")
+
+  /// Derived onboarding lifecycle status. See `deriveStatus` in the
+  /// payout-accounts service.
+  status                      PayoutAccountStatus
+
+  /// Stripe's `charges_enabled` — true when the connected account can
+  /// accept charges. For Express accounts on Taste & See the platform
+  /// pays the provider directly (no destination charges), so this is
+  /// secondary to `payoutsEnabled`. Persisted for completeness.
+  chargesEnabled              Boolean             @default(false) @map("charges_enabled")
+
+  /// Stripe's `payouts_enabled` — true when Stripe will accept
+  /// `Transfer` calls for the connected account. The gating signal for
+  /// "ok to disburse" (combined with status != disabled).
+  payoutsEnabled              Boolean             @default(false) @map("payouts_enabled")
+
+  /// Stripe's `details_submitted` — true once the provider has
+  /// completed the onboarding form (regardless of whether Stripe
+  /// accepted it).
+  detailsSubmitted            Boolean             @default(false) @map("details_submitted")
+
+  /// Stripe `requirements.currently_due[]` snapshot. JSONB so we get
+  /// GIN-indexability for future ad-hoc queries; the contract layer
+  /// caps the array.
+  requirementsCurrentlyDue    Json                @default("[]") @map("requirements_currently_due")
+
+  /// Stripe `requirements.past_due[]` snapshot.
+  requirementsPastDue         Json                @default("[]") @map("requirements_past_due")
+
+  /// Stripe `requirements.disabled_reason` — non-null only when status
+  /// is `restricted` or `disabled`.
+  disabledReason              String?             @map("disabled_reason")
+
+  /// Whether the Stripe SDK ran in live mode (true) or stub mode (false)
+  /// at the time of last update. Lets ops tell at a glance which rows
+  /// were minted under the Phase-1 stub before the live SDK landed.
+  liveMode                    Boolean             @default(false) @map("live_mode")
+
+  /// Free-form audit trail for the row — every state change adds an
+  /// account-link event row (see `PayoutAccountLinkEvent`) and updates
+  /// the timestamps here.
+  createdAt                   DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                   DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Reverse relations.
+  linkEvents                  PayoutAccountLinkEvent[]
+  stripeEvents                StripeAccountEvent[]
+
+  /// Powers the admin "list accounts in a given onboarding state" filter
+  /// — used by the ops dashboard to surface providers stuck in
+  /// `restricted` or `pending_onboarding` for outreach.
+  @@index([status, createdAt(sort: Desc)], map: "payout_accounts_status_created_idx")
+
+  @@map("provider_payout_accounts")
+  @@schema("payouts")
+}
+
+/// Audit trail of every Stripe account-link (`account_onboarding` /
+/// `account_update`) the platform has minted on behalf of a provider.
+///
+/// Append-only — link URLs are short-lived (≤ 10 min on the live side)
+/// but the row sticks around for audit. Useful for "why did the provider
+/// hit a stale onboarding link?" troubleshooting + the future TS-100
+/// audit-log integration.
+model PayoutAccountLinkEvent {
+  id                          String                  @id @default(cuid())
+
+  providerPayoutAccountId     String                  @map("provider_payout_account_id")
+  account                     ProviderPayoutAccount   @relation(fields: [providerPayoutAccountId], references: [id], onDelete: Cascade)
+
+  /// `account_onboarding` for the initial flow; `account_update` for
+  /// re-verification / KYC re-collection paths.
+  kind                        String
+
+  /// Stripe-issued URL. Never logged at info level (it contains a
+  /// single-use token); stored for replay/audit.
+  url                         String
+
+  /// Stripe-assigned expiration. Persisted as TIMESTAMPTZ so timezone
+  /// math is unambiguous.
+  expiresAt                   DateTime                @map("expires_at") @db.Timestamptz(6)
+
+  /// Whether the SDK ran live (true) or stub mode (false) when the
+  /// link was minted.
+  liveMode                    Boolean                 @default(false) @map("live_mode")
+
+  createdAt                   DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([providerPayoutAccountId, createdAt(sort: Desc)], map: "payout_link_events_account_created_idx")
+
+  @@map("payout_account_link_events")
+  @@schema("payouts")
+}
+
+/// Idempotent ingest log of Stripe `account.*` webhook events
+/// (currently `account.updated`; future extension to `account.deauthorized`
+/// + `capability.updated`).
+///
+/// `stripeEventId` is UNIQUE — a retried delivery from Stripe (or from
+/// our service-webhook) replays into the existing row. The service-
+/// layer code uses this row as the dedup key: on a hit, the `outcome`
+/// is `replayed` and the account row is not re-mutated.
+///
+/// The full Stripe payload is intentionally NOT persisted in full —
+/// service-webhook (TS-041a) already holds the raw event with signature
+/// verification. service-payouts persists the down-projected scalar
+/// fields it actually uses so the schema isn't coupled to Stripe SDK
+/// release notes.
+model StripeAccountEvent {
+  id                          String                  @id @default(cuid())
+
+  /// Stripe `evt_*` id. UNIQUE — dedup key.
+  stripeEventId               String                  @unique @map("stripe_event_id")
+
+  /// Stripe event type — `account.updated` for TS-090.
+  eventType                   String                  @map("event_type")
+
+  /// Stripe `acct_*` id this event concerns. Soft FK into
+  /// `provider_payout_accounts.stripe_account_id`; not enforced
+  /// referentially because Stripe may emit an event for an account
+  /// id this service has not yet observed (race with the create flow).
+  stripeAccountId             String                  @map("stripe_account_id")
+
+  /// The `ProviderPayoutAccount` row this event was applied to, if any
+  /// (nullable for `outcome = 'ignored'` events).
+  providerPayoutAccountId     String?                 @map("provider_payout_account_id")
+  account                     ProviderPayoutAccount?  @relation(fields: [providerPayoutAccountId], references: [id], onDelete: SetNull)
+
+  /// Stripe-emitted `event.created` time (UTC).
+  occurredAt                  DateTime                @map("occurred_at") @db.Timestamptz(6)
+
+  /// Down-projected scalar payload (the fields the service mutates on).
+  /// JSONB so admin tooling can grep for an obscure value without a
+  /// schema migration.
+  payload                     Json
+
+  /// `applied` | `replayed` | `ignored`. Stored as TEXT — the contract
+  /// is the source of truth; a regression that lands an unknown value
+  /// surfaces in admin queries.
+  outcome                     String
+
+  createdAt                   DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([stripeAccountId, occurredAt(sort: Desc)], map: "stripe_account_events_account_occurred_idx")
+
+  @@map("stripe_account_events")
+  @@schema("payouts")
+}
+
+/// Disbursement lifecycle status — mirror of `PayoutDisbursementStatusSchema`
+/// in `packages/contracts`. See the contract doc-comment for the full
+/// state machine; this enum is the persistence layer's view of it.
+enum PayoutDisbursementStatus {
+  pending
+  in_transit
+  paid
+  failed
+  canceled
+
+  @@map("payout_disbursement_status")
+  @@schema("payouts")
+}
+
+/// One row per attempted (or planned) disbursement from the platform to
+/// a provider's connected Stripe Express account (TS-091).
+///
+/// **Idempotency keys.** Two service-managed dedup paths feed into this
+/// table; both are UNIQUE at the DB layer.
+///
+///   - `idempotency_key` — the orchestrator-supplied key. The daily
+///     sweep uses `sweep:<asOfDate>:<providerId>` (one disbursement per
+///     provider per day); admin-issued disbursements use a caller-
+///     supplied opaque token. A retry of the SAME scheduling intent
+///     hits this UNIQUE constraint and returns the existing row.
+///
+///   - `source_event_id` — surfaces into the future accounting service
+///     postback so the DR Provider Payable / CR Cash journal is
+///     idempotent on the same key (TS-091-followup-3 closes this loop
+///     via the journals.source_event_id UNIQUE we already maintain in
+///     service-accounting).
+///
+/// **Immutable Stripe id.** `stripe_transfer_id` is set at most once;
+/// the migration adds a BEFORE-UPDATE trigger that rejects any UPDATE
+/// that changes the column from a non-null value to a different
+/// non-null value. This protects against a regression that rebinds a
+/// disbursement to a different Stripe transfer (which would corrupt
+/// the operator's audit trail).
+///
+/// **No FK to `provider_payout_accounts.id`.** A FK would force a
+/// `RESTRICT` semantic on account deletion, which we don't want — a
+/// soft-deleted account row must not block the disbursement history
+/// from being queryable. The mapping is `(providerId, stripeAccountId)`
+/// at the application layer; both columns are denormalised here so the
+/// admin scroll doesn't need a join to render.
+///
+/// **Money math.** Amounts are stored as `BigInt` in minor units (cents)
+/// — int math, deterministic, no decimal rounding concerns. The
+/// service layer parses to integer-valued primitives at the contract
+/// boundary. The CLAUDE.md §4.1 "no float for money" rule is preserved
+/// by going BIGINT rather than Decimal — for an integer count of cents
+/// BIGINT is even safer than Decimal because it eliminates the conversion
+/// round-trip.
+model PayoutDisbursement {
+  /// Surrogate primary key (cuid2). Stable identity for the row.
+  id                  String                   @id @default(cuid())
+
+  /// Soft FK into `provider.providers.id`.
+  providerId          String                   @map("provider_id")
+
+  /// Stripe Connect account id at the time of scheduling. Captured
+  /// here so a subsequent rebind of the provider's account (rare; admin
+  /// path only) doesn't retroactively change the audit trail.
+  stripeAccountId     String                   @map("stripe_account_id")
+
+  /// Stripe Transfer id (`tr_*` live, `tr_stub_*` stub). Nullable for
+  /// `pending` rows where the SDK call has not yet landed. The
+  /// migration adds an immutability trigger preventing rebind once set.
+  stripeTransferId    String?                  @unique @map("stripe_transfer_id")
+
+  /// ISO 4217. Phase 1 USD only.
+  currency            String
+
+  /// Money in minor units (cents). BigInt so even astronomically large
+  /// payouts fit; service-layer code narrows to Number at the contract
+  /// boundary.
+  amountMinor         BigInt                   @map("amount_minor")
+
+  /// Orchestrator-supplied dedup key. Sweep-scheduled disbursements use
+  /// `sweep:<asOfDate>:<providerId>`; admin-triggered disbursements use
+  /// an operator-supplied opaque token.
+  idempotencyKey      String                   @unique @map("idempotency_key")
+
+  /// Source-event id surfaced into the future accounting postback.
+  /// Defaults to `payout:disbursement:<id>` when the caller doesn't
+  /// supply one.
+  sourceEventId       String                   @unique @map("source_event_id")
+
+  /// Calendar date the disbursement was scheduled for (UTC). Drives
+  /// 1099-NEC accumulation + per-day reporting.
+  scheduledFor        DateTime                 @map("scheduled_for") @db.Date
+
+  /// Wall-clock cut-off for the T+2 hold window — disbursement may
+  /// only be initiated once now >= held_until. Computed at create
+  /// time from `scheduled_for - holdDays`.
+  heldUntil           DateTime                 @map("held_until") @db.Timestamptz(6)
+
+  /// Wall-clock when the Stripe Transfer call landed. Null until the
+  /// disbursement transitions out of `pending`.
+  initiatedAt         DateTime?                @map("initiated_at") @db.Timestamptz(6)
+
+  /// Wall-clock when Stripe confirmed `transfer.paid`. Null until paid.
+  paidAt              DateTime?                @map("paid_at") @db.Timestamptz(6)
+
+  /// Wall-clock when Stripe confirmed `transfer.failed`. Null until failed.
+  failedAt            DateTime?                @map("failed_at") @db.Timestamptz(6)
+
+  /// Stripe-supplied failure code or operator-supplied free text.
+  failureReason       String?                  @map("failure_reason")
+
+  /// Operator note (manual-disbursement path).
+  memo                String?
+
+  /// Lifecycle state.
+  status              PayoutDisbursementStatus
+
+  /// Whether the Stripe SDK ran live (true) or stub (false) at the
+  /// time of the initiating attempt. The accounting postback uses this
+  /// to decide whether to actually post the journal (stub mode skips
+  /// posting to avoid muddying the ledger with dev/CI traffic).
+  liveMode            Boolean                  @default(false) @map("live_mode")
+
+  createdAt           DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  /// Powers the admin / provider history scroll — newest disbursements
+  /// per-provider first.
+  @@index([providerId, createdAt(sort: Desc)], map: "payout_disbursements_provider_created_idx")
+  /// Powers the admin "stuck disbursements" filter (`status='pending'`
+  /// rows older than N hours).
+  @@index([status, createdAt(sort: Desc)], map: "payout_disbursements_status_created_idx")
+  /// Powers the daily reporting roll-up by scheduled-for date.
+  @@index([scheduledFor], map: "payout_disbursements_scheduled_for_idx")
+
+  @@map("payout_disbursements")
+  @@schema("payouts")
+}

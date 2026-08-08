@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "display": "Taste & See — Node.js / NestJS service",
+  "extends": "./base.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "lib": ["ES2022"],
+    "target": "ES2022",
+    "types": ["node"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "removeComments": true,
+    "preserveConstEnums": true
+  },
+  "exclude": ["node_modules", "dist", "test", "**/*.spec.ts", "**/*.test.ts"]
+}

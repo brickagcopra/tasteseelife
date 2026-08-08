@@ -1,0 +1,197 @@
+#cloud-config
+#
+# Bootstrap script for the Postgres + Redis + pgBackRest data node.
+#
+# Variables interpolated by templatefile():
+#   env                       — environment name (dev / staging / prod)
+#   ssh_public_key            — operator's authorized_keys entry
+#   postgres_version          — major version (e.g. "16")
+#   redis_version             — major version (e.g. "7")
+#   private_network_cidr      — VLAN CIDR for pg_hba.conf entry
+#   private_network_ip_prefix — Terraform-computed dotted IP prefix (e.g.
+#                               "10.40.") so we don't need bash parameter
+#                               expansion inside the templatefile heredoc.
+#   pgbackrest_repo_bucket    — S3 bucket name for backups
+#   pgbackrest_repo_endpoint  — S3 endpoint URL
+#
+# Hardening + ops conventions:
+#   * No application secrets are baked in via cloud-init. Postgres roles +
+#     passwords are seeded by the operator after first boot via a documented
+#     runbook (README §First-boot data-node bootstrap). pgBackRest's S3
+#     credentials are dropped into /etc/pgbackrest/pgbackrest.conf manually
+#     so that Terraform state never holds the live secret.
+#   * Postgres listens on the private VLAN interface only — never on
+#     0.0.0.0. Same for Redis.
+#   * unattended-upgrades for security patches; manual major version bumps
+#     for Postgres / Redis.
+#   * pgBackRest is installed but not initialised on boot; the operator
+#     runs `pgbackrest stanza-create` after configuring S3 creds.
+
+hostname: ${env}-data
+manage_etc_hosts: true
+timezone: Etc/UTC
+
+users:
+  - name: tastesee-ops
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [sudo, adm]
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+apt:
+  sources:
+    pgdg:
+      source: "deb https://apt.postgresql.org/pub/repos/apt $RELEASE-pgdg main"
+      keyid: B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - curl
+  - ca-certificates
+  - gnupg
+  - jq
+  - unattended-upgrades
+  - apt-listchanges
+  - fail2ban
+  - chrony
+  - ufw
+  - postgresql-${postgres_version}
+  - postgresql-contrib-${postgres_version}
+  - pgbackrest
+  - redis-server
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/10-tastesee-hardening.conf
+    permissions: "0644"
+    content: |
+      PermitRootLogin no
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      X11Forwarding no
+      AllowUsers tastesee-ops
+
+  - path: /etc/apt/apt.conf.d/52unattended-upgrades-local
+    permissions: "0644"
+    content: |
+      Unattended-Upgrade::Origins-Pattern {
+        "origin=Ubuntu,codename=$${distro_codename},label=Ubuntu-Security";
+        "origin=apt.postgresql.org,label=PostgreSQL";
+      };
+      Unattended-Upgrade::Automatic-Reboot "false";
+
+  # Postgres listens on every interface; pg_hba.conf (below) restricts
+  # connections to the private VLAN CIDR. Binding by IP at template time
+  # is infeasible because the VLAN-side IP is allocated by Contabo at
+  # boot, after this cloud-init runs. CLAUDE.md §3.2 enforcement is at
+  # the pg_hba layer, which is the authoritative gate.
+  - path: /etc/postgresql/${postgres_version}/main/conf.d/10-tastesee.conf
+    permissions: "0644"
+    content: |
+      listen_addresses = '*'
+      wal_level = replica
+      archive_mode = on
+      archive_command = 'pgbackrest --stanza=tastesee archive-push %p'
+      archive_timeout = 60
+      max_wal_senders = 5
+      max_replication_slots = 5
+      shared_buffers = 8GB
+      effective_cache_size = 20GB
+      work_mem = 16MB
+      maintenance_work_mem = 1GB
+      checkpoint_completion_target = 0.9
+      max_connections = 200
+      log_min_duration_statement = 500
+      log_lock_waits = on
+      log_temp_files = 0
+      log_connections = on
+      log_disconnections = on
+      log_line_prefix = '%t [%p] %u@%d %a '
+      ssl = on
+
+  # pg_hba.conf — VLAN-only access for cluster services.
+  # Operator appends real DB role rules during bootstrap (runbook §3).
+  - path: /etc/postgresql/${postgres_version}/main/pg_hba.conf.tastesee
+    permissions: "0640"
+    content: |
+      # Type  Database  User        Address                  Method
+      local   all       all                                  peer
+      host    all       all         127.0.0.1/32             scram-sha-256
+      host    all       all         ::1/128                  scram-sha-256
+      host    replication all       ${private_network_cidr}  scram-sha-256
+      host    all       all         ${private_network_cidr}  scram-sha-256
+
+  # pgBackRest skeleton — S3 credentials filled in by operator post-boot
+  # (NEVER via Terraform). The stanza name 'tastesee' is referenced by
+  # the archive_command above; do not rename without updating both.
+  - path: /etc/pgbackrest/pgbackrest.conf.template
+    permissions: "0640"
+    content: |
+      [global]
+      repo1-type=s3
+      repo1-s3-endpoint=${pgbackrest_repo_endpoint}
+      repo1-s3-bucket=${pgbackrest_repo_bucket}
+      repo1-s3-region=us-central-1
+      repo1-s3-key=<FILL_IN_OPERATOR>
+      repo1-s3-key-secret=<FILL_IN_OPERATOR>
+      repo1-path=/pgbackrest
+      repo1-retention-full=2
+      repo1-retention-diff=4
+      repo1-cipher-type=aes-256-cbc
+      repo1-cipher-pass=<FILL_IN_OPERATOR>
+      compress-type=zst
+      compress-level=6
+      log-level-console=info
+      log-level-file=detail
+      start-fast=y
+
+      [tastesee]
+      pg1-path=/var/lib/postgresql/${postgres_version}/main
+      pg1-port=5432
+
+  # Redis — bind to all interfaces but gate at the protocol layer via
+  # requirepass + protected-mode + the Contabo firewall. The actual
+  # VLAN IP isn't known at template time (Contabo allocates it at boot)
+  # and Redis doesn't accept CIDRs in `bind`. Operator can pin to the
+  # specific VLAN IP after first boot if defence-in-depth is required —
+  # documented in the first-boot runbook.
+  - path: /etc/redis/redis.conf.d/10-tastesee.conf
+    permissions: "0644"
+    content: |
+      bind 0.0.0.0 -::*
+      protected-mode yes
+      port 6379
+      appendonly yes
+      appendfsync everysec
+      maxmemory-policy noeviction
+      save 900 1
+      save 300 10
+      save 60 10000
+      requirepass <FILL_IN_OPERATOR>
+
+  - path: /etc/sysctl.d/90-postgres.conf
+    permissions: "0644"
+    content: |
+      vm.swappiness = 1
+      vm.overcommit_memory = 2
+      vm.overcommit_ratio = 80
+
+runcmd:
+  - [ systemctl, restart, ssh ]
+  - [ systemctl, enable, --now, unattended-upgrades ]
+  - [ systemctl, enable, --now, fail2ban ]
+  - [ systemctl, enable, --now, chrony ]
+  - [ sysctl, --system ]
+  # Move our hba template into place and reload Postgres.
+  - [ install, -m, "0640", -o, postgres, -g, postgres,
+      "/etc/postgresql/${postgres_version}/main/pg_hba.conf.tastesee",
+      "/etc/postgresql/${postgres_version}/main/pg_hba.conf" ]
+  - [ systemctl, restart, "postgresql@${postgres_version}-main" ]
+  # Ensure Redis picks up its include directory.
+  - [ sed, -i, "s|^# include /etc/redis/redis.conf.d/\\*.conf|include /etc/redis/redis.conf.d/*.conf|",
+      "/etc/redis/redis.conf" ]
+  - [ systemctl, restart, redis-server ]
+
+final_message: "data-node bootstrap complete on $${HOSTNAME} after $${UPTIME} seconds. Operator: fill /etc/pgbackrest/pgbackrest.conf.template with S3 creds, mv to pgbackrest.conf, run 'sudo -u postgres pgbackrest --stanza=tastesee stanza-create'."

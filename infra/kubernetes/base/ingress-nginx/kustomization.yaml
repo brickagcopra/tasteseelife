@@ -1,0 +1,30 @@
+# Kustomize inflates the NGINX Ingress Controller Helm chart at
+# `kustomize build` time. No Helm-operator dependency lives in the
+# cluster — ArgoCD (TS-152) or `kustomize build | kubectl apply` is
+# enough to roll the manifests.
+#
+# Per ADR-0001 §"No managed load balancer", NGINX Ingress runs
+# in-cluster pinned to one or two edge nodes via `hostPort: 443` +
+# `hostPort: 80`, fronted by Cloudflare. The values below pin the
+# DaemonSet kind (one ingress pod per labelled node) and disable
+# the upstream Service of type LoadBalancer because Contabo has no
+# managed LB primitive.
+#
+# Chart version pinned for reproducibility — bump via PR, not via
+# floating `>=` ranges. The CRDs the chart needs (validating
+# webhook configurations) install alongside.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ingress
+
+helmCharts:
+  - name: ingress-nginx
+    repo: https://kubernetes.github.io/ingress-nginx
+    version: 4.11.3
+    releaseName: ingress-nginx
+    namespace: ingress
+    valuesFile: values.yaml
+
+resources:
+  - cluster-network-policy.yaml

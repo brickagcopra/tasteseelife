@@ -1,0 +1,35 @@
+# Per-worker egress NetworkPolicy for worker-accounting-metrics.
+#
+# The namespace default-deny baseline
+# (infra/kubernetes/base/network-policies/default-deny.yaml) denies all
+# egress except DNS (allow-dns-egress) and the external data node
+# (allow-data-node-egress). This worker needs neither Postgres nor Redis
+# — it only calls service-accounting's internal compute endpoint in the
+# platform-services namespace — so this additive policy opens exactly
+# that one path: TCP/3015 to platform-services.
+#
+# The component comment (bullmq-worker/network-policy.yaml) notes that
+# per-worker egress (external CIDRs / in-cluster targets) belongs in the
+# per-worker base, not the reusable component — this is that override.
+# The matching ingress admission lives in the service-accounting base.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: worker-accounting-metrics-egress-accounting
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: worker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: worker
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: platform-services
+      ports:
+        - protocol: TCP
+          port: 3015

@@ -1,0 +1,20 @@
+# Non-secret runtime configuration. Per CLAUDE.md §3.5, no SECRETS
+# in this ConfigMap — only structural / non-sensitive values
+# (NODE_ENV, LOG_LEVEL, PORT, JWT_ISSUER, JWT_AUDIENCE, OTEL exporter
+# endpoints, etc.). Secrets ride on a separate Secret object referenced
+# via `envFrom` in the Deployment (see deployment.yaml).
+#
+# Consumers override `data` per-service via a JSON patch in their
+# per-service base.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nestjs-service-config
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: backend
+data:
+  NODE_ENV: production
+  LOG_LEVEL: info
+  PORT: "3000"
+  SERVICE_VERSION: dev

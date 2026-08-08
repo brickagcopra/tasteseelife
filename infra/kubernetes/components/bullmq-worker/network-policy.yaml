@@ -1,0 +1,19 @@
+# Workers receive NO ingress (no Service, nothing dials them).
+# Egress is needed for: Postgres + Redis (covered by the
+# base/data-access policy) and external APIs (Stripe / Twilio /
+# Checkr / SES) — those external CIDRs are added per-worker in
+# the per-worker base.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bullmq-worker-ingress-deny
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: worker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: worker
+  policyTypes:
+    - Ingress
+  ingress: []

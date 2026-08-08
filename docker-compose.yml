@@ -1,0 +1,130 @@
+name: tastesee
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tastesee-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tastesee}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tastesee_dev_only}
+      POSTGRES_DB: ${POSTGRES_DB:-tastesee}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/local/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tastesee} -d ${POSTGRES_DB:-tastesee}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - tastesee-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: tastesee-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --save
+      - "60"
+      - "1000"
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - tastesee-net
+
+  # ----- Heavyweight services (opt-in via `--profile full`) -----
+  # Cassandra holds messaging, audit, activity, notification history, ad
+  # impressions, raw analytics. ~2 GB RAM minimum; keep it off for routine
+  # dev unless a service under test actually touches it.
+  cassandra:
+    image: cassandra:5
+    container_name: tastesee-cassandra
+    profiles: ["full", "cassandra"]
+    restart: unless-stopped
+    environment:
+      CASSANDRA_CLUSTER_NAME: tastesee-local
+      CASSANDRA_DC: dc1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+      MAX_HEAP_SIZE: "1G"
+      HEAP_NEWSIZE: "256M"
+    ports:
+      - "${CASSANDRA_PORT:-9042}:9042"
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", 'cqlsh -e "describe keyspaces" || exit 1']
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    networks:
+      - tastesee-net
+
+  # OpenSearch powers provider discovery, content search, admin search.
+  opensearch:
+    image: opensearchproject/opensearch:2.15.0
+    container_name: tastesee-opensearch
+    profiles: ["full", "search"]
+    restart: unless-stopped
+    environment:
+      cluster.name: tastesee-local
+      node.name: opensearch-1
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "${OPENSEARCH_PORT:-9200}:9200"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - tastesee-net
+
+  # MailHog catches transactional/marketing email in dev.
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    container_name: tastesee-mailhog
+    profiles: ["full", "mail"]
+    restart: unless-stopped
+    ports:
+      - "${MAILHOG_SMTP_PORT:-1025}:1025"
+      - "${MAILHOG_UI_PORT:-8025}:8025"
+    networks:
+      - tastesee-net
+
+volumes:
+  postgres-data:
+  redis-data:
+  cassandra-data:
+  opensearch-data:
+
+networks:
+  tastesee-net:
+    driver: bridge

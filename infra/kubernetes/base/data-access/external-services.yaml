@@ -1,0 +1,68 @@
+# Per ADR-0001, Phase 1 runs Postgres 16 + Redis 7 on a DEDICATED
+# data node that lives outside the k3s cluster on the Contabo private
+# VLAN. The cluster reaches them via private DNS / VLAN IP, NOT via a
+# StatefulSet inside the cluster.
+#
+# These ExternalName Services give the cluster a stable, in-cluster
+# DNS name (postgres-primary.platform-data.svc.cluster.local /
+# redis-primary.platform-data.svc.cluster.local) that resolves to the
+# data node. Per-service Deployments reference the in-cluster name in
+# their DATABASE_URL / REDIS_URL — never the raw VLAN IP — so a future
+# move to an in-cluster StatefulSet (Phase 3 if scale demands it) is
+# a Service-spec swap rather than a fleet-wide env edit.
+#
+# IMPORTANT: the `externalName` value below uses a placeholder that
+# the env overlay overrides via a JSON patch. We deliberately do NOT
+# bake the VLAN IP into the base — the IP differs across dev /
+# staging / prod environments, and CLAUDE.md §17.11 forbids
+# environment-dependent hardcodes in shared bases.
+#
+# Sealed-secrets wiring lands in TS-151-followup-N. For Phase 1 the
+# operator creates the per-service credential Secrets out-of-band
+# using `kubectl create secret generic ... --from-literal=...` against
+# the data-node's `<FILL_IN_OPERATOR>` Postgres role passwords + the
+# Redis requirepass set during TS-150's first-apply.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-primary
+  namespace: platform-data
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    app.kubernetes.io/component: external-database
+  annotations:
+    taste-and-see/external-host: >-
+      Overridden per-env in infra/kubernetes/overlays/<env>/data-access-patch.yaml.
+      Default below points at a literal placeholder so the manifest
+      cannot accidentally apply against the wrong host.
+spec:
+  type: ExternalName
+  externalName: postgres.data.invalid
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-primary
+  namespace: platform-data
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+    app.kubernetes.io/component: external-cache
+  annotations:
+    taste-and-see/external-host: >-
+      Overridden per-env in infra/kubernetes/overlays/<env>/data-access-patch.yaml.
+spec:
+  type: ExternalName
+  externalName: redis.data.invalid
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      protocol: TCP

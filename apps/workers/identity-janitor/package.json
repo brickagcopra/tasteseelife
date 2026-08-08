@@ -1,0 +1,51 @@
+{
+  "name": "@taste-and-see/worker-identity-janitor",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "Identity janitor worker (TS-022-followup-3 + TS-023-followup-4). A separate long-running process that periodically prunes expired, retention-aged rows from the `identity` schema: `identity.refresh_tokens` (rotated/expired session tokens) and `identity.mfa_challenges` (consumed/expired MFA challenge rows). Both tables grow unbounded under sustained auth traffic and never shrink on their own; the janitor deletes rows whose `expires_at` is older than a configurable retention window (default 30d past expiry so audit trails are not immediately destroyed — CLAUDE.md §3.6). Deletes are batched to avoid long locks; the prune is idempotent and absolute-time-threshold based, so a missed cycle self-heals on the next tick.",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "start:dev": "tsc -p tsconfig.build.json --watch",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "test": "vitest run",
+    "test:boot-graph": "vitest run test/app-module-graph.test.ts",
+    "test:watch": "vitest",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "clean": "rimraf dist tsconfig.build.tsbuildinfo tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.0.0",
+    "@nestjs/core": "11.0.0",
+    "@nestjs/platform-express": "11.0.0",
+    "@taste-and-see/logger": "workspace:*",
+    "@taste-and-see/nest-common": "workspace:*",
+    "@taste-and-see/nest-observability": "workspace:*",
+    "@taste-and-see/sentry": "workspace:*",
+    "@taste-and-see/tracing": "workspace:*",
+    "pg": "8.13.1",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.1",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "11.0.0",
+    "@taste-and-see/eslint-config": "workspace:*",
+    "@taste-and-see/testing": "workspace:*",
+    "@taste-and-see/tsconfig": "workspace:*",
+    "@types/express": "5.0.0",
+    "@types/node": "22.10.1",
+    "@types/pg": "8.11.10",
+    "eslint": "8.57.0",
+    "rimraf": "6.0.1",
+    "testcontainers": "10.13.2",
+    "typescript": "5.5.4",
+    "vitest": "2.1.1"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}

@@ -1,0 +1,327 @@
+// Search bounded context — see PDD §7.2 (service inventory entry #21
+// search-svc) and §14.1 (provider discovery / tier-aware boosting).
+//
+// PDD §7.2 names Elasticsearch as service-search's primary store. This
+// schema adds a small Postgres companion store for ops-mutable
+// configuration that has no business living in ES (no transactional
+// semantics for config rows; ES indices are write-once-then-replace).
+//
+// Scope so far:
+//   - TS-211 adds the `search_ranking_config` row that holds the
+//     per-region tier-weight multipliers consumed by service-search at
+//     query time (Elite > Certified > Basic — PDD §14.1 "Tier-aware
+//     boosting … configurable"). One row keyed by `region_code`; the
+//     canonical `global` row is seeded on first migration with Elite
+//     ×1.5 / Certified ×1.2 / Basic ×1.0 and acts as the fallback for
+//     every region until ops authors a per-region override.
+//   - TS-215 adds two per-actor surfaces: `saved_searches` (named
+//     snapshots of `SearchProvidersRequest` bodies the family payer can
+//     re-run with one click — PRD §6.3, §6.4) and `favorite_providers`
+//     (per-actor bookmarks of providers, with an optional senior
+//     association for the "providers we love for Mom" surface). Both
+//     are user-scoped — `owner_user_id` is non-nullable and the service
+//     layer enforces that the authenticated actor's userId matches the
+//     row's owner on every read / update / delete.
+//
+// Cross-service references are by id only — never a foreign key into
+// another service schema (CLAUDE.md §2.3, §4.1). The
+// `updated_by_user_id` / `owner_user_id` / `senior_id` / `provider_id`
+// columns are all free TEXT — service-search does not maintain
+// referential integrity with service-identity / service-household /
+// service-provider.
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. The feature has
+  // been production-stable since Prisma 5.0 even though it remains
+  // under the `previewFeatures` umbrella in 5.x.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `search` Postgres schema. Every other service
+  // gets its own schema in the same database (Phase 1) or its own
+  // database entirely (Phase 3 — see PDD §7.2 final paragraph).
+  schemas  = ["search"]
+}
+
+/// Search ranking configuration (TS-211).
+///
+/// Each row holds the tier-weight multipliers service-search applies at
+/// query time to boost / demote providers by tier. The `global` row is
+/// the platform-wide default; per-region rows override `global` when a
+/// search request resolves to that region (resolution itself lands as
+/// TS-211-followup-3).
+///
+/// **Ops shape.** Maintained by ops via web-admin (TS-211-followup-2)
+/// or `curl` against service-search's internal shared-secret endpoint
+/// (today). Idempotent PUTs replay safely — a byte-equal write returns
+/// `unchanged` without bumping `updated_at`.
+///
+/// **Why not floats stored in env-vars.** Phase 1 used env-vars as the
+/// source of truth. That works for a single global ramp but doesn't
+/// support per-region experimentation, ops-time mutation without a
+/// redeploy, or actor attribution. The env-vars survive as the boot-
+/// time fallback (used by service-search if the DB row is absent or
+/// unreachable during boot) — captured on the env file with a
+/// "fallback only" disclaimer.
+model SearchRankingConfig {
+  /// CUID2-shaped id. Stable across writes — the natural key is
+  /// `region_code` (unique below), but the surrogate `id` keeps the row
+  /// referenceable from an audit / outbox event if either ever land.
+  id String @id @default(cuid())
+
+  /// Region code — `'global'` or a lowercase slug like `'nyc'`,
+  /// `'manhattan'`, `'bay_area'`. UNIQUE so the upsert path can rely
+  /// on the row identity matching the URL :regionCode without an
+  /// id round-trip.
+  regionCode String @unique @map("region_code")
+
+  /// Free-text description shown on the web-admin row. Optional —
+  /// the canonical `global` row is allowed to skip a description.
+  description String?
+
+  /// Tier weights. Float8 for full IEEE-754 precision — these are
+  /// multipliers, not money (CLAUDE.md §4.1's "no floats for money"
+  /// rule does not apply to ranking weights). Contract caps the range
+  /// at [0.1, 10]; the column itself is unconstrained at the Postgres
+  /// level so a follow-up that widens the contract bound does not need
+  /// a column-type migration.
+  tierWeightBasic     Float @map("tier_weight_basic")
+  tierWeightCertified Float @map("tier_weight_certified")
+  tierWeightElite     Float @map("tier_weight_elite")
+
+  /// Attributing user id — populated when the gateway BFF
+  /// (TS-211-followup-1) forwards from an authenticated admin actor.
+  /// Null when the row was seeded by migration or written by a system
+  /// process. NEVER a foreign key into service-identity (CLAUDE.md
+  /// §2.3).
+  updatedByUserId String? @map("updated_by_user_id")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("search_ranking_config")
+  @@schema("search")
+}
+
+/// Saved-search row (TS-215; PRD §6.3, §6.4; PDD §14.1).
+///
+/// Holds a verbatim `SearchProvidersRequest` body the family payer (or
+/// another authorised household member) saved under a label and can
+/// re-run with one click from the dashboard. The query is stored as
+/// JSONB so the search request schema can evolve additively (new
+/// optional filters, etc.) without invalidating older rows.
+///
+/// **Ownership invariant.** `owner_user_id` is non-nullable. The
+/// service layer enforces that the authenticated actor's userId matches
+/// the row's owner on every list / fetch / update / delete; the index
+/// `saved_searches_owner_user_id_idx` powers the "my saved searches"
+/// list query.
+///
+/// **Optional senior association.** `senior_id` lets the family-portal
+/// scope a saved search to a particular senior ("Italian-speaking chefs
+/// near Mom"). Null when the search is generic.
+///
+/// **`last_run_at`** is bumped by the run endpoint so the dashboard can
+/// sort by recency. Null until the family first invokes a rerun.
+model SavedSearch {
+  /// CUID2-shaped id.
+  id String @id @default(cuid())
+
+  /// Authenticated actor's user id. NEVER null — orphan rows are
+  /// rejected at the service layer at write time.
+  ownerUserId String @map("owner_user_id")
+
+  /// Optional soft-FK to a senior in service-household. NEVER a real
+  /// FK across services (CLAUDE.md §2.3).
+  seniorId String? @map("senior_id")
+
+  /// User-given label shown on the dashboard card. Bounded by the
+  /// contract (`SAVED_SEARCH_NAME_MAX_LENGTH`).
+  name String
+
+  /// Verbatim `SearchProvidersRequest` body, stored as JSONB so the
+  /// shape can evolve additively. The service-layer Zod parser
+  /// validates the payload at write time + the run endpoint replays
+  /// it through the public search surface.
+  query Json
+
+  /// Last time the family invoked the rerun endpoint. Null until first
+  /// rerun.
+  lastRunAt DateTime? @map("last_run_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([ownerUserId, createdAt(sort: Desc)], map: "saved_searches_owner_user_id_idx")
+  @@map("saved_searches")
+  @@schema("search")
+}
+
+/// Favorite-provider row (TS-215; PRD §6.3, §6.4; PDD §14.1).
+///
+/// Per-actor bookmark of a provider, with an optional senior
+/// association so the family-portal can surface "providers we love for
+/// Mom" on the senior profile. Bare by design — denormalised provider
+/// data lives on the discovery doc the search backend already projects;
+/// favourites just store the soft-FK + optional context note.
+///
+/// **Ownership invariant.** Same as `SavedSearch` — `owner_user_id` is
+/// non-nullable and the service layer enforces ownership on every read
+/// / update / delete.
+///
+/// **Uniqueness.** A composite unique on `(owner_user_id, provider_id,
+/// senior_id)` so the same actor cannot favourite the same provider
+/// twice for the same senior. Postgres' default NULLS-DISTINCT
+/// semantics treat `senior_id IS NULL` as a distinct value from any
+/// non-null value, which is the intent: an actor can have one
+/// no-senior favourite + one favourite-for-Mom + one favourite-for-Dad
+/// for the same provider.
+model FavoriteProvider {
+  /// CUID2-shaped id.
+  id String @id @default(cuid())
+
+  /// Authenticated actor's user id. NEVER null — orphan rows are
+  /// rejected at the service layer at write time.
+  ownerUserId String @map("owner_user_id")
+
+  /// Soft-FK to a provider in service-provider.
+  providerId String @map("provider_id")
+
+  /// Optional soft-FK to a senior in service-household.
+  seniorId String? @map("senior_id")
+
+  /// Optional free-text note ("Loved the carbonara at the trial").
+  /// Bounded by the contract (`FAVORITE_PROVIDER_NOTES_MAX_LENGTH`).
+  notes String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([ownerUserId, providerId, seniorId], map: "favorite_providers_owner_provider_senior_key")
+  @@index([ownerUserId, createdAt(sort: Desc)], map: "favorite_providers_owner_user_id_idx")
+  @@index([ownerUserId, seniorId, createdAt(sort: Desc)], map: "favorite_providers_owner_senior_idx")
+  @@map("favorite_providers")
+  @@schema("search")
+}
+
+/// Featured-placement row (TS-207; PRD §7.2, §10.5; PDD §14.1).
+///
+/// A scheduled window during which service-search's ranking layer applies a
+/// configurable score boost to a provider in discovery results, flagging the
+/// resulting hit as `featured` so the family-portal renders a badge. Authored
+/// by ops via web-admin (through the api-gateway BFF) or `curl` against the
+/// shared-secret-pinned internal endpoint.
+///
+/// **Why this lives in service-search, not in the indexed document.** A
+/// placement is scoped "per provider × region × tier" and time-windowed —
+/// whether a provider is featured for a given search depends on the query's
+/// region/tier context and the wall clock, none of which can be statically
+/// baked into the indexed doc by the search-indexer. So the boost is resolved
+/// at query time, mirroring the `SearchRankingConfig` tier-weight resolver.
+///
+/// **Scope semantics.** `region_code IS NULL` ⇒ applies in every region;
+/// `tier IS NULL` ⇒ applies to the provider regardless of tier. `tier` is a
+/// free TEXT column (not a Prisma enum) — the contract validates it against
+/// `ProviderDiscoveryTierSchema` at the boundary, and keeping it TEXT avoids
+/// an enum migration in a store whose primary index is Elasticsearch.
+///
+/// **Ops config, not tenant data.** Listed in `unscopedModels` alongside
+/// `SearchRankingConfig` — platform-wide ops config, not per-tenant. Soft-FK
+/// `provider_id` / `created_by_user_id` (never a cross-service FK — CLAUDE.md
+/// §2.3).
+model FeaturedPlacement {
+  /// CUID2-shaped id.
+  id String @id @default(cuid())
+
+  /// Soft-FK to a provider in service-provider.
+  providerId String @map("provider_id")
+
+  /// Region scope. Null ⇒ applies in every region. Lowercase slug
+  /// (`nyc`, `bay_area`) when set — same vocabulary as `SearchRankingConfig`.
+  regionCode String? @map("region_code")
+
+  /// Tier scope. Null ⇒ applies regardless of tier. One of
+  /// `basic` / `certified` / `elite` when set (validated by the contract).
+  tier String?
+
+  /// Score multiplier applied during the window. Contract caps `[1, 10]`.
+  /// Float8 — a ranking multiplier, not money (CLAUDE.md §4.1 money rule N/A).
+  boostMultiplier Float @map("boost_multiplier")
+
+  /// The active window. The ranking layer applies the boost when
+  /// `starts_at <= now < ends_at`.
+  startsAt DateTime @map("starts_at") @db.Timestamptz(6)
+  endsAt   DateTime @map("ends_at") @db.Timestamptz(6)
+
+  /// Optional free-text ops note shown on the admin row.
+  note String?
+
+  /// Attributing admin user id — populated when the gateway BFF forwards
+  /// from an authenticated super_admin actor. Null for direct curl callers.
+  /// NEVER a foreign key into service-identity (CLAUDE.md §2.3).
+  createdByUserId String? @map("created_by_user_id")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  // `ends_at` index powers the query-time "active or future" fetch
+  // (`WHERE ends_at > now()`); `provider_id` index powers the admin
+  // list-by-provider filter + the per-provider boost lookup.
+  @@index([endsAt], map: "featured_placements_ends_at_idx")
+  @@index([providerId], map: "featured_placements_provider_id_idx")
+  @@map("featured_placements")
+  @@schema("search")
+}
+
+/// Transactional outbox (TS-217-prep-1; PDD §7.3, CLAUDE.md §5.3).
+///
+/// Canonical `outbox_events` shape — identical to every other producer
+/// service's table (the `@taste-and-see/nest-outbox` SDK is
+/// schema-agnostic). service-search appends `search.performed` rows here
+/// on a best-effort path (off the search read path — see
+/// `SearchAnalyticsEmitter`); the worker-outbox-relay drains undispatched
+/// rows onto Redis Streams for `service-analytics` to consume (TS-217).
+///
+/// **Why this table lives in a search whose primary store is ES.** The
+/// outbox is durable-event plumbing, not search data — it belongs in the
+/// transactional Postgres companion store (the same `search` schema that
+/// already holds `search_ranking_config` etc.), never in Elasticsearch.
+///
+/// The SDK writes via raw SQL; this model exists so `prisma migrate`
+/// sees no drift against the hand-authored migration and so admin/debug
+/// tooling can read the table through the typed client. The partial
+/// `outbox_events_undispatched_idx` (the relay's dominant query) is
+/// materialised in the migration SQL — Prisma's `@@index` cannot express
+/// the `WHERE dispatched_at IS NULL` predicate.
+model OutboxEvent {
+  eventId         String    @id @map("event_id")
+  eventName       String    @map("event_name")
+  payload         Json
+  occurredAt      DateTime  @map("occurred_at") @db.Timestamptz(6)
+  producerService String    @map("producer_service")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  dispatchedAt    DateTime? @map("dispatched_at") @db.Timestamptz(6)
+  attempts        Int       @default(0)
+  lastAttemptAt   DateTime? @map("last_attempt_at") @db.Timestamptz(6)
+  lastError       String?   @map("last_error")
+
+  @@index([eventName], map: "outbox_events_event_name_idx")
+  @@map("outbox_events")
+  @@schema("search")
+}

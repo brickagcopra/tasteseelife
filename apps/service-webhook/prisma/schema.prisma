@@ -1,0 +1,249 @@
+// Webhook bounded context — see PDD §7.2 (service inventory entry #22).
+//
+// Inbound third-party webhook receiver. Owns:
+//   - Signature verification (HMAC) on every inbound request — the
+//     source-of-truth gate that distinguishes a real Stripe / Checkr
+//     / Twilio event from an attacker spraying our endpoint
+//     (CLAUDE.md §3.5, §17.8).
+//   - Idempotent event persistence keyed on the third party's event
+//     id. Replays from the third party (network retries, manual
+//     replays from the Stripe Dashboard, our own webhook-svc retry
+//     loop) hit a UNIQUE-constraint fast-path and ack 200 without
+//     re-running any downstream handler.
+//   - Forward-only dispatch to the rest of the platform via the
+//     event bus (TS-142 outbox + relay). Each persisted event is
+//     later marked `dispatched_at` once its downstream consumers
+//     have acked.
+//
+// Scope so far:
+//   - TS-041a added `stripe_processed_events` — the idempotency +
+//     persistence layer for inbound Stripe events.
+//   - TS-026 introduced the synchronous KYC dispatch hop (the
+//     dispatcher service lives under modules/stripe/services/; the
+//     row's `dispatched_at` is the source-of-truth that the future
+//     TS-142 relay will respect).
+//   - TS-051 adds `checkr_processed_events` — the idempotency +
+//     persistence layer for inbound Checkr background-check events.
+//     Same shape as `stripe_processed_events`: id-PK, signature-
+//     verified column, dispatched_at for the future relay. The
+//     payload is plain `Json` here too (the Checkr REST API speaks
+//     JSON exclusively; we persist the byte-exact verified body so
+//     downstream replay paths have the original event).
+//
+// Deliberately deferred:
+//   - `twilio_processed_events` — lands when Twilio delivery
+//     receipts wire in (TS-073 follow-up).
+//   - Dispatch tracking columns evolve when TS-142 (outbox + relay)
+//     lands.
+//
+// Cross-service references are by id only — never a foreign key
+// into another service schema (CLAUDE.md §2.3, §4.1).
+
+generator client {
+  provider        = "prisma-client-js"
+  binaryTargets   = ["native", "linux-musl-openssl-3.0.x"]
+  // Generated into the service's own `prisma/generated` rather than
+  // `node_modules/.prisma/client`. Under pnpm all 20 services share ONE
+  // physical `@prisma/client` in the store, so `require('.prisma/client')`
+  // resolves up from the store realpath and finds the 2 KB postinstall stub
+  // (0 models) instead — every service then dies at boot with
+  // "@prisma/client did not initialize yet" (TS-500).
+  //
+  // `./generated` is relative to THIS file, so it lands at
+  // `<service>/prisma/generated`. The import path `../../prisma/generated`
+  // is then identical from `src/prisma/` and from the compiled
+  // `dist/prisma/` — one path that works at type-check time and at runtime.
+  output          = "./generated"
+  // `multiSchema` is required for `@@schema(...)`. Production-stable
+  // since Prisma 5.0 even though it remains under the
+  // `previewFeatures` umbrella in 5.x.
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // The service owns the `webhook` Postgres schema. Every other
+  // service gets its own schema in the same database (Phase 1) or
+  // its own database entirely (Phase 3 — see PDD §7.2 final
+  // paragraph).
+  schemas  = ["webhook"]
+}
+
+/// Persisted inbound Stripe webhook event. See TS-041a doc-comment
+/// above for the rationale on every column. (Trimmed here for
+/// brevity — the original full doc lives in the TS-041a migration.)
+model StripeProcessedEvent {
+  eventId             String    @id @map("event_id")
+  eventType           String    @map("event_type")
+  apiVersion          String?   @map("api_version")
+  livemode            Boolean
+  requestId           String?   @map("request_id")
+  payload             Json
+  signatureVerifiedAt DateTime  @map("signature_verified_at") @db.Timestamptz(6)
+  receivedAt          DateTime  @default(now()) @map("received_at") @db.Timestamptz(6)
+  dispatchedAt        DateTime? @map("dispatched_at") @db.Timestamptz(6)
+
+  @@index([eventType, receivedAt], map: "stripe_processed_events_type_received_idx")
+  /// Relay query (TS-142): `WHERE dispatched_at IS NULL ORDER BY
+  /// received_at`. Materialised as a PARTIAL index
+  /// `(received_at) WHERE dispatched_at IS NULL` in the migration SQL
+  /// (TS-041a-followup-1) — Prisma 5.x's `@@index` cannot directly
+  /// express the partial predicate, so the index lives outside
+  /// Prisma's introspection. Same pattern as `outbox_events_undispatched_idx`
+  /// (TS-142). DO NOT add an `@@index([dispatchedAt, receivedAt], ...)`
+  /// declaration here — the next `prisma migrate dev` would recreate
+  /// the old composite and drop the partial.
+  @@map("stripe_processed_events")
+  @@schema("webhook")
+}
+
+/// Persisted inbound Checkr webhook event (TS-051).
+///
+/// **Idempotency key** (`eventId`): Checkr's `event.id` (a UUID).
+/// We use it as the primary key so a P2002 (unique constraint
+/// violation) on insert is the "we've already seen this event"
+/// fast-path — the controller catches it, responds 200, and skips
+/// any downstream dispatch.
+///
+/// **Signature verified at**: the timestamp at which the request's
+/// `X-Checkr-Signature` header was validated via HMAC-SHA256
+/// against `CHECKR_WEBHOOK_SECRET`. A row exists in this table only
+/// if the signature passed.
+///
+/// **Payload** (`payload`): the byte-exact JSON parsed from the
+/// verified raw body. Checkr event payloads are typically <16 KiB
+/// per the platform doc.
+///
+/// **Account ID** (`accountId`): Checkr's `account_id` — the
+/// Checkr-side tenant id this event belongs to. Persisted so a
+/// staging environment that points at the wrong Checkr account can
+/// be detected at the dispatch layer.
+///
+/// **Dispatched at** (`dispatchedAt`): set non-null once the
+/// outbox/relay (TS-142) — or today, the TS-051 synchronous
+/// dispatcher — has handed this event off to service-provider.
+/// Null means "we have the event but haven't dispatched it yet".
+///
+/// **No `livemode` column** because Checkr doesn't surface a
+/// boolean live/test discriminator on the event envelope; the
+/// distinction lives in `accountId` (test-mode account id ≠
+/// production account id).
+///
+/// Soft-delete intentionally NOT supported: webhook events are an
+/// immutable audit trail. Pruning happens via a periodic janitor
+/// (TS-051-followup-N) that respects a retention window.
+model CheckrProcessedEvent {
+  /// Checkr's `event.id` — global unique per account.
+  eventId             String    @id @map("event_id")
+  /// `event.type` — eg `report.completed`. Index for ops queries.
+  eventType           String    @map("event_type")
+  /// `event.account_id`.
+  accountId           String    @map("account_id")
+  /// `event.object` — typically `report`. Captured for ops querying.
+  objectKind          String    @map("object_kind")
+  /// `event.data.object.id` — the report id (or candidate id for
+  /// some event types). Indexed for ops queries.
+  objectId            String    @map("object_id")
+  /// Byte-exact JSON of the verified Checkr event envelope.
+  payload             Json
+  /// Wall-clock at which the signature was verified.
+  signatureVerifiedAt DateTime  @map("signature_verified_at") @db.Timestamptz(6)
+  /// Wall-clock at which the row was inserted.
+  receivedAt          DateTime  @default(now()) @map("received_at") @db.Timestamptz(6)
+  /// Non-null once the dispatcher (TS-051 sync; TS-142 relay
+  /// thereafter) has forwarded downstream.
+  dispatchedAt        DateTime? @map("dispatched_at") @db.Timestamptz(6)
+
+  /// Ops query: "show me every event of type X in time range Y".
+  @@index([eventType, receivedAt], map: "checkr_processed_events_type_received_idx")
+  /// Ops query: "show me every event for this report id".
+  @@index([objectId, receivedAt], map: "checkr_processed_events_object_received_idx")
+  /// Relay query (TS-142): `WHERE dispatched_at IS NULL ORDER BY
+  /// received_at`. Materialised as a PARTIAL index
+  /// `(received_at) WHERE dispatched_at IS NULL` in the migration SQL
+  /// (TS-041a-followup-1, same migration as the stripe-table swap) —
+  /// Prisma 5.x's `@@index` cannot directly express the partial
+  /// predicate, so the index lives outside Prisma's introspection.
+  /// DO NOT add an `@@index([dispatchedAt, receivedAt], ...)`
+  /// declaration here — the next `prisma migrate dev` would recreate
+  /// the old composite and drop the partial.
+  @@map("checkr_processed_events")
+  @@schema("webhook")
+}
+
+/// Outbox row — webhook-side platform domain events emitted
+/// transactionally with the ingress-table write per the outbox pattern
+/// (PDD §7.3, CLAUDE.md §5.3). Shape is identical to every other
+/// producer service's `outbox_events` table; the
+/// `@taste-and-see/nest-outbox` SDK is schema-agnostic and consumes
+/// this table via raw SQL inside the caller's Prisma `$transaction`.
+///
+/// This is the canonical generic PRODUCER-side outbox — the platform
+/// domain events service-webhook EMITS once the per-source synchronous
+/// dispatch hops transition onto the relay (the TS-026-followup-1 /
+/// TS-051-followup-1 / TS-073-followup-5 migrations of the KYC /
+/// background-check / delivery-receipt dispatchers). It is orthogonal
+/// to the per-source ingress tables `StripeProcessedEvent`
+/// (`webhook.stripe_processed_events`) and `CheckrProcessedEvent`
+/// (`webhook.checkr_processed_events`), each of which carries its own
+/// `dispatched_at` tracking the legacy synchronous dispatch hop. The
+/// ingress tables record "third-party events I have received +
+/// verified"; this table records "platform domain events I will
+/// publish onto the bus" — they never overlap.
+///
+/// The relay worker (`apps/workers/outbox-relay`) polls
+/// `WHERE dispatched_at IS NULL ORDER BY created_at` via its own
+/// `pg` pool — NOT through this Prisma client — so cross-service
+/// reads stay outside the service's Prisma boundary
+/// (CLAUDE.md §2.3 / §4.1).
+model OutboxEvent {
+  /// Dedup key — consumers must idempotency-check on this. UUID v4
+  /// generated by the SDK by default; producers may pass an explicit
+  /// id (e.g. a deterministic `{stripeEventId}.dispatched` composite)
+  /// for cross-boundary exactly-once-effective delivery.
+  eventId         String    @id @map("event_id")
+  /// Dot-notation event name from `packages/contracts/events`. The
+  /// SDK validates the name against the registry before inserting
+  /// — unknown names are rejected at the producer boundary.
+  eventName       String    @map("event_name")
+  /// Validated domain payload (validated by the SDK against the
+  /// matching `eventRegistry` schema before insert).
+  payload         Json
+  /// Producer wall-clock time the event semantically happened. May
+  /// differ from `created_at` for backfilled events.
+  occurredAt      DateTime  @map("occurred_at") @db.Timestamptz(6)
+  /// Service name that produced the row (`service-webhook`). Useful
+  /// for relay observability + per-service throughput metrics.
+  producerService String    @map("producer_service")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Stamped by the relay when the row has been successfully
+  /// forwarded onto the bus. Null means undispatched + eligible for
+  /// the next poll cycle.
+  dispatchedAt    DateTime? @map("dispatched_at") @db.Timestamptz(6)
+  /// Failed dispatch counter. The relay stops retrying once this
+  /// reaches `MAX_ATTEMPTS` — those rows are dead-lettered for ops
+  /// attention (surfaced via metrics + an admin endpoint).
+  attempts        Int       @default(0)
+  /// Stamped by the relay on the most recent failed attempt.
+  lastAttemptAt   DateTime? @map("last_attempt_at") @db.Timestamptz(6)
+  /// Most recent failure message — capped at 2000 chars at the
+  /// relay's record-failure path.
+  lastError       String?   @map("last_error")
+
+  /// Secondary scroll by event_name (admin filters / metrics).
+  ///
+  /// The relay's dominant read query — "give me the next batch of
+  /// undispatched rows ordered by created_at" — is served by a PARTIAL
+  /// index on `(created_at) WHERE dispatched_at IS NULL`, which keeps
+  /// the index footprint bounded against an ever-growing append-only
+  /// table (CLAUDE.md §7.3). Prisma's `@@index` cannot directly express
+  /// the partial predicate, so that index is materialised in the
+  /// migration SQL (TS-142-followup-1), NOT here. DO NOT add an
+  /// `@@index([dispatchedAt, createdAt], ...)` declaration — the next
+  /// `prisma migrate dev` would recreate a non-partial composite and
+  /// drop the partial.
+  @@index([eventName], map: "outbox_events_event_name_idx")
+  @@map("outbox_events")
+  @@schema("webhook")
+}

@@ -1,0 +1,22 @@
+# Testcontainers image pin list (TS-009e-followup-4).
+#
+# One image reference per line. Lines starting with `#` and blank lines
+# are ignored. The CI integration-test job hashes this file to key an
+# `actions/cache` entry, so each new line invalidates the cache and the
+# job pulls + re-saves the full set on the next run.
+#
+# Canonical sources of these pins — keep this file in lockstep with them:
+#   - packages/testing/src/integration/postgres.ts  (DEFAULT_POSTGRES_IMAGE)
+#   - packages/testing/src/integration/redis.ts     (DEFAULT_REDIS_IMAGE)
+#   - docker-compose.yml                            (local dev stack)
+#
+# Scope is deliberately tight: only the images the
+# `startIntegrationTestStack` harness boots on every run. The reaper
+# image (`testcontainers/ryuk:*`) is intentionally NOT pinned here — its
+# tag is owned by the `testcontainers` npm package version
+# (`packages/testing/package.json`) and adding it would couple this
+# file to that pin. Ryuk's pull is small enough (~5 MB) to not justify
+# the indirection.
+
+postgres:16-alpine
+redis:7-alpine

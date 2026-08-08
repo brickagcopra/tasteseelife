@@ -1,0 +1,36 @@
+# Per-service NetworkPolicy additive layer.
+#
+# Allows ingress to the service's HTTP port from any pod inside
+# `platform-services` (typical: api-gateway calls service-identity;
+# service-subscription calls service-accounting). Does NOT permit
+# inbound from outside the cluster — the per-service Ingress (if any)
+# enters via ingress-nginx, which the base
+# infra/kubernetes/base/ingress-nginx/cluster-network-policy.yaml
+# already allows.
+#
+# Egress to the data node (Postgres / Redis) is already permitted by
+# the base infra/kubernetes/base/data-access/egress-network-policies.yaml.
+# Per-service egress to external APIs (Stripe, Twilio, Checkr, ...)
+# goes in the service's own override patch — those CIDRs change per
+# vendor and don't belong in a reusable component.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nestjs-service
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: backend
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: backend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: platform-services
+      ports:
+        - protocol: TCP
+          port: 3000

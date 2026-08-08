@@ -1,0 +1,153 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": [
+    "tsconfig.base.json",
+    ".eslintrc.cjs",
+    ".prettierrc",
+    "packages/tsconfig/*.json",
+    "packages/eslint-config/*.cjs",
+    "packages/eslint-config/package.json",
+    "packages/prettier-config/*.cjs",
+    "packages/prettier-config/package.json",
+    ".env",
+    ".env.local"
+  ],
+  "globalEnv": ["NODE_ENV", "CI"],
+  "globalPassThroughEnv": ["GITHUB_TOKEN"],
+  "ui": "tui",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "src/**",
+        "prisma/**",
+        "public/**",
+        "next.config.*",
+        "tailwind.config.*",
+        "postcss.config.*",
+        "tsconfig.json"
+      ],
+      "outputs": [
+        "dist/**",
+        ".next/**",
+        "!.next/cache/**",
+        "build/**",
+        "out/**",
+        // `*.tsbuildinfo` is an OUTPUT, not a side effect, and leaving it out
+        // of this list is a defect that can make `build` emit nothing while
+        // reporting success.
+        //
+        // The shared base tsconfig sets `incremental: true`, so `tsc` consults
+        // `tsconfig.build.tsbuildinfo` to decide what to re-emit. If that file
+        // survives while `dist/` does not — which is exactly what happened
+        // when turbo restored a cached `dist` over a newer build state, and
+        // what every `clean: rimraf dist` script did on purpose — `tsc` sees
+        // "already up to date", emits NOTHING, and exits 0. Two workers
+        // (`identity-janitor`, `certification-renewal`) were sitting on a
+        // `dist/` missing whole directories that no rebuild could repair;
+        // deleting the `.tsbuildinfo` was the only way out. Found by the
+        // TS-505 worker boot sweep, which could not start them.
+        //
+        // Listing it here makes turbo treat the pair atomically: both are
+        // saved together and both are cleared before a restore, so the
+        // incremental state can never describe a `dist/` that isn't there.
+        // The `clean` scripts remove it too, so `pnpm clean && pnpm build`
+        // rebuilds rather than no-ops.
+        "*.tsbuildinfo"
+      ]
+    },
+    "lint": {
+      "dependsOn": ["^lint"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "src/**",
+        "*.{ts,tsx,js,jsx,cjs,mjs}",
+        ".eslintrc.*",
+        "eslint.config.*"
+      ],
+      "outputs": []
+    },
+    "type-check": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "src/**",
+        "tsconfig.json",
+        "tsconfig.*.json",
+        // Services type-check against their own generated Prisma client
+        // (`prisma/generated`, TS-500/TS-501). That directory is gitignored,
+        // so it can never be a cache input itself — but it is a pure function
+        // of the schema + pinned Prisma version, so keying on the schema is
+        // the correct proxy. Without this a schema change leaves a stale
+        // green type-check in the cache.
+        "prisma/schema.prisma"
+      ],
+      "outputs": []
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "src/**",
+        "test/**",
+        "tests/**",
+        "vitest.config.*",
+        "jest.config.*",
+        // Same reasoning as `type-check` above — suites compile against the
+        // generated client, so the schema has to be part of the cache key.
+        "prisma/schema.prisma"
+      ],
+      "outputs": ["coverage/**"]
+    },
+    // TS-506-followup-2 — the boot-graph guards, on their own lane.
+    //
+    // These 30 suites (one per Nest app + worker) each import a whole
+    // service's dependency tree and run Nest's injector over it. They are
+    // the slowest tests in the repo by an order of magnitude, and inside
+    // the shared `test` task the one assertion that means *this service
+    // cannot start* is buried among hundreds of unit results — a
+    // boot-graph break reads as "service-X unit tests failed".
+    //
+    // They remain in each app's `test` include glob as well, deliberately:
+    // a developer running `pnpm test` locally must still find out that a
+    // provider went unresolvable. This lane exists so CI can say so in a
+    // job whose NAME is the property, and so it can gate independently.
+    //
+    // Same `dependsOn` and inputs as `test` — the suites compile against
+    // the generated Prisma client, so the schema belongs in the cache key.
+    "test:boot-graph": {
+      "dependsOn": ["^build"],
+      "inputs": ["$TURBO_DEFAULT$", "src/**", "test/**", "vitest.config.*", "prisma/schema.prisma"],
+      "outputs": []
+    },
+    "test:integration": {
+      "dependsOn": ["^build"],
+      "cache": false,
+      "outputs": ["coverage-integration/**"]
+    },
+    "test:e2e": {
+      "dependsOn": ["^build"],
+      "cache": false,
+      "outputs": ["playwright-report/**", "test-results/**"]
+    },
+    "check": {
+      "dependsOn": ["build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "src/**",
+        "generated/**",
+        "tsconfig.json",
+        "tsconfig.build.json"
+      ],
+      "outputs": []
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "clean": {
+      "cache": false
+    }
+  }
+}

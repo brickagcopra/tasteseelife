@@ -1,0 +1,58 @@
+# Workload PriorityClasses. Kubernetes evicts lower-priority pods
+# first under node pressure or when a higher-priority pod needs to
+# be scheduled.
+#
+# `system-cluster-critical` and `system-node-critical` are already
+# created by Kubernetes itself; we do not redefine them here.
+#
+# Per CLAUDE.md §7 + PDD §20.2 Pod Disruption Budgets, the booking,
+# gateway, identity, and accounting services are flagged as critical
+# — those pin to `taste-and-see-workload-critical` so their pods
+# survive node-drain operations longer than a typical web app or
+# worker. Worker pods at the bottom of the priority stack so
+# background jobs yield to live request traffic during cluster squeeze.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: taste-and-see-workload-critical
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+value: 100000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: >-
+  Critical-path services that drive revenue + trust (booking-svc,
+  api-gateway, service-identity, service-accounting, service-payouts,
+  service-subscription, service-webhook).
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: taste-and-see-workload-standard
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+value: 50000
+globalDefault: true
+preemptionPolicy: PreemptLowerPriority
+description: >-
+  Default tier for all standard backend services + frontends.
+  Marked globalDefault so a pod without an explicit priorityClassName
+  lands here rather than at the bottom of the priority stack.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: taste-and-see-workload-batch
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/part-of: taste-and-see
+value: 10000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: >-
+  Background workers + BullMQ consumers + scheduled CronJobs +
+  one-shot migration Jobs. First to yield when the cluster needs
+  capacity for higher-priority requests.
