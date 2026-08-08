@@ -235,7 +235,9 @@ jobs:
           ignore-unfixed: true
 
       - name: Upload Trivy SARIF to GitHub Security
-        if: always()
+        # Same shape as the migrator upload below: a bare `always()` would fire
+        # after a failed BUILD, when the scan never ran and there is no file.
+        if: always() && steps.build.outcome == 'success'
         uses: github/codeql-action/upload-sarif@1521896cd211af95be3f02edf6f436e10b819c27 # v3.35.4
         with:
           sarif_file: trivy-image-results.sarif
@@ -302,7 +304,15 @@ jobs:
           ignore-unfixed: true
 
       - name: Upload migrator Trivy SARIF to GitHub Security
-        if: always() && inputs.migrator-image-name != ''
+        # Gated on the migrator BUILD, not just on the image name. `always()`
+        # alone made this step run even when the build was skipped — which is
+        # exactly what happened on the first real CI run: the service image's
+        # Trivy scan failed, every later step was skipped, and this one still
+        # fired and died on a `trivy-migrator-results.sarif` that was never
+        # written. Trivy writes its SARIF before exiting non-zero, so keying on
+        # the build succeeding still uploads findings from a FAILED scan, which
+        # is the case the Security tab most needs.
+        if: always() && steps.build-migrator.outcome == 'success'
         uses: github/codeql-action/upload-sarif@1521896cd211af95be3f02edf6f436e10b819c27 # v3.35.4
         with:
           sarif_file: trivy-migrator-results.sarif
