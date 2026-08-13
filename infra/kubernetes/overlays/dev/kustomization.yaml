@@ -1386,9 +1386,9 @@ images:
   - name: ghcr.io/brickagcopra/service-media-migrator
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-webhook
-    newTag: sha-d2feac6
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-webhook-migrator
-    newTag: sha-d2feac6
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/worker-accounting-metrics
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/worker-stripe-reconciliation
