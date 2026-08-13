@@ -1418,9 +1418,9 @@ images:
   - name: ghcr.io/brickagcopra/service-messaging-migrator
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-concierge
-    newTag: dev
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-concierge-migrator
-    newTag: dev
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-academy
     newTag: dev
   - name: ghcr.io/brickagcopra/service-academy-migrator
