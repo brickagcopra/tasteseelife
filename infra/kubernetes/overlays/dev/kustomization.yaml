@@ -1432,7 +1432,7 @@ images:
   - name: ghcr.io/brickagcopra/web-admin
     newTag: dev
   - name: ghcr.io/brickagcopra/web-provider
-    newTag: dev
+    newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/worker-search-indexer
     newTag: dev
   - name: ghcr.io/brickagcopra/worker-identity-janitor
