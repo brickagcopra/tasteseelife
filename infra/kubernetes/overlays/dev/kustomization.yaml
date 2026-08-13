@@ -1378,9 +1378,9 @@ images:
   - name: ghcr.io/brickagcopra/service-accounting-migrator
     newTag: dev
   - name: ghcr.io/brickagcopra/service-notification
-    newTag: sha-d2feac6
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-notification-migrator
-    newTag: sha-d2feac6
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-media
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-media-migrator
