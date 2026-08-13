@@ -1440,7 +1440,7 @@ images:
   - name: ghcr.io/brickagcopra/worker-certification-renewal
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/worker-wellness-summary
-    newTag: sha-d2feac6
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-ads
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-ads-migrator
