@@ -1422,9 +1422,9 @@ images:
   - name: ghcr.io/brickagcopra/service-concierge-migrator
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-academy
-    newTag: dev
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-academy-migrator
-    newTag: dev
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-search
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-search-migrator
