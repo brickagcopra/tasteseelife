@@ -1346,9 +1346,9 @@ patches:
 
 images:
   - name: ghcr.io/brickagcopra/service-identity
-    newTag: sha-d2feac6
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-identity-migrator
-    newTag: sha-d2feac6
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/api-gateway
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-subscription
