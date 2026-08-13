@@ -1446,9 +1446,9 @@ images:
   - name: ghcr.io/brickagcopra/service-ads-migrator
     newTag: dev
   - name: ghcr.io/brickagcopra/service-content
-    newTag: dev
+    newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/service-content-migrator
-    newTag: dev
+    newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/service-trust-safety
     newTag: dev
   - name: ghcr.io/brickagcopra/service-trust-safety-migrator
