@@ -1364,9 +1364,9 @@ images:
   - name: ghcr.io/brickagcopra/service-household-migrator
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-provider
-    newTag: dev
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-provider-migrator
-    newTag: dev
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/worker-outbox-relay
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/web-family
