@@ -1352,9 +1352,9 @@ images:
   - name: ghcr.io/brickagcopra/api-gateway
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-subscription
-    newTag: sha-d2feac6
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-subscription-migrator
-    newTag: sha-d2feac6
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-booking
     newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/service-booking-migrator
