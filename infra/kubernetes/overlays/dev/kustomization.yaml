@@ -1442,9 +1442,9 @@ images:
   - name: ghcr.io/brickagcopra/worker-wellness-summary
     newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/service-ads
-    newTag: dev
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-ads-migrator
-    newTag: dev
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-content
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-content-migrator
