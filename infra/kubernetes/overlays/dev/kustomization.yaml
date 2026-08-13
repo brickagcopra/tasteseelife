@@ -1392,7 +1392,7 @@ images:
   - name: ghcr.io/brickagcopra/worker-accounting-metrics
     newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/worker-stripe-reconciliation
-    newTag: dev
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/worker-media-processor
     newTag: dev
   - name: ghcr.io/brickagcopra/service-payouts
