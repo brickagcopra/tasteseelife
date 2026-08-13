@@ -65,9 +65,20 @@ patches:
   # index 0 with both bounds set, so the paths below resolve for all of them —
   # and a future component that does not would fail this patch loudly rather
   # than silently skipping.
+  #
+  # `managed-by=kustomize` is load-bearing (TS-151-followup-22), not
+  # decoration. `part-of=taste-and-see` alone does NOT mean "our workload":
+  # the base stamps it via `commonLabels` onto EVERYTHING it renders,
+  # Helm-inflated charts included. That selector matched 42 Deployments, and
+  # four of them — kube-prometheus-stack's grafana / kube-state-metrics /
+  # operator, and sealed-secrets-controller — ship `resources: {}`, so the
+  # `replace` ops below found no path and kustomize failed the entire build
+  # with `doc is missing path`. Adding the second label narrows the set to the
+  # 34 Deployments this repo actually authors, which is both what the patch
+  # can apply to and, per "What it does NOT do" above, all it should touch.
   - target:
       kind: Deployment
-      labelSelector: app.kubernetes.io/part-of=taste-and-see
+      labelSelector: app.kubernetes.io/part-of=taste-and-see,app.kubernetes.io/managed-by=kustomize
     patch: |-
       - op: replace
         path: /spec/template/spec/containers/0/resources/requests/cpu

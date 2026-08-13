@@ -54,10 +54,57 @@ resources:
   - ../../services/service-content
   - ../../services/service-trust-safety
 
+# ── Single-node resource profile (TS-151-followup-13) ────────────────
+#
+# Dev is one 8-vCPU box. `replicas: 1` below is necessary but NOT
+# sufficient: rendered, the 34 workload Deployments request ~7.15 cores
+# / 7.88 GiB, and the Helm-inflated platform stack (kube-prometheus,
+# Loki, Tempo, Grafana, ingress-nginx, cert-manager, sealed-secrets)
+# adds roughly 2 more cores and 4+ GiB. Requests are a scheduling
+# floor, not a usage estimate, so without this component the tail of
+# the fleet sits `Pending`/`Insufficient cpu` indefinitely while every
+# Deployment cheerfully reports healthy replicas of zero — a failure
+# that reads as a hang because nothing has actually crashed.
+#
+# The component cuts REQUESTS only (cpu -> 50m, memory -> 192Mi) and
+# leaves LIMITS untouched, so burst headroom under real load is
+# unchanged. Applied here and NOT in staging/prod, where ADR-0001's
+# three-node topology makes it the wrong trade.
+#
+# Expect: cpu 7.15 -> ~1.7 cores, memory 7.88 -> ~6.0 GiB.
+components:
+  - ../../components/single-node
+
 # No top-level namespace — this overlay spans multiple namespaces
 # and each child resource carries its own.
 
 patches:
+  # ── Data-node egress CIDR (TS-151-followup-22) ────────────────────
+  #
+  # Base ships the Contabo private-VLAN default `10.40.0.0/24`. The dev
+  # box has no such VLAN: it is a single-node k3s install, and the data
+  # services it must reach (Postgres 16, Redis) are addressed on the
+  # flannel pod network, `10.42.0.0/16`.
+  #
+  # This is the failure mode the CIDR being wrong produces: every pod
+  # starts, passes its liveness probe, and then fails every query — the
+  # NetworkPolicy silently drops egress to 5432/6379 and nothing in the
+  # pod's own status reflects it. Patched here rather than edited in
+  # base because `infra/kubernetes/README.md` §2 designates the CIDR
+  # overlay-overridable, and staging/prod legitimately differ.
+  #
+  # No `namespace:` on the target: the same policy name exists in
+  # platform-services, platform-workers AND platform-frontends, and all
+  # three need the same CIDR. Omitting it patches all three; naming one
+  # would fix a third of the fleet and leave the rest silently broken.
+  - target:
+      kind: NetworkPolicy
+      name: allow-data-node-egress
+    patch: |-
+      - op: replace
+        path: /spec/egress/0/to/0/ipBlock/cidr
+        value: 10.42.0.0/16
+
   - target:
       kind: Service
       name: postgres-primary

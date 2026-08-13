@@ -82,6 +82,41 @@ COPY ${SERVICE_PATH} ${SERVICE_PATH}
 # own `build` script runs `next build`, which emits `.next/standalone`.
 RUN pnpm --filter "${SERVICE_PACKAGE}..." build
 
+# Prune the build-time toolchain that Next's file tracer pulls into the
+# standalone tree. Sibling of the identical step in nestjs.Dockerfile — same
+# CVE class, different mechanism, so the fix has to be applied twice.
+#
+# There the cause is `pnpm deploy --prod` copying the virtual store wholesale.
+# Here it is `outputFileTracingRoot` pointing at the MONOREPO ROOT (required —
+# without it the tracer cannot resolve workspace deps): the tracer walks
+# `node_modules/.pnpm/` from the root and over-includes, so the devDependency
+# closure of a transpiled workspace package (contracts -> vitest -> vite ->
+# esbuild) lands in `.next/standalone/node_modules/.pnpm/@esbuild+linux-x64@…`.
+#
+# Trivy attributed EIGHTEEN Go stdlib findings to that one binary in the
+# web-family image — sixteen HIGH and two CRITICAL — because esbuild is a Go
+# program and 0.21.5 was built with Go 1.20.12. A Next standalone server
+# compiles with SWC and never invokes esbuild at runtime; the CVEs are
+# reachable only because a build tool was shipped.
+#
+# Deleting is again the correct fix rather than a version bump: vite 5 pins
+# esbuild, so an override would fight the lockfile to solve the wrong problem.
+#
+# The assertion is the load-bearing half: if a future Next.js changes its
+# tracing semantics — in either direction — this fails the build loudly
+# instead of silently shipping the binary again or silently deleting
+# something now needed. `find` rather than fixed globs because the standalone
+# tree may carry a nested `node_modules` alongside the root-level one.
+RUN standalone="${SERVICE_PATH}/.next/standalone" \
+ && find "${standalone}" -type d \
+      \( -name '@esbuild+*' -o -name 'esbuild@*' -o -name 'vite@*' \
+         -o -name 'vitest@*' -o -name 'rollup@*' -o -name '@rollup+*' \) \
+      -prune -exec rm -rf {} + \
+ && if find "${standalone}" -name 'esbuild' -type f -print -quit | grep -q .; then \
+      echo "FATAL: esbuild survived the prune and would ship in the runtime image"; \
+      exit 1; \
+    fi
+
 # Guarantee a public/ dir exists so the runner COPY is unconditional even
 # for apps that ship no static assets yet (web-family / web-marketing today).
 RUN mkdir -p ${SERVICE_PATH}/public

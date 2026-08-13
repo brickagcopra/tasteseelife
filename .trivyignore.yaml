@@ -1,0 +1,57 @@
+# Trivy ignore list — TS-151-followup-21.
+#
+# ONLY for findings that cannot reach a runtime image. Everything reachable
+# gets bumped instead; see the `pnpm.overrides` block in the root package.json,
+# which is where the other seven packages from this triage pass were fixed.
+#
+# The underlying problem this file works around: the filesystem gate
+# (.github/workflows/ci.yml) scans `pnpm-lock.yaml`, which carries the whole
+# workspace's dependency graph with no prod/dev distinction. The image gates in
+# build-push-image.yml scan the actual shipped filesystem and report neither of
+# the entries below — that difference is the evidence for each `statement`.
+#
+# Every entry MUST carry a `statement` saying why it cannot ship and an
+# `expired_at`. On expiry the finding returns and has to be re-argued rather
+# than silently inherited. Do not add an entry here to unblock a build.
+
+vulnerabilities:
+  - id: CVE-2026-12151
+    paths:
+      - pnpm-lock.yaml
+    statement: >-
+      undici 5.29.0 is pulled exclusively by testcontainers, a devDependency
+      used to stand up integration-test containers. It is absent from every
+      runtime image (confirmed: the service-ads image scan reports multer,
+      OpenTelemetry, @grpc/grpc-js and ws, and no undici). No fix exists on the
+      5.x line — the advisory's first fixed version is 6.27.0 — so clearing it
+      means a major bump of a transitive dep of test-only tooling. Revisit by
+      bumping testcontainers rather than overriding undici underneath it.
+    expired_at: 2026-11-06
+
+  - id: CVE-2026-1526
+    paths:
+      - pnpm-lock.yaml
+    statement: >-
+      Same undici 5.29.0 instance as CVE-2026-12151 — testcontainers-only,
+      never in a runtime image, no 5.x fix (first fixed: 6.24.0).
+    expired_at: 2026-11-06
+
+  - id: CVE-2026-2229
+    paths:
+      - pnpm-lock.yaml
+    statement: >-
+      Same undici 5.29.0 instance as CVE-2026-12151 — testcontainers-only,
+      never in a runtime image, no 5.x fix (first fixed: 6.24.0).
+    expired_at: 2026-11-06
+
+  - id: CVE-2025-59288
+    paths:
+      - pnpm-lock.yaml
+    statement: >-
+      playwright 1.48.2 reaches the graph only through @playwright/test, a
+      devDependency of apps/e2e. Playwright is the E2E runner; it is not
+      installed into any image and no service imports it. The fix (1.55.1) is
+      seven minor versions ahead and belongs in a deliberate E2E tooling
+      upgrade with the suite actually executed — which needs Docker, so it
+      cannot be validated in the same pass as a lockfile edit.
+    expired_at: 2026-11-06

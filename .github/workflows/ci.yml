@@ -484,6 +484,12 @@ jobs:
           # saying HIGH,CRITICAL. 0.28.0 did not behave this way; the 0.36.0
           # bump changed it, and the gate silently became stricter than it reads.
           limit-severities-for-sarif: true
+          # Documented exceptions ONLY for findings that cannot reach a runtime
+          # image, each with a reason and an expiry date (TS-151-followup-21).
+          # Passed explicitly rather than relying on Trivy's cwd auto-discovery,
+          # so a future working-directory change cannot silently drop the file
+          # and turn the exceptions back into build failures.
+          trivyignores: .trivyignore.yaml
           # Skip noisy directories — node_modules is reproducible from the
           # lockfile and gets covered by `pnpm audit` follow-ups.
           skip-dirs: "node_modules,.next,.turbo,dist,build,coverage"

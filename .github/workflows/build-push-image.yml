@@ -220,37 +220,6 @@ jobs:
         run: |
           cosign sign --yes "${{ inputs.image-name }}@${{ steps.build.outputs.digest }}"
 
-      - name: Trivy image scan
-        # Scans the pushed digest (not the tag) so the scan target is exactly
-        # what landed in the registry — defends against a tag-flip race.
-        # Fails the job on HIGH/CRITICAL; lower severities are reported via
-        # the SARIF upload but don't block.
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
-          format: sarif
-          output: trivy-image-results.sarif
-          severity: HIGH,CRITICAL
-          exit-code: "1"
-          ignore-unfixed: true
-          # REQUIRED with format: sarif. Without it trivy-action builds the
-          # report "with all severities" and evaluates exit-code against ALL
-          # of them, so the job fails on MEDIUM/LOW despite severity above
-          # saying HIGH,CRITICAL. 0.28.0 did not behave this way; the 0.36.0
-          # bump changed it, and the gate silently became stricter than it reads.
-          limit-severities-for-sarif: true
-
-      - name: Upload Trivy SARIF to GitHub Security
-        # Same shape as the migrator upload below: a bare `always()` would fire
-        # after a failed BUILD, when the scan never ran and there is no file.
-        if: always() && steps.build.outcome == 'success'
-        uses: github/codeql-action/upload-sarif@1521896cd211af95be3f02edf6f436e10b819c27 # v3.35.4
-        with:
-          sarif_file: trivy-image-results.sarif
-          # Per-service category so the Security tab groups findings the way
-          # ops + on-call expect them (one row per service, not one row per scan).
-          category: trivy-image-${{ inputs.service-name }}
-
       # -- Migrator image (TS-151-followup-12) ------------------------------
       #
       # Built from the same context and the same commit as the service image
@@ -260,6 +229,17 @@ jobs:
       # code that needs it can never be promoted apart.
       #
       # Skipped wholesale for the 14 workloads that own no Prisma schema.
+      #
+      # ORDERING (TS-151-followup-22): both images are BUILT and pushed before
+      # either is SCANNED. They are separate artifacts from separate Dockerfile
+      # targets, so a finding in one says nothing about the other — but when the
+      # migrator build sat after the service's scan gate, a service CVE skipped
+      # it and no migrator image was ever produced. That is not hypothetical:
+      # it is why ghcr held zero migrator images across every run since the
+      # initial import, which in turn blocked runbook §7 migrations entirely.
+      # Build-then-scan keeps the gate exactly as strict — the job still fails
+      # on either scan — while ensuring one finding cannot silently withhold
+      # the other artifact.
 
       - name: Build & push migrator image
         id: build-migrator
@@ -295,11 +275,58 @@ jobs:
         run: |
           cosign sign --yes "${{ inputs.migrator-image-name }}@${{ steps.build-migrator.outputs.digest }}"
 
+      - name: Trivy image scan
+        # Scans the pushed digest (not the tag) so the scan target is exactly
+        # what landed in the registry — defends against a tag-flip race.
+        # Fails the job on HIGH/CRITICAL; lower severities are reported via
+        # the SARIF upload but don't block.
+        #
+        # NOTE the deliberate asymmetry with ci.yml's filesystem gate: that one
+        # passes `trivyignores: .trivyignore.yaml`, and the image gates do NOT.
+        # Every entry in that file is justified by "this is a devDependency and
+        # cannot reach a runtime image" — so honouring it HERE would suppress
+        # the one check capable of proving that claim false. This scan sees the
+        # shipped filesystem; if a dev-only package ever lands in an image, this
+        # is where it must still fail. That is not hypothetical: it is exactly
+        # how esbuild shipped in all four Next.js portals (TS-151-followup-19).
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-image-results.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          # REQUIRED with format: sarif. Without it trivy-action builds the
+          # report "with all severities" and evaluates exit-code against ALL
+          # of them, so the job fails on MEDIUM/LOW despite severity above
+          # saying HIGH,CRITICAL. 0.28.0 did not behave this way; the 0.36.0
+          # bump changed it, and the gate silently became stricter than it reads.
+          limit-severities-for-sarif: true
+
+      - name: Upload Trivy SARIF to GitHub Security
+        # Same shape as the migrator upload below: a bare `always()` would fire
+        # after a failed BUILD, when the scan never ran and there is no file.
+        if: always() && steps.build.outcome == 'success'
+        uses: github/codeql-action/upload-sarif@1521896cd211af95be3f02edf6f436e10b819c27 # v3.35.4
+        with:
+          sarif_file: trivy-image-results.sarif
+          # Per-service category so the Security tab groups findings the way
+          # ops + on-call expect them (one row per service, not one row per scan).
+          category: trivy-image-${{ inputs.service-name }}
+
       - name: Trivy migrator image scan
         # Scanned on the same terms as the service image, and deliberately not
         # on softer ones: this image holds a database superuser-grade
         # `DATABASE_URL` for the length of a migration.
-        if: inputs.migrator-image-name != ''
+        #
+        # `always()` (TS-151-followup-22) so a HIGH in the SERVICE image cannot
+        # skip the MIGRATOR's scan. Without it the two gates are chained rather
+        # than independent: one finding in the service suppresses all knowledge
+        # of the migrator's posture, which is how the migrator went unscanned
+        # AND unbuilt for the whole life of the repo. The job still fails if
+        # either scan trips — nothing here weakens the gate.
+        if: always() && steps.build-migrator.outcome == 'success'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ inputs.migrator-image-name }}@${{ steps.build-migrator.outputs.digest }}

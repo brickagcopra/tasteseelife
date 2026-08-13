@@ -98,7 +98,19 @@ describe('RecognitionMetrics', () => {
       // bare words, since `no_balance` is a legitimate result value.
       expect(labels).not.toMatch(/"(sub|cus|hh|drb)_/);
       expect(labels).not.toMatch(/\b(subscription_id|customer_id|balance_id)=/);
-      expect(labels.match(/(\w+)=/g)?.sort()).toEqual(['operation=', 'result=']);
+      // Deliberately closed-world: an allow-list, so a label nobody intended
+      // fails here rather than shipping. `otel_scope_*` joined the set in
+      // TS-151-followup-20c — OTel SDK v2's Prometheus serializer stamps the
+      // emitting meter's name/version on every series per the OTel→Prometheus
+      // compatibility spec. They are bounded-cardinality provenance (one pair
+      // per meter, e.g. `service-accounting:revenue-recognition`), carry no
+      // subject identifier, and so do not weaken the guard above.
+      expect(labels.match(/(\w+)=/g)?.sort()).toEqual([
+        'operation=',
+        'otel_scope_name=',
+        'otel_scope_version=',
+        'result=',
+      ]);
     }
   });
 });

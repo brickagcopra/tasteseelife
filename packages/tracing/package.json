@@ -25,17 +25,17 @@
   },
   "dependencies": {
     "@opentelemetry/api": "1.9.0",
-    "@opentelemetry/auto-instrumentations-node": "0.50.0",
-    "@opentelemetry/exporter-prometheus": "0.54.0",
-    "@opentelemetry/exporter-trace-otlp-http": "0.54.0",
-    "@opentelemetry/resources": "1.27.0",
-    "@opentelemetry/sdk-metrics": "1.27.0",
-    "@opentelemetry/sdk-node": "0.54.0",
-    "@opentelemetry/semantic-conventions": "1.27.0"
+    "@opentelemetry/auto-instrumentations-node": "0.79.0",
+    "@opentelemetry/exporter-prometheus": "0.221.0",
+    "@opentelemetry/exporter-trace-otlp-http": "0.221.0",
+    "@opentelemetry/resources": "2.10.0",
+    "@opentelemetry/sdk-metrics": "2.10.0",
+    "@opentelemetry/sdk-node": "0.221.0",
+    "@opentelemetry/semantic-conventions": "1.43.0"
   },
   "devDependencies": {
-    "@opentelemetry/sdk-trace-base": "1.27.0",
-    "@opentelemetry/sdk-trace-node": "1.27.0",
+    "@opentelemetry/sdk-trace-base": "2.10.0",
+    "@opentelemetry/sdk-trace-node": "2.10.0",
     "@taste-and-see/eslint-config": "workspace:*",
     "@taste-and-see/tsconfig": "workspace:*",
     "@types/node": "22.10.1",

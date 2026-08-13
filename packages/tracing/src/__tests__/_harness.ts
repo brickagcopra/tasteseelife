@@ -19,12 +19,13 @@ let registered = false;
 
 export function ensureHarness(): void {
   if (registered) return;
-  // OTel SDK v2 takes `spanProcessors` as a constructor arg; on the v1.x
-  // line we're pinned to (`@opentelemetry/sdk-trace-node@1.27.0`), the API
-  // is `addSpanProcessor()` after construction. When we bump to v2 the
-  // constructor form is preferred — track via the dependency upgrade plan.
-  const provider = new NodeTracerProvider();
-  provider.addSpanProcessor(new SimpleSpanProcessor(harnessExporter));
+  // OTel SDK v2 (TS-151-followup-20c) takes `spanProcessors` as a constructor
+  // arg; `addSpanProcessor()` was removed with the v1.x line, so this is now
+  // the only form. A provider constructed without processors silently drops
+  // every span, which is why the processor goes in at construction.
+  const provider = new NodeTracerProvider({
+    spanProcessors: [new SimpleSpanProcessor(harnessExporter)],
+  });
   provider.register();
   registered = true;
 }

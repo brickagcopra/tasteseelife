@@ -90,3 +90,10 @@ terraform.rc
 
 # Husky auto-generated wrapper scripts (committed hooks live alongside)
 .husky/_/
+
+# Kustomize Helm chart cache. `kustomize build --enable-helm` (the command
+# infra/kubernetes/README.md tells operators to run, and the only way to
+# render an overlay locally) pulls each pinned chart into a `charts/`
+# directory next to the kustomization that declares it. They are download
+# artifacts reproducible from the pinned `version:` — never source.
+infra/kubernetes/**/charts/

@@ -1,6 +1,6 @@
 import { diag, type Meter, metrics as otelMetrics } from '@opentelemetry/api';
 import { PrometheusSerializer } from '@opentelemetry/exporter-prometheus';
-import { Resource } from '@opentelemetry/resources';
+import { resourceFromAttributes } from '@opentelemetry/resources';
 import {
   AggregationTemporality,
   type CollectionResult,
@@ -94,11 +94,25 @@ export function initMetrics(options: InitMetricsOptions): void {
   });
 
   const provider = new MeterProvider({
-    resource: new Resource(attributes),
+    resource: resourceFromAttributes(attributes),
     readers: [reader],
   });
 
-  otelMetrics.setGlobalMeterProvider(provider);
+  // `setGlobalMeterProvider` returns FALSE (it does not throw) when something
+  // already claimed the global slot, and the only trace of it is a diag error
+  // no production process is listening for. Swallowing that boolean is how the
+  // SDK-v2 bump silently emptied `/metrics` platform-wide until a real-process
+  // probe caught it (TS-151-followup-20c) — so refuse to continue instead.
+  // CLAUDE.md §3.9: no silent error swallowing.
+  if (!otelMetrics.setGlobalMeterProvider(provider)) {
+    void provider.shutdown();
+    throw new Error(
+      'initMetrics: another MeterProvider already owns the global metrics API, so ' +
+        'no instrument recorded through getMeter() would reach serializeMetrics(). ' +
+        'Something initialised metrics before this call — check that initTracing() ' +
+        'still passes `metricReaders: []` to the NodeSDK.',
+    );
+  }
   active = { provider, reader, exporter };
 }
 

@@ -16,8 +16,31 @@
   "globalPassThroughEnv": ["GITHUB_TOKEN"],
   "ui": "tui",
   "tasks": {
+    // Generates each schema-owning service's Prisma client into
+    // `<service>/prisma/generated` (the service schema's `output` block
+    // explains why it is per-service and not `node_modules/.prisma/client`).
+    //
+    // **That directory is gitignored**, so on any fresh checkout — every CI
+    // run, every new clone — it does not exist until this task runs. Nothing
+    // used to run it: there is no root `postinstall`, and the CI jobs go
+    // straight from `pnpm install --frozen-lockfile` to `pnpm type-check`.
+    // The result was ~1000 `TS2339: Property 'x' does not exist on type
+    // 'PrismaService'` errors in CI against code that type-checks locally,
+    // because a developer's working tree already has the clients on disk.
+    // That is why the six consuming tasks below name it in `dependsOn`.
+    //
+    // Inputs are deliberately narrow rather than `$TURBO_DEFAULT$`: the
+    // client is a pure function of the schema and the pinned Prisma version,
+    // so ordinary `src/**` churn must not invalidate it. `package.json`
+    // carries the version pin. Turbo skips the task in the 14 workloads that
+    // define no `prisma:generate` script, which is the correct behaviour —
+    // they own no schema and import no generated client.
+    "prisma:generate": {
+      "inputs": ["prisma/schema.prisma", "package.json"],
+      "outputs": ["prisma/generated/**"]
+    },
     "build": {
-      "dependsOn": ["^build"],
+      "dependsOn": ["^build", "prisma:generate"],
       "inputs": [
         "$TURBO_DEFAULT$",
         "src/**",
@@ -69,7 +92,7 @@
       "outputs": []
     },
     "type-check": {
-      "dependsOn": ["^build"],
+      "dependsOn": ["^build", "prisma:generate"],
       "inputs": [
         "$TURBO_DEFAULT$",
         "src/**",
@@ -86,7 +109,7 @@
       "outputs": []
     },
     "test": {
-      "dependsOn": ["^build"],
+      "dependsOn": ["^build", "prisma:generate"],
       "inputs": [
         "$TURBO_DEFAULT$",
         "src/**",
@@ -117,17 +140,17 @@
     // Same `dependsOn` and inputs as `test` — the suites compile against
     // the generated Prisma client, so the schema belongs in the cache key.
     "test:boot-graph": {
-      "dependsOn": ["^build"],
+      "dependsOn": ["^build", "prisma:generate"],
       "inputs": ["$TURBO_DEFAULT$", "src/**", "test/**", "vitest.config.*", "prisma/schema.prisma"],
       "outputs": []
     },
     "test:integration": {
-      "dependsOn": ["^build"],
+      "dependsOn": ["^build", "prisma:generate"],
       "cache": false,
       "outputs": ["coverage-integration/**"]
     },
     "test:e2e": {
-      "dependsOn": ["^build"],
+      "dependsOn": ["^build", "prisma:generate"],
       "cache": false,
       "outputs": ["playwright-report/**", "test-results/**"]
     },

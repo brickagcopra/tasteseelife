@@ -84,7 +84,8 @@ describe('extractTraceContext', () => {
 
     const finished = harnessExporter.getFinishedSpans();
     const consumer = finished.find((s) => s.name === 'consumer');
-    expect(consumer?.parentSpanId).toBe(producerSpanId);
+    // `parentSpanId` -> `parentSpanContext` in OTel SDK v2 (TS-151-followup-20c).
+    expect(consumer?.parentSpanContext?.spanId).toBe(producerSpanId);
   });
 
   it('falls back to the active context when the carrier has no propagation headers', async () => {

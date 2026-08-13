@@ -61,7 +61,11 @@ describe('BullMQ trace-context propagation helpers', () => {
 
     const consumer = harnessExporter.getFinishedSpans().find((s) => s.name === 'consumer');
     expect(consumerTraceId).toBe(producerTraceId);
-    expect(consumer?.parentSpanId).toBe(producerSpanId);
+    // OTel SDK v2 replaced `ReadableSpan.parentSpanId` with the full
+    // `parentSpanContext` (TS-151-followup-20c). `producerSpanId` is a real
+    // span id, so a broken parent link reads as `undefined` here and still
+    // fails — the assertion keeps its teeth.
+    expect(consumer?.parentSpanContext?.spanId).toBe(producerSpanId);
   });
 
   it('runWithJobContext is a clean no-op when the carrier is missing', () => {

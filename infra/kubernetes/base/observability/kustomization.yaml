@@ -39,7 +39,18 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: observability
+# NO top-level `namespace:` here — same defect as
+# `base/ingress-nginx/kustomization.yaml` (TS-151-followup-22). A
+# top-level `namespace:` is a TRANSFORMER: it rewrote the two
+# NetworkPolicies in `cluster-network-policy.yaml` out of
+# `platform-services` / `platform-workers` and into `observability`,
+# where their shared name `allow-metrics-from-observability` collapsed
+# into one identity and kustomize aborted the build with an ID conflict.
+#
+# Nothing here needs the transformer: all three charts below carry their
+# own `namespace: observability`, and both files in `resources:` declare
+# the namespace they belong in explicitly (grafana-ingress.yaml ->
+# observability; the policies -> the two workload namespaces they guard).
 
 helmCharts:
   - name: kube-prometheus-stack

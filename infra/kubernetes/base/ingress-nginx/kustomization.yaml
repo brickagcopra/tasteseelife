@@ -16,7 +16,21 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: ingress
+# NO top-level `namespace:` here (TS-151-followup-22). It reads like the
+# right way to place the chart, but a top-level `namespace:` is a
+# TRANSFORMER — it rewrites the namespace of every resource this
+# kustomization emits, not just the chart's. That swept up both
+# NetworkPolicies in `cluster-network-policy.yaml`, which deliberately
+# live in `platform-services` and `platform-frontends`; rewriting both to
+# `ingress` collapsed them onto the same name/namespace/kind identity and
+# kustomize aborted the whole build with an ID conflict.
+#
+# The effect was total: `kustomize build` failed for base AND for all
+# three overlays, so no manifest could be rendered or applied at all.
+#
+# The chart does not need it — `helmCharts[].namespace` below already
+# passes `--namespace ingress` to `helm template`, which is what actually
+# places the chart's own resources.
 
 helmCharts:
   - name: ingress-nginx

@@ -1,6 +1,6 @@
 import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
-import { Resource } from '@opentelemetry/resources';
+import { resourceFromAttributes } from '@opentelemetry/resources';
 import { NodeSDK } from '@opentelemetry/sdk-node';
 
 const ATTR_SERVICE_NAME = 'service.name';
@@ -63,9 +63,27 @@ export function initTracing(options: InitTracingOptions): void {
   }
 
   activeSdk = new NodeSDK({
-    resource: new Resource(attributes),
+    resource: resourceFromAttributes(attributes),
     traceExporter: new OTLPTraceExporter({ url: endpoint }),
     instrumentations: [getNodeAutoInstrumentations()],
+    // Traces ONLY. `initMetrics` owns the metrics surface — see metrics.ts for
+    // why (we serialise on demand from an in-memory reader instead of letting
+    // the SDK stand up its own exporter/HTTP server).
+    //
+    // This empty array is load-bearing, not decoration (TS-151-followup-20c).
+    // Given no `metricReaders`, SDK v2's NodeSDK falls back to reading
+    // `OTEL_METRICS_EXPORTER`, which DEFAULTS TO OTLP when unset — it then
+    // builds its own MeterProvider and claims the global slot via
+    // `metrics.setGlobalMeterProvider`. Because `initTracing` runs first, the
+    // later `initMetrics` registration is refused ("Attempted duplicate
+    // registration of API: metrics"), and since nothing installs a diag logger
+    // in production that refusal is INVISIBLE: `getMeter()` hands back meters
+    // owned by the SDK's provider, so every domain instrument silently stops
+    // appearing on `/metrics` while `target_info` keeps rendering — the
+    // endpoint looks alive and reports nothing. An empty reader list short-
+    // circuits that block entirely (`readers.length > 0` is false), so no
+    // MeterProvider is built and no global registration happens.
+    metricReaders: [],
   });
 
   activeSdk.start();
