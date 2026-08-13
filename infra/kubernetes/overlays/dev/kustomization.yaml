@@ -1414,9 +1414,9 @@ images:
   - name: ghcr.io/brickagcopra/worker-analytics-aggregator
     newTag: dev
   - name: ghcr.io/brickagcopra/service-messaging
-    newTag: dev
+    newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/service-messaging-migrator
-    newTag: dev
+    newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/service-concierge
     newTag: dev
   - name: ghcr.io/brickagcopra/service-concierge-migrator
