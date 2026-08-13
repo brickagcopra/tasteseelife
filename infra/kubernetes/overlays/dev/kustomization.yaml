@@ -1382,9 +1382,9 @@ images:
   - name: ghcr.io/brickagcopra/service-notification-migrator
     newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/service-media
-    newTag: dev
+    newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/service-media-migrator
-    newTag: dev
+    newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/service-webhook
     newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/service-webhook-migrator
