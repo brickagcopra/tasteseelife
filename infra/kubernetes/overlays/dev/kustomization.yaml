@@ -1426,9 +1426,9 @@ images:
   - name: ghcr.io/brickagcopra/service-academy-migrator
     newTag: dev
   - name: ghcr.io/brickagcopra/service-search
-    newTag: dev
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-search-migrator
-    newTag: dev
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/web-admin
     newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/web-provider
