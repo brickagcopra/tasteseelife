@@ -56,7 +56,9 @@ jobs:
     # an unreviewed build into dev, via the trunk.
     if: github.ref_name == 'main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # 15 not 5 (TS-151-followup-24): a 34-way fan-out serialises these
+    # pushes, and the retry loop below needs room to wait its turn.
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -65,44 +67,32 @@ jobs:
           ref: main
           persist-credentials: true
 
-      - name: Update overlay tag
-        id: bump
+      # Bump, commit and push in ONE step, re-deriving on every attempt
+      # (TS-151-followup-24).
+      #
+      # A push touching `packages/**` or `pnpm-lock.yaml` matches all 34
+      # per-service path filters, so 34 of these jobs run concurrently, each
+      # rewriting a DIFFERENT `newTag:` line in the SAME file and racing to
+      # push to main. The first wins; the rest are rejected non-fast-forward.
+      # Not theoretical: commit d2feac6 fanned out to 34 builds, all 34 image
+      # jobs passed, and 12 bumpers died exactly this way.
+      #
+      # `git pull --rebase` is NOT a sufficient fix. The `images:` entries are
+      # two lines each, packed back to back, so neighbouring services' `newTag:`
+      # lines sit 2 lines apart — inside git's default 3-line diff context — and
+      # concurrent rebases of adjacent entries conflict.
+      #
+      # So every attempt RE-DERIVES from a fresh main instead of replaying a
+      # patch: fetch, hard-reset, re-run the rewrite, commit, push. The edit is
+      # idempotent and line-scoped, so re-deriving after someone else's push is
+      # always correct and can never conflict.
+      - name: Bump overlay tag, commit & push
         env:
           NEW_TAG: ${{ needs.build.outputs.image-sha-tag }}
-        run: |
-          set -euo pipefail
-          overlay='infra/kubernetes/overlays/dev/kustomization.yaml'
-          before="$(grep -A1 -E '^  - name: ghcr\.io/brickagcopra/service-notification(-migrator)?$' "${overlay}" | grep 'newTag:')"
-          awk -v new_tag="${NEW_TAG}" '
-            BEGIN { pending = 0 }
-            /^[[:space:]]*-[[:space:]]*name:[[:space:]]*ghcr\.io\/brickagcopra\/service-notification(-migrator)?[[:space:]]*$/ {
-              pending = 1
-              print
-              next
-            }
-            pending == 1 && /^[[:space:]]*newTag:[[:space:]]*/ {
-              sub(/newTag:[[:space:]]*.*/, "newTag: " new_tag)
-              pending = 0
-              print
-              next
-            }
-            { print }
-          ' "${overlay}" > "${overlay}.next"
-          mv "${overlay}.next" "${overlay}"
-          after="$(grep -A1 -E '^  - name: ghcr\.io/brickagcopra/service-notification(-migrator)?$' "${overlay}" | grep 'newTag:')"
-          echo "before: ${before}"
-          echo "after:  ${after}"
-          if [[ "${before}" == "${after}" ]]; then
-            echo "changed=false" >> "${GITHUB_OUTPUT}"
-            echo "Bumper is a no-op (overlay already pins ${NEW_TAG}); skipping commit."
-          else
-            echo "changed=true" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: Commit & push
-        if: steps.bump.outputs.changed == 'true'
-        env:
-          NEW_TAG: ${{ needs.build.outputs.image-sha-tag }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.image-digest }}
+          SOURCE_SHA: ${{ github.sha }}
+          # github-actions[bot]'s no-reply email — keeps the commit author
+          # bound to the bot identity GitHub uses for token-attributed pushes.
           GIT_AUTHOR_NAME: github-actions[bot]
           GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
           GIT_COMMITTER_NAME: github-actions[bot]
@@ -111,8 +101,69 @@ jobs:
           set -euo pipefail
           git config user.name "${GIT_AUTHOR_NAME}"
           git config user.email "${GIT_AUTHOR_EMAIL}"
-          git add infra/kubernetes/overlays/dev/kustomization.yaml
-          git commit -m "ci(service-notification): bump dev overlay to ${NEW_TAG} [skip ci]" \
-                     -m "Source commit: ${GITHUB_SHA}" \
-                     -m "Image digest: ${{ needs.build.outputs.image-digest }}"
-          git push origin HEAD:main
+          overlay='infra/kubernetes/overlays/dev/kustomization.yaml'
+
+          for attempt in $(seq 1 50); do
+            # FETCH_HEAD rather than origin/main: unambiguous regardless of
+            # how the checkout configured its remote-tracking refspec.
+            git fetch --quiet origin main
+            git reset --quiet --hard FETCH_HEAD
+
+            # The kustomize `images:` directive is the only place the dev tag
+            # lives (TS-009g refactor). The pattern is anchored to THIS
+            # service's image entry to stay surgical — touching any other
+            # `newTag:` line would be a bug. Where the service owns a Prisma
+            # schema the pattern also admits the `-migrator` suffix, so the
+            # one-shot `prisma migrate deploy` image is bumped to the SAME sha
+            # in the same commit (TS-151-followup-12): a release whose migrator
+            # lagged its service would apply last release's migrations and then
+            # roll code that needs this one.
+            #
+            # awk rather than sed because GNU sed and BSD sed disagree on
+            # in-place edit syntax (`-i` vs `-i ''`), and the runners are Ubuntu
+            # today but the recipe also needs to work for local operator
+            # dry-runs on macOS.
+            awk -v new_tag="${NEW_TAG}" '
+              BEGIN { pending = 0 }
+              /^[[:space:]]*-[[:space:]]*name:[[:space:]]*ghcr\.io\/brickagcopra\/service-notification(-migrator)?[[:space:]]*$/ {
+                pending = 1
+                print
+                next
+              }
+              pending == 1 && /^[[:space:]]*newTag:[[:space:]]*/ {
+                sub(/newTag:[[:space:]]*.*/, "newTag: " new_tag)
+                pending = 0
+                print
+                next
+              }
+              { print }
+            ' "${overlay}" > "${overlay}.next"
+            mv "${overlay}.next" "${overlay}"
+
+            if git diff --quiet -- "${overlay}"; then
+              echo "Overlay already pins ${NEW_TAG}; nothing to push."
+              exit 0
+            fi
+
+            git add "${overlay}"
+            # `[skip ci]` keeps the bumper from triggering ci.yml against its
+            # own commit. The bumper does NOT match this workflow's path
+            # filters (it only touches `infra/kubernetes/overlays/dev/`), so the
+            # self-trigger loop is already structurally impossible — the marker
+            # is belt-and-braces against future path-filter drift.
+            git commit --quiet \
+              -m "ci(service-notification): bump dev overlay to ${NEW_TAG} [skip ci]" \
+              -m "Source commit: ${SOURCE_SHA}" \
+              -m "Image digest: ${IMAGE_DIGEST}"
+
+            if git push --quiet origin HEAD:main; then
+              echo "Pushed service-notification -> ${NEW_TAG} on attempt ${attempt}."
+              exit 0
+            fi
+
+            echo "Attempt ${attempt}: push rejected (a concurrent bumper won the race); re-deriving against fresh main."
+            sleep "$(( (attempt % 3) + 1 ))"
+          done
+
+          echo "FATAL: could not push the overlay bump for service-notification after 50 attempts."
+          exit 1
