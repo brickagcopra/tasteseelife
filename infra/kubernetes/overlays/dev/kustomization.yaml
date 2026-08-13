@@ -1400,9 +1400,9 @@ images:
   - name: ghcr.io/brickagcopra/service-payouts-migrator
     newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/service-audit
-    newTag: dev
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-audit-migrator
-    newTag: dev
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-activity
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-activity-migrator
