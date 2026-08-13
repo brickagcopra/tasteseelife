@@ -1408,9 +1408,9 @@ images:
   - name: ghcr.io/brickagcopra/service-activity-migrator
     newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/service-analytics
-    newTag: dev
+    newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/service-analytics-migrator
-    newTag: dev
+    newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/worker-analytics-aggregator
     newTag: sha-d2feac6
   - name: ghcr.io/brickagcopra/service-messaging
