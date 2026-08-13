@@ -1396,9 +1396,9 @@ images:
   - name: ghcr.io/brickagcopra/worker-media-processor
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-payouts
-    newTag: sha-d2feac6
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-payouts-migrator
-    newTag: sha-d2feac6
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-audit
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-audit-migrator
