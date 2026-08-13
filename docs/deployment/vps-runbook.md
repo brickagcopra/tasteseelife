@@ -74,15 +74,33 @@ migrations. A missing migrator means that service's schema never gets created.
 ### 1.1 Your domain
 
 The registered domain is **`tasteseelife.com`**, and it is already committed
-throughout the overlays, the Terraform tfvars, and the DNS module. Nothing here
-needs renaming.
+throughout the overlays. Nothing here needs renaming.
 
-What still has to be true before the first apply:
+**DNS is hand-managed in the Contabo control panel, not by Terraform.** The
+zone is built and live on `ns1` / `ns2` / `ns3.contabo.net`, which answer for
+it authoritatively (AA flag set), with every record pointing at the node
+`169.58.147.122` (`vmi3496049.contaboserver.net`).
 
-- The **zone exists in Cloudflare** and the registrar's nameservers are
-  delegated to it. The Terraform `dns` module creates records inside a zone it
-  expects to find; it does not register the domain or take over delegation.
-- The Cloudflare API token is scoped to **this** zone (`Zone:Read`, `DNS:Edit`).
+> ⚠️ **The delegation does not match, so none of it resolves publicly.** The
+> `.com` TLD servers still delegate `tasteseelife.com` to
+> `orbit.dns-parking.com` / `horizon.dns-parking.com` (Hostinger), which is
+> where the domain was registered. Cloudflare, Google and Quad9 all agree, and
+> every portal host is **NXDOMAIN** on the public internet while resolving
+> correctly against `ns1.contabo.net` directly.
+>
+> The three `NS` rows inside the Contabo zone are correct but self-referential
+> — a zone naming its own nameservers has no effect until the parent
+> delegation agrees. **Fix at the registrar**, by setting the domain's
+> nameservers to `ns1.contabo.net`, `ns2.contabo.net`, `ns3.contabo.net`. The
+> parent `NS` TTL is 172800, so allow up to 48 h. Tracked as
+> TS-151-followup-25; **nothing below this line works until it is done.**
+
+> The Terraform `dns` module (`infra/terraform/modules/dns/`) manages
+> **Cloudflare** records and reads the zone via `data "cloudflare_zone"`. With
+> DNS on Contabo it can never apply, and its default `hostnames` map names
+> surfaces that no longer match the Ingresses (`family` / `provider` /
+> `academy` / `partner` rather than `app` / `pros`). Treat it as orphaned
+> pending TS-151-followup-28 — do not run it expecting these records to appear.
 
 Hosts that actually have an Ingress rule (shown for `dev`; `staging` swaps the
 label, and `prod` drops it entirely — `app.tasteseelife.com`, not
@@ -96,9 +114,23 @@ label, and `prod` drops it entirely — `app.tasteseelife.com`, not
 | `pros.dev.tasteseelife.com`    | web-provider  |
 | `grafana.dev.tasteseelife.com` | Grafana       |
 
+**The zone is prod-shaped, by decision.** The Contabo zone carries explicit A
+records for the five bare hosts — `admin`, `app`, `grafana`, `pros`, `www` —
+and those are the intended public surface. There are deliberately no `dev.` or
+`staging.` records.
+
+It also carries a `*.tasteseelife.com` wildcard, which should be deleted. Per
+RFC 4592 a wildcard matches multi-label names when no intervening node exists,
+so it currently answers for anything at all — `typo123.tasteseelife.com`
+returns the node IP. That removes NXDOMAIN as a signal: every typo and every
+unconfigured host silently reaches ingress-nginx's default backend and 404s,
+which reads as an application bug rather than a DNS mistake. Tracked as
+TS-151-followup-26.
+
 > **`api.<env>.tasteseelife.com` is a DNS record with nothing behind it.** The
-> Terraform `dns` module creates an `api` A record, but **the api-gateway has no
-> Ingress** — verified by rendering its base, which emits zero Ingress objects.
+> wildcard answers it (as does the Terraform `dns` module's `api` entry, if
+> that module is ever revived), but **the api-gateway has no Ingress** —
+> verified by rendering its base, which emits zero Ingress objects.
 > That is architecturally correct, not an oversight: all four portals reach the
 > gateway at `http://api-gateway.platform-services.svc.cluster.local:3000`, and
 > no `NEXT_PUBLIC_*` variable exposes a gateway URL to the browser. Traffic is
@@ -171,7 +203,7 @@ reasonable target. Below 4 vCPU / 8 GB, do not attempt this.
 | Credential                                                            | Used by                                             | Where to get it                                                 |
 | --------------------------------------------------------------------- | --------------------------------------------------- | --------------------------------------------------------------- |
 | Contabo API client id/secret + customer user/pass                     | Terraform                                           | <https://my.contabo.com/api/permissions> and Account → Security |
-| Cloudflare scoped API token (`Zone:Read`, `DNS:Edit`, that zone only) | Terraform `dns` module, cert-manager                | Cloudflare dashboard → API tokens                               |
+| ~~Cloudflare scoped API token~~ — **not needed**                      | nothing (see § 1.1)                                 | n/a — DNS is hand-managed in the Contabo panel                  |
 | Operator SSH keypair                                                  | node access                                         | `ssh-keygen -t ed25519 -f ~/.ssh/tastesee-ops`                  |
 | GitHub PAT with `read:packages`                                       | pulling images from ghcr.io                         | GitHub → Developer settings                                     |
 | Stripe test keys                                                      | service-accounting, subscription, payouts, identity | Stripe dashboard (test mode)                                    |
@@ -412,18 +444,42 @@ kubectl -n platform-services logs job/service-identity-migrate
 
 ## 9. DNS and TLS
 
-The Terraform `dns` module creates the Cloudflare A records pointing at the
-node. Confirm they resolve to the box, then let cert-manager do the rest.
+The A records already exist in the Contabo panel and point at the node (§ 1.1).
+Nothing creates them for you and Terraform is not involved. What matters here
+is that they resolve **publicly**, which today they do not.
+
+Check delegation first — it is the one failure that makes every other symptom
+in this section a red herring:
+
+```sh
+# What the internet uses. Must list ns1/ns2/ns3.contabo.net, NOT dns-parking.com.
+dig +short NS tasteseelife.com @1.1.1.1
+
+# What Contabo actually serves. This has been correct all along.
+dig +short A app.tasteseelife.com @ns1.contabo.net
+
+# The two agreeing is the thing you are waiting for.
+dig +short A app.tasteseelife.com @1.1.1.1
+```
+
+Before re-delegating, **drop every record's TTL to 300** in the Contabo panel.
+The apex, `www`, the wildcard and `mail` currently sit at 86400, so a wrong IP
+costs you a day; the portal records are already at 3600. Raise them again once
+the cutover is stable.
 
 The `dev` overlay uses the **Let's Encrypt staging** issuer, which produces
 certificates your browser will not trust. That is intentional — staging has
 generous rate limits and dev exists to be rebuilt. Only the `prod` overlay
 points at the production issuer.
 
-If a certificate stays `READY=False`, the HTTP-01 challenge is almost always
-the cause: it needs port 80 reachable from the internet to the ingress
-controller. Check the Contabo firewall and that Cloudflare's proxy (the orange
-cloud) is **off** for these records during issuance.
+Both ClusterIssuers solve **HTTP-01** only
+(`base/cert-manager/cluster-issuer-letsencrypt.yaml`), so certificate issuance
+needs two things and no others: the name must resolve publicly, and port 80
+must be reachable from the internet to the ingress controller. At the time of
+writing ports 80, 443 and 25 are all closed or filtered on the node — expected
+if the cluster is not up yet, but it will block issuance. Check the Contabo
+firewall. There is no Cloudflare proxy in this topology, so the "turn the
+orange cloud off" advice you will find elsewhere does not apply.
 
 ---
 
