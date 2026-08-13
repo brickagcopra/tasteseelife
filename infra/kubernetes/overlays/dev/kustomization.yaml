@@ -1360,9 +1360,9 @@ images:
   - name: ghcr.io/brickagcopra/service-booking-migrator
     newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-household
-    newTag: dev
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-household-migrator
-    newTag: dev
+    newTag: sha-164b151
   - name: ghcr.io/brickagcopra/service-provider
     newTag: dev
   - name: ghcr.io/brickagcopra/service-provider-migrator
